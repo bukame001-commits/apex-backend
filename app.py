@@ -30,7 +30,10 @@ def health():
 # ── Fetch single stock from Yahoo Finance ─────────────────────
 def fetch_one_stock(sym):
     try:
-        url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1wk&range=4y'
+        interval = request.args.get('interval', '1wk')
+        range_map = {'1wk': '4y', '1d': '2y', '60m': '1y'}
+        range_val = range_map.get(interval, '4y')
+        url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={interval}&range={range_val}'
         r = requests.get(url, headers=HEADERS, timeout=12)
         if not r.ok:
             return sym, None
