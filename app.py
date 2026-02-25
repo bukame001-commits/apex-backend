@@ -3,6 +3,7 @@ import csv
 import io
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
@@ -14,6 +15,11 @@ _russell_cache = None
 _russell_cache_time = 0
 CACHE_TTL = 86400  # 24 hours
 
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept': 'application/json'
+}
+
 
 # ── Health check ─────────────────────────────────────────────
 @app.route('/health')
@@ -21,7 +27,48 @@ def health():
     return jsonify({'status': 'ok'})
 
 
-# ── Stock OHLCV data via Yahoo Finance ───────────────────────
+# ── Fetch single stock from Yahoo Finance ─────────────────────
+def fetch_one_stock(sym):
+    try:
+        url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1wk&range=4y'
+        r = requests.get(url, headers=HEADERS, timeout=12)
+        if not r.ok:
+            return sym, None
+        data = r.json()
+        result = data.get('chart', {}).get('result', [None])[0]
+        if not result:
+            return sym, None
+
+        timestamps = result.get('timestamp', [])
+        q = result.get('indicators', {}).get('quote', [{}])[0]
+        if not q or len(timestamps) < 35:
+            return sym, None
+
+        klines = []
+        opens   = q.get('open',   [None]*len(timestamps))
+        highs   = q.get('high',   [None]*len(timestamps))
+        lows    = q.get('low',    [None]*len(timestamps))
+        closes  = q.get('close',  [None]*len(timestamps))
+        volumes = q.get('volume', [0]*len(timestamps))
+
+        for i, ts in enumerate(timestamps):
+            if opens[i] is not None and closes[i] is not None:
+                klines.append([ts * 1000, opens[i], highs[i], lows[i], closes[i], volumes[i] or 0])
+
+        if len(klines) < 35:
+            return sym, None
+
+        return sym, {
+            'klines': klines,
+            'marketCap': result.get('meta', {}).get('marketCap'),
+            'type': 'stock'
+        }
+    except Exception as e:
+        print(f'{sym} error: {e}')
+        return sym, None
+
+
+# ── Stock OHLCV data — parallel fetch via thread pool ────────
 @app.route('/stocks')
 def stocks():
     symbols_param = request.args.get('symbols', '')
@@ -30,48 +77,12 @@ def stocks():
         return jsonify({})
 
     results = {}
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json'
-    }
-
-    for sym in symbols:
-        try:
-            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1wk&range=4y'
-            r = requests.get(url, headers=headers, timeout=12)
-            if not r.ok:
-                continue
-            data = r.json()
-            result = data.get('chart', {}).get('result', [None])[0]
-            if not result:
-                continue
-
-            timestamps = result.get('timestamp', [])
-            q = result.get('indicators', {}).get('quote', [{}])[0]
-            if not q or len(timestamps) < 35:
-                continue
-
-            klines = []
-            for i, ts in enumerate(timestamps):
-                o = q.get('open', [None] * len(timestamps))[i]
-                h = q.get('high', [None] * len(timestamps))[i]
-                lo = q.get('low', [None] * len(timestamps))[i]
-                c = q.get('close', [None] * len(timestamps))[i]
-                v = q.get('volume', [0] * len(timestamps))[i] or 0
-                if o is not None and c is not None:
-                    klines.append([ts * 1000, o, h, lo, c, v])
-
-            if len(klines) < 35:
-                continue
-
-            results[sym] = {
-                'klines': klines,
-                'marketCap': result.get('meta', {}).get('marketCap'),
-                'type': 'stock'
-            }
-        except Exception as e:
-            print(f'{sym} error: {e}')
-            continue
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(fetch_one_stock, sym): sym for sym in symbols}
+        for future in as_completed(futures):
+            sym, data = future.result()
+            if data:
+                results[sym] = data
 
     return jsonify(results)
 
