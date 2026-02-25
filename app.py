@@ -1,103 +1,185 @@
+import os
+import csv
+import io
+import time
+import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import requests
-import numpy as np
 
 app = Flask(__name__)
 CORS(app)
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Accept': 'application/json'
-}
+# ── Cache for Russell 2000 constituents (refresh every 24h) ──
+_russell_cache = None
+_russell_cache_time = 0
+CACHE_TTL = 86400  # 24 hours
 
-def get_yahoo_data(symbol):
-    url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + symbol + '?interval=1wk&range=4y'
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=10)
-        data = res.json()
-        result = data["chart"]["result"][0]
-        closes = [x for x in result["indicators"]["quote"][0]["close"] if x]
-        volumes = [x for x in result["indicators"]["quote"][0]["volume"] if x]
-        return closes, volumes
-    except:
-        return None, None
 
-def calc_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return None
-    deltas = np.diff(closes[-(period+1):])
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
-    avg_gain = np.mean(gains)
-    avg_loss = np.mean(losses)
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 2)
-
-def calc_ema(closes, period):
-    if len(closes) < period:
-        return None
-    k = 2 / (period + 1)
-    ema = float(np.mean(closes[:period]))
-    for price in closes[period:]:
-        ema = price * k + ema * (1 - k)
-    return round(ema, 4)
-
-def calc_vol_spike(volumes):
-    if len(volumes) < 20:
-        return None
-    avg = float(np.mean(volumes[-20:-1]))
-    if avg == 0:
-        return None
-    return round(float(volumes[-1]) / avg, 2)
-
-@app.route("/health")
+# ── Health check ─────────────────────────────────────────────
+@app.route('/health')
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({'status': 'ok'})
 
-@app.route("/stocks")
-def get_stocks_batch():
-    symbols = request.args.get("symbols", "")
+
+# ── Stock OHLCV data via Yahoo Finance ───────────────────────
+@app.route('/stocks')
+def stocks():
+    symbols_param = request.args.get('symbols', '')
+    symbols = [s.strip().upper() for s in symbols_param.split(',') if s.strip()][:50]
     if not symbols:
-        return jsonify({"error": "symbols required"}), 400
+        return jsonify({})
 
-    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()][:20]
     results = {}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json'
+    }
 
-    for symbol in symbol_list:
-        closes, volumes = get_yahoo_data(symbol)
-        if not closes or len(closes) < 20:
-            continue
+    for sym in symbols:
         try:
-            price = closes[-1]
-            rsi = calc_rsi(closes)
-            ema200 = calc_ema(closes, min(200, len(closes)))
-            ema50 = calc_ema(closes, min(50, len(closes)))
-            vol_spike = calc_vol_spike(volumes) if volumes else None
-            vs_ema200 = round((price / ema200 - 1) * 100, 2) if ema200 else None
-            vs_ema50 = round((price / ema50 - 1) * 100, 2) if ema50 else None
-            year = closes[-52:] if len(closes) >= 52 else closes
-            high52 = round(max(year), 4)
-            low52 = round(min(year), 4)
-            results[symbol] = {
-                "price": round(price, 4),
-                "rsi": rsi,
-                "ema200": ema200,
-                "ema50": ema50,
-                "vsEma200": vs_ema200,
-                "vsEma50": vs_ema50,
-                "volSpike": vol_spike,
-                "high52": high52,
-                "low52": low52,
-                "vsHigh52": round((price / high52 - 1) * 100, 2),
-                "vsLow52": round((price / low52 - 1) * 100, 2)
+            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1wk&range=4y'
+            r = requests.get(url, headers=headers, timeout=12)
+            if not r.ok:
+                continue
+            data = r.json()
+            result = data.get('chart', {}).get('result', [None])[0]
+            if not result:
+                continue
+
+            timestamps = result.get('timestamp', [])
+            q = result.get('indicators', {}).get('quote', [{}])[0]
+            if not q or len(timestamps) < 35:
+                continue
+
+            klines = []
+            for i, ts in enumerate(timestamps):
+                o = q.get('open', [None] * len(timestamps))[i]
+                h = q.get('high', [None] * len(timestamps))[i]
+                lo = q.get('low', [None] * len(timestamps))[i]
+                c = q.get('close', [None] * len(timestamps))[i]
+                v = q.get('volume', [0] * len(timestamps))[i] or 0
+                if o is not None and c is not None:
+                    klines.append([ts * 1000, o, h, lo, c, v])
+
+            if len(klines) < 35:
+                continue
+
+            results[sym] = {
+                'klines': klines,
+                'marketCap': result.get('meta', {}).get('marketCap'),
+                'type': 'stock'
             }
-        except:
+        except Exception as e:
+            print(f'{sym} error: {e}')
             continue
 
     return jsonify(results)
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+
+# ── Russell 2000 constituents via iShares IWM ETF ────────────
+@app.route('/russell2000')
+def russell2000():
+    global _russell_cache, _russell_cache_time
+
+    # Return cache if still fresh
+    if _russell_cache and (time.time() - _russell_cache_time) < CACHE_TTL:
+        return jsonify({
+            'tickers': _russell_cache,
+            'count': len(_russell_cache),
+            'source': 'cache'
+        })
+
+    try:
+        url = (
+            'https://www.ishares.com/us/products/239707/ishares-russell-2000-etf/'
+            '1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund'
+        )
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.ishares.com/',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        }
+        r = requests.get(url, headers=headers, timeout=20)
+        if not r.ok:
+            raise Exception(f'iShares returned {r.status_code}')
+
+        tickers = []
+        reader = csv.reader(io.StringIO(r.text))
+        data_started = False
+
+        for row in reader:
+            if not row:
+                continue
+            ticker = row[0].strip().strip('"')
+
+            # Skip header rows — wait until we see a valid ticker pattern
+            if not data_started:
+                if ticker and ticker.isupper() and 1 <= len(ticker) <= 5 and ticker.isalpha():
+                    data_started = True
+                else:
+                    continue
+
+            # Skip non-ticker rows (cash, header remnants, etc.)
+            if not ticker or ticker in ('Ticker', 'Name', 'CASH', 'USD', 'EUR', '-'):
+                continue
+            if not (ticker.isupper() and 1 <= len(ticker) <= 5 and ticker.replace('-','').isalpha()):
+                continue
+
+            tickers.append(ticker)
+
+        if len(tickers) > 100:
+            _russell_cache = tickers
+            _russell_cache_time = time.time()
+            print(f'Russell 2000: fetched {len(tickers)} tickers from iShares')
+            return jsonify({
+                'tickers': tickers,
+                'count': len(tickers),
+                'source': 'ishares'
+            })
+
+        raise Exception(f'Only parsed {len(tickers)} tickers — possible format change')
+
+    except Exception as e:
+        print(f'Russell 2000 fetch failed: {e}')
+        return jsonify({'error': str(e)}), 503
+
+
+# ── S&P 500 constituents via iShares IVV ETF ─────────────────
+@app.route('/sp500')
+def sp500():
+    try:
+        url = (
+            'https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/'
+            '1467271812596.ajax?fileType=csv&fileName=IVV_holdings&dataType=fund'
+        )
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.ishares.com/'
+        }
+        r = requests.get(url, headers=headers, timeout=20)
+        if not r.ok:
+            raise Exception(f'{r.status_code}')
+
+        tickers = []
+        reader = csv.reader(io.StringIO(r.text))
+        started = False
+        for row in reader:
+            if not row:
+                continue
+            ticker = row[0].strip().strip('"')
+            if not started:
+                if ticker.isupper() and 1 <= len(ticker) <= 5 and ticker.isalpha():
+                    started = True
+                else:
+                    continue
+            if ticker and ticker.isupper() and ticker.isalpha() and ticker not in ('CASH', 'USD'):
+                tickers.append(ticker)
+
+        return jsonify({'tickers': tickers[:505], 'count': len(tickers)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 503
+
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 3000))
+    app.run(host='0.0.0.0', port=port)
