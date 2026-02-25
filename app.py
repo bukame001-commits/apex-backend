@@ -28,9 +28,8 @@ def health():
 
 
 # ── Fetch single stock from Yahoo Finance ─────────────────────
-def fetch_one_stock(sym):
+def fetch_one_stock(sym, interval='1wk'):
     try:
-        interval = request.args.get('interval', '1wk')
         range_map = {'1wk': '4y', '1d': '2y', '60m': '1y'}
         range_val = range_map.get(interval, '4y')
         url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={interval}&range={range_val}'
@@ -79,9 +78,10 @@ def stocks():
     if not symbols:
         return jsonify({})
 
+    interval = request.args.get('interval', '1wk')
     results = {}
     with ThreadPoolExecutor(max_workers=20) as executor:
-        futures = {executor.submit(fetch_one_stock, sym): sym for sym in symbols}
+        futures = {executor.submit(fetch_one_stock, sym, interval): sym for sym in symbols}
         for future in as_completed(futures):
             sym, data = future.result()
             if data:
