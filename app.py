@@ -36,7 +36,7 @@ def fetch_one_stock(sym, interval='1wk'):
         range_map = {'1wk': '4y', '1d': '2y', '60m': '1y'}
         range_val = range_map.get(interval, '4y')
         url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={interval}&range={range_val}'
-        r = requests.get(url, headers=HEADERS, timeout=12)
+        r = requests.get(url, headers=HEADERS, timeout=8)
         if not r.ok:
             return sym, None
         data = r.json()
@@ -77,13 +77,13 @@ def fetch_one_stock(sym, interval='1wk'):
 @app.route('/stocks')
 def stocks():
     symbols_param = request.args.get('symbols', '')
-    symbols = [s.strip().upper() for s in symbols_param.split(',') if s.strip()][:50]
+    symbols = [s.strip().upper() for s in symbols_param.split(',') if s.strip()][:100]
     if not symbols:
         return jsonify({})
 
     interval = request.args.get('interval', '1wk')
     results = {}
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    with ThreadPoolExecutor(max_workers=40) as executor:
         futures = {executor.submit(fetch_one_stock, sym, interval): sym for sym in symbols}
         for future in as_completed(futures):
             sym, data = future.result()
@@ -121,28 +121,45 @@ def russell2000():
             raise Exception(f'iShares returned {r.status_code}')
 
         tickers = []
+        seen = set()
         reader = csv.reader(io.StringIO(r.text))
         data_started = False
+        consecutive_invalid = 0
 
         for row in reader:
             if not row:
                 continue
-            ticker = row[0].strip().strip('"')
+            ticker = row[0].strip().strip('"').upper()
 
-            # Skip header rows — wait until we see a valid ticker pattern
+            # Skip header rows until we hit real ticker data
             if not data_started:
-                if ticker and ticker.isupper() and 1 <= len(ticker) <= 5 and ticker.isalpha():
+                if ticker and 1 <= len(ticker) <= 5 and ticker.replace('-','').replace('.','').isalpha():
                     data_started = True
                 else:
                     continue
 
-            # Skip non-ticker rows (cash, header remnants, etc.)
-            if not ticker or ticker in ('Ticker', 'Name', 'CASH', 'USD', 'EUR', '-'):
+            # Stop if we hit the cash/futures/footer section
+            # iShares CSVs end equity section with rows like "Cash", "-", empty tickers
+            if not ticker or ticker in ('TICKER','NAME','CASH','USD','EUR','GBP','-','','TOTAL'):
+                consecutive_invalid += 1
+                if consecutive_invalid > 10:
+                    break  # End of equity section
                 continue
-            if not (ticker.isupper() and 1 <= len(ticker) <= 5 and ticker.replace('-','').isalpha()):
+            consecutive_invalid = 0
+
+            # Accept standard US equity tickers: 1-5 alpha chars, optional hyphen for class shares
+            # Covers: AAPL, BRK-B, BF-B, etc.
+            clean = ticker.replace('-','').replace('.','')
+            if not (1 <= len(ticker) <= 6 and clean.isalpha() and clean.isupper()):
                 continue
 
-            tickers.append(ticker)
+            # Skip known non-equity rows
+            if ticker in ('CASH','USD','EUR','GBP','CHF','JPY','XTSLA','PUT','CALL'):
+                continue
+
+            if ticker not in seen:
+                seen.add(ticker)
+                tickers.append(ticker)
 
         if len(tickers) > 100:
             _russell_cache = tickers
