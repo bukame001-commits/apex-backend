@@ -28,46 +28,120 @@ def health():
 
 
 # ── Fetch single stock from Yahoo Finance ─────────────────────
+def parse_klines_from_rows(rows, interval):
+    """Convert OHLCV rows (list of lists) into kline format [[ts_ms, o, h, l, c, v], ...]"""
+    import datetime
+    klines = []
+    for row in rows:
+        try:
+            if len(row) < 5:
+                continue
+            # Parse date string to timestamp
+            date_str = str(row[0]).strip()
+            try:
+                dt = datetime.datetime.strptime(date_str, '%Y-%m-%d')
+            except ValueError:
+                try:
+                    dt = datetime.datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+                except ValueError:
+                    continue
+            ts_ms = int(dt.timestamp() * 1000)
+            o = float(row[1]) if row[1] and str(row[1]).strip() not in ('', 'null') else None
+            h = float(row[2]) if row[2] and str(row[2]).strip() not in ('', 'null') else None
+            l = float(row[3]) if row[3] and str(row[3]).strip() not in ('', 'null') else None
+            c = float(row[4]) if row[4] and str(row[4]).strip() not in ('', 'null') else None
+            v = float(row[5]) if len(row) > 5 and row[5] and str(row[5]).strip() not in ('', 'null') else 0
+            if o and h and l and c:
+                klines.append([ts_ms, o, h, l, c, v])
+        except Exception:
+            continue
+    return klines
+
+
+def fetch_stooq(sym, interval='1wk'):
+    """Fetch OHLCV from Stooq as fallback. Returns klines list or None."""
+    try:
+        # Stooq interval codes: d=daily, w=weekly, m=monthly
+        interval_map = {'1wk': 'w', '1d': 'd', '60m': 'd'}  # No hourly on Stooq free
+        stooq_interval = interval_map.get(interval, 'd')
+        # Stooq ticker format: lowercase + .us suffix
+        stooq_sym = sym.lower().replace('-', '.') + '.us'
+        url = f'https://stooq.com/q/d/l/?s={stooq_sym}&i={stooq_interval}'
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,*/*',
+            'Referer': 'https://stooq.com/'
+        }
+        r = requests.get(url, headers=headers, timeout=10)
+        if not r.ok or 'No data' in r.text or len(r.text) < 50:
+            return None
+        # Parse CSV — header: Date,Open,High,Low,Close,Volume
+        lines = r.text.strip().splitlines()
+        if len(lines) < 3:
+            return None
+        rows = []
+        for line in lines[1:]:  # skip header
+            parts = line.strip().split(',')
+            if len(parts) >= 5:
+                rows.append(parts)
+        # Stooq returns oldest first — reverse to get newest last (match Yahoo format)
+        rows.reverse()
+        klines = parse_klines_from_rows(rows, interval)
+        return klines if len(klines) >= 20 else None
+    except Exception as e:
+        print(f'Stooq {sym} error: {e}')
+        return None
+
+
 def fetch_one_stock(sym, interval='1wk'):
     try:
         # Normalise interval names (frontend may send 1w, Yahoo needs 1wk)
         interval_map = {'1w': '1wk', '1week': '1wk', '4h': '60m', '4hour': '60m'}
         interval = interval_map.get(interval, interval)
-        range_map = {'1wk': '4y', '1d': '2y', '60m': '1y'}
+        range_map = {'1wk': '4y', '1d': '2y', '60m': '730d'}
         range_val = range_map.get(interval, '4y')
-        url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={interval}&range={range_val}'
-        r = requests.get(url, headers=HEADERS, timeout=8)
-        if not r.ok:
-            return sym, None
-        data = r.json()
-        result = data.get('chart', {}).get('result', [None])[0]
-        if not result:
-            return sym, None
 
-        timestamps = result.get('timestamp', [])
-        q = result.get('indicators', {}).get('quote', [{}])[0]
-        if not q or len(timestamps) < 35:
-            return sym, None
+        # ── 1. Try Yahoo Finance first ──
+        yahoo_klines = None
+        market_cap = None
+        try:
+            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={interval}&range={range_val}'
+            r = requests.get(url, headers=HEADERS, timeout=8)
+            if r.ok:
+                data = r.json()
+                result = data.get('chart', {}).get('result', [None])[0]
+                if result:
+                    timestamps = result.get('timestamp', [])
+                    q = result.get('indicators', {}).get('quote', [{}])[0]
+                    market_cap = result.get('meta', {}).get('marketCap')
+                    if q and len(timestamps) >= 20:
+                        klines = []
+                        opens   = q.get('open',   [None]*len(timestamps))
+                        highs   = q.get('high',   [None]*len(timestamps))
+                        lows    = q.get('low',    [None]*len(timestamps))
+                        closes  = q.get('close',  [None]*len(timestamps))
+                        volumes = q.get('volume', [0]*len(timestamps))
+                        for i, ts in enumerate(timestamps):
+                            if opens[i] is not None and closes[i] is not None:
+                                klines.append([ts * 1000, opens[i], highs[i], lows[i], closes[i], volumes[i] or 0])
+                        if len(klines) >= 20:
+                            yahoo_klines = klines
+        except Exception as e:
+            print(f'{sym} Yahoo error: {e}')
 
-        klines = []
-        opens   = q.get('open',   [None]*len(timestamps))
-        highs   = q.get('high',   [None]*len(timestamps))
-        lows    = q.get('low',    [None]*len(timestamps))
-        closes  = q.get('close',  [None]*len(timestamps))
-        volumes = q.get('volume', [0]*len(timestamps))
+        if yahoo_klines:
+            return sym, {'klines': yahoo_klines, 'marketCap': market_cap, 'type': 'stock'}
 
-        for i, ts in enumerate(timestamps):
-            if opens[i] is not None and closes[i] is not None:
-                klines.append([ts * 1000, opens[i], highs[i], lows[i], closes[i], volumes[i] or 0])
+        # ── 2. Stooq fallback — only fires when Yahoo fails ──
+        # Skip Stooq for 60m (intraday) — it doesn't have reliable hourly data
+        if interval != '60m':
+            print(f'{sym}: Yahoo failed, trying Stooq...')
+            stooq_klines = fetch_stooq(sym, interval)
+            if stooq_klines:
+                print(f'{sym}: Stooq success ({len(stooq_klines)} bars)')
+                return sym, {'klines': stooq_klines, 'marketCap': None, 'type': 'stock'}
 
-        if len(klines) < 35:
-            return sym, None
-
-        return sym, {
-            'klines': klines,
-            'marketCap': result.get('meta', {}).get('marketCap'),
-            'type': 'stock'
-        }
+        return sym, None
     except Exception as e:
         print(f'{sym} error: {e}')
         return sym, None
