@@ -151,7 +151,7 @@ def fetch_one_stock(sym, interval='1wk'):
 @app.route('/crypto')
 def crypto():
     symbols_param = request.args.get('symbols', '')
-    symbols = [s.strip().upper() for s in symbols_param.split(',') if s.strip()][:100]
+    symbols = [s.strip().upper() for s in symbols_param.split(',') if s.strip()][:200]
     if not symbols:
         return jsonify({})
 
@@ -202,7 +202,7 @@ def crypto():
 @app.route('/stocks')
 def stocks():
     symbols_param = request.args.get('symbols', '')
-    symbols = [s.strip().upper() for s in symbols_param.split(',') if s.strip()][:100]
+    symbols = [s.strip().upper() for s in symbols_param.split(',') if s.strip()][:200]
     if not symbols:
         return jsonify({})
 
