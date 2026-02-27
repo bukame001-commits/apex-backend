@@ -76,7 +76,9 @@ def detect_volume_spike(symbol, klines):
 
 
 # ── Background monitor scan ───────────────────────────────────
-MONITOR_COINS = [
+# MONITOR_COINS is populated dynamically on startup from KuCoin/OKX
+# Falls back to this built-in list if exchange APIs are unreachable
+MONITOR_COINS_BUILTIN = [
     'BTC','ETH','BNB','XRP','SOL','ADA','DOGE','TRX','DOT','LTC',
     'SHIB','AVAX','LINK','ATOM','UNI','XLM','BCH','ALGO','ICP','HBAR',
     'APT','ARB','NEAR','GRT','AAVE','INJ','OP','SUI','SEI','TIA',
@@ -90,7 +92,80 @@ MONITOR_COINS = [
     'MANTA','ALT','PIXEL','PORTAL','ZETA','DYM','TNSR','REZ','BB','NOT',
     'IO','ZK','WLD','ETHFI','EIGEN','HMSTR','CATI','NEIRO','SCR','DOGS',
     'PNUT','ACT','GOAT','MOODENG','TURBO','BRETT','ENA','SAGA','BOME','MEW',
+    'NEAR','AVAX','LINK','UNI','MKR','AAVE','SNX','CRV','YFI','SUSHI',
+    'BAL','UMA','GRT','LDO','CVX','DYDX','PERP','GNS','JOE','PENDLE',
 ]
+MONITOR_COINS = list(MONITOR_COINS_BUILTIN)  # will be replaced on startup
+
+
+def fetch_monitor_coins():
+    """Fetch full coin list from KuCoin or OKX for monitoring."""
+    global MONITOR_COINS
+    EXCLUDE = {'USDT','USDC','BUSD','TUSD','USDD','USDP','FDUSD','DAI','FRAX',
+               'LUSD','PYUSD','GUSD','SUSD','USDB','USDX','EURC','WBTC','WETH',
+               'WBNB','STETH','WSTETH','CBETH','RETH','BETH','BTCB','HBTC'}
+    coins = []
+
+    # Try Binance first
+    try:
+        r = requests.get('https://api.binance.com/api/v3/exchangeInfo', headers=HEADERS, timeout=10)
+        if r.ok:
+            data = r.json()
+            seen = set()
+            for s in data.get('symbols', []):
+                if (s.get('quoteAsset') == 'USDT' and
+                    s.get('status') == 'TRADING' and
+                    s.get('isSpotTradingAllowed', False)):
+                    base = s['baseAsset']
+                    if base not in seen and base not in EXCLUDE:
+                        seen.add(base)
+                        coins.append(base)
+            if coins:
+                MONITOR_COINS = coins
+                print(f'[MONITOR] Loaded {len(MONITOR_COINS)} coins from Binance')
+                return
+    except Exception as e:
+        print(f'[MONITOR] Binance fetch failed: {e}')
+
+    # Try KuCoin
+    try:
+        r2 = requests.get('https://api.kucoin.com/api/v2/symbols', headers=HEADERS, timeout=10)
+        if r2.ok:
+            data2 = r2.json()
+            seen = set()
+            for s in data2.get('data', []):
+                if s.get('quoteCurrency') == 'USDT' and s.get('enableTrading', False):
+                    base = s['baseCurrency']
+                    if base not in seen and base not in EXCLUDE:
+                        seen.add(base)
+                        coins.append(base)
+            if coins:
+                MONITOR_COINS = coins
+                print(f'[MONITOR] Loaded {len(MONITOR_COINS)} coins from KuCoin')
+                return
+    except Exception as e:
+        print(f'[MONITOR] KuCoin fetch failed: {e}')
+
+    # Try OKX
+    try:
+        r3 = requests.get('https://www.okx.com/api/v5/public/instruments?instType=SPOT', headers=HEADERS, timeout=10)
+        if r3.ok:
+            data3 = r3.json()
+            seen = set()
+            for s in data3.get('data', []):
+                if s.get('quoteCcy') == 'USDT' and s.get('state') == 'live':
+                    base = s['baseCcy']
+                    if base not in seen and base not in EXCLUDE:
+                        seen.add(base)
+                        coins.append(base)
+            if coins:
+                MONITOR_COINS = coins
+                print(f'[MONITOR] Loaded {len(MONITOR_COINS)} coins from OKX')
+                return
+    except Exception as e:
+        print(f'[MONITOR] OKX fetch failed: {e}')
+
+    print(f'[MONITOR] All exchanges failed — using built-in list of {len(MONITOR_COINS)} coins')
 
 
 def run_monitor_scan():
@@ -161,13 +236,19 @@ def monitor_loop():
     global _monitor_running
     _monitor_running = True
     print(f'[MONITOR] Background monitor started — scanning every {SCAN_INTERVAL_SECONDS//60} minutes')
-    # Wait 60s after startup before first scan (let server fully initialize)
-    time.sleep(60)
+    # Wait 30s after startup then fetch full coin list
+    time.sleep(30)
+    fetch_monitor_coins()
+    # Wait another 30s before first scan
+    time.sleep(30)
     while True:
         try:
             run_monitor_scan()
         except Exception as e:
             print(f'[MONITOR] Scan error: {e}')
+        # Refresh coin list every 24 hours
+        if int(time.time()) % 86400 < SCAN_INTERVAL_SECONDS:
+            fetch_monitor_coins()
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 
