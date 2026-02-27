@@ -147,36 +147,69 @@ def fetch_one_stock(sym, interval='1wk'):
         return sym, None
 
 
-# ── Binance USDT pairs — fetch real list server-side ─────────
+# ── Crypto pairs — fetch real list from multiple exchanges ───
 @app.route('/binance-pairs')
 def binance_pairs():
+    EXCLUDE = {'USDT','USDC','BUSD','TUSD','USDD','USDP','FDUSD','DAI','FRAX',
+               'LUSD','PYUSD','GUSD','SUSD','USDB','USDX','EURC','WBTC','WETH',
+               'WBNB','STETH','WSTETH','CBETH','RETH','BETH','BTCB','HBTC'}
+    seen = set()
+    symbols = []
+
+    # 1. Try Binance
     try:
-        # Binance exchange info — no auth needed, returns all trading pairs
-        r = requests.get('https://api.binance.com/api/v3/exchangeInfo', headers=HEADERS, timeout=15)
-        if not r.ok:
-            return jsonify({'error': 'Binance unreachable', 'symbols': []})
-        data = r.json()
-        
-        EXCLUDE = {'USDT','USDC','BUSD','TUSD','USDD','USDP','FDUSD','DAI','FRAX',
-                   'LUSD','PYUSD','GUSD','SUSD','USDB','USDX','EURC','WBTC','WETH',
-                   'WBNB','STETH','WSTETH','CBETH','RETH','BETH','BTCB','HBTC'}
-        
-        # Extract all USDT spot pairs that are actively trading
-        symbols = []
-        seen = set()
-        for s in data.get('symbols', []):
-            if (s.get('quoteAsset') == 'USDT' and 
-                s.get('status') == 'TRADING' and
-                s.get('isSpotTradingAllowed', False)):
-                base = s['baseAsset']
-                if base not in seen and base not in EXCLUDE:
-                    seen.add(base)
-                    symbols.append(base)
-        
-        return jsonify({'symbols': symbols, 'count': len(symbols)})
+        r = requests.get('https://api.binance.com/api/v3/exchangeInfo', headers=HEADERS, timeout=10)
+        if r.ok:
+            data = r.json()
+            for s in data.get('symbols', []):
+                if (s.get('quoteAsset') == 'USDT' and
+                    s.get('status') == 'TRADING' and
+                    s.get('isSpotTradingAllowed', False)):
+                    base = s['baseAsset']
+                    if base not in seen and base not in EXCLUDE:
+                        seen.add(base)
+                        symbols.append(base)
+            if symbols:
+                print(f'Binance pairs: {len(symbols)}')
+                return jsonify({'symbols': symbols, 'count': len(symbols), 'source': 'binance'})
     except Exception as e:
-        print(f'binance-pairs error: {e}')
-        return jsonify({'error': str(e), 'symbols': []})
+        print(f'Binance exchangeInfo error: {e}')
+
+    # 2. Try KuCoin
+    try:
+        r2 = requests.get('https://api.kucoin.com/api/v2/symbols', headers=HEADERS, timeout=10)
+        if r2.ok:
+            data2 = r2.json()
+            for s in data2.get('data', []):
+                if s.get('quoteCurrency') == 'USDT' and s.get('enableTrading', False):
+                    base = s['baseCurrency']
+                    if base not in seen and base not in EXCLUDE:
+                        seen.add(base)
+                        symbols.append(base)
+            if symbols:
+                print(f'KuCoin pairs: {len(symbols)}')
+                return jsonify({'symbols': symbols, 'count': len(symbols), 'source': 'kucoin'})
+    except Exception as e:
+        print(f'KuCoin symbols error: {e}')
+
+    # 3. Try OKX
+    try:
+        r3 = requests.get('https://www.okx.com/api/v5/public/instruments?instType=SPOT', headers=HEADERS, timeout=10)
+        if r3.ok:
+            data3 = r3.json()
+            for s in data3.get('data', []):
+                if s.get('quoteCcy') == 'USDT' and s.get('state') == 'live':
+                    base = s['baseCcy']
+                    if base not in seen and base not in EXCLUDE:
+                        seen.add(base)
+                        symbols.append(base)
+            if symbols:
+                print(f'OKX pairs: {len(symbols)}')
+                return jsonify({'symbols': symbols, 'count': len(symbols), 'source': 'okx'})
+    except Exception as e:
+        print(f'OKX instruments error: {e}')
+
+    return jsonify({'symbols': [], 'count': 0, 'source': 'none'})
 
 
 # ── Crypto OHLCV data — fetch from Binance server-side ──────
@@ -196,23 +229,70 @@ def crypto():
 
     def fetch_one_crypto(sym):
         try:
-            # Try Binance Futures first
-            url = f'https://fapi.binance.com/fapi/v1/klines?symbol={sym}USDT&interval={binance_interval}&limit={limit}'
-            r = requests.get(url, headers=HEADERS, timeout=8)
-            if r.ok:
-                data = r.json()
-                if isinstance(data, list) and len(data) >= 20:
-                    klines = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in data]
-                    return sym, {'klines': klines, 'type': 'crypto'}
+            # 1. Try Binance Futures
+            try:
+                url = f'https://fapi.binance.com/fapi/v1/klines?symbol={sym}USDT&interval={binance_interval}&limit={limit}'
+                r = requests.get(url, headers=HEADERS, timeout=6)
+                if r.ok:
+                    data = r.json()
+                    if isinstance(data, list) and len(data) >= 20:
+                        klines = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in data]
+                        return sym, {'klines': klines, 'type': 'crypto'}
+            except Exception: pass
 
-            # Try Binance Spot
-            url2 = f'https://api.binance.com/api/v3/klines?symbol={sym}USDT&interval={binance_interval}&limit={limit}'
-            r2 = requests.get(url2, headers=HEADERS, timeout=8)
-            if r2.ok:
-                data2 = r2.json()
-                if isinstance(data2, list) and len(data2) >= 20:
-                    klines = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in data2]
-                    return sym, {'klines': klines, 'type': 'crypto'}
+            # 2. Try Binance Spot
+            try:
+                url2 = f'https://api.binance.com/api/v3/klines?symbol={sym}USDT&interval={binance_interval}&limit={limit}'
+                r2 = requests.get(url2, headers=HEADERS, timeout=6)
+                if r2.ok:
+                    data2 = r2.json()
+                    if isinstance(data2, list) and len(data2) >= 20:
+                        klines = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in data2]
+                        return sym, {'klines': klines, 'type': 'crypto'}
+            except Exception: pass
+
+            # 3. KuCoin — not geo-blocked on cloud IPs, 700+ USDT pairs
+            try:
+                kucoin_interval = {'1W': '1week', '1d': '1day', '4h': '4hour'}.get(binance_interval, '1day')
+                import time
+                end_ts = int(time.time())
+                start_ts = end_ts - (limit * {'1week': 604800, '1day': 86400, '4hour': 14400}.get(kucoin_interval, 86400))
+                url3 = f'https://api.kucoin.com/api/v1/market/candles?symbol={sym}-USDT&type={kucoin_interval}&startAt={start_ts}&endAt={end_ts}'
+                r3 = requests.get(url3, headers=HEADERS, timeout=8)
+                if r3.ok:
+                    data3 = r3.json()
+                    candles = data3.get('data', [])
+                    if candles and len(candles) >= 20:
+                        # KuCoin returns newest first: [time, open, close, high, low, volume, turnover]
+                        klines = []
+                        for c in reversed(candles):
+                            try:
+                                klines.append([int(c[0])*1000, float(c[1]), float(c[3]), float(c[4]), float(c[2]), float(c[5])])
+                            except Exception: continue
+                        if len(klines) >= 20:
+                            return sym, {'klines': klines, 'type': 'crypto'}
+            except Exception as e:
+                print(f'KuCoin {sym} error: {e}')
+
+            # 4. OKX — another exchange that works from cloud IPs
+            try:
+                okx_bar = {'1W': '1W', '1d': '1D', '4h': '4H'}.get(binance_interval, '1D')
+                url4 = f'https://www.okx.com/api/v5/market/history-candles?instId={sym}-USDT&bar={okx_bar}&limit={min(limit, 300)}'
+                r4 = requests.get(url4, headers=HEADERS, timeout=8)
+                if r4.ok:
+                    data4 = r4.json()
+                    candles4 = data4.get('data', [])
+                    if candles4 and len(candles4) >= 20:
+                        # OKX: [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
+                        klines = []
+                        for c in reversed(candles4):
+                            try:
+                                klines.append([int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])])
+                            except Exception: continue
+                        if len(klines) >= 20:
+                            return sym, {'klines': klines, 'type': 'crypto'}
+            except Exception as e:
+                print(f'OKX {sym} error: {e}')
 
             return sym, None
         except Exception as e:
