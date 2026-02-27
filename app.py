@@ -448,7 +448,7 @@ def binance_pairs():
     return jsonify({'symbols': [], 'count': 0, 'source': 'none'})
 
 
-# ── Crypto OHLCV data — fetch from Binance server-side ──────
+# ── Crypto OHLCV data — fetch from multiple exchanges server-side ──────
 @app.route('/crypto')
 def crypto():
     symbols_param = request.args.get('symbols', '')
@@ -459,90 +459,102 @@ def crypto():
     interval = request.args.get('interval', '1d')
     limit = int(request.args.get('limit', '210'))
 
-    # Normalize interval for Binance
-    interval_map = {'1w': '1W', '1week': '1W', '4h': '4h', '1d': '1d'}
-    binance_interval = interval_map.get(interval, interval)
+    # Normalize intervals per exchange
+    kucoin_interval = {'1w': '1week', '4h': '4hour', '1d': '1day'}.get(interval, '1day')
+    binance_interval = {'1w': '1w', '4h': '4h', '1d': '1d'}.get(interval, '1d')
+    okx_bar = {'1w': '1W', '4h': '4H', '1d': '1D'}.get(interval, '1D')
+
+    print(f'[CRYPTO] {len(symbols)} symbols | interval={interval} kucoin={kucoin_interval} binance={binance_interval} okx={okx_bar}')
 
     def fetch_one_crypto(sym):
+        # ── 1. KuCoin FIRST — most reliable from Railway/cloud IPs ──
         try:
-            # 1. Try Binance Futures
-            try:
-                url = f'https://fapi.binance.com/fapi/v1/klines?symbol={sym}USDT&interval={binance_interval}&limit={limit}'
-                r = requests.get(url, headers=HEADERS, timeout=6)
-                if r.ok:
-                    data = r.json()
-                    if isinstance(data, list) and len(data) >= 20:
-                        klines = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in data]
-                        return sym, {'klines': klines, 'type': 'crypto'}
-            except Exception: pass
-
-            # 2. Try Binance Spot
-            try:
-                url2 = f'https://api.binance.com/api/v3/klines?symbol={sym}USDT&interval={binance_interval}&limit={limit}'
-                r2 = requests.get(url2, headers=HEADERS, timeout=6)
-                if r2.ok:
-                    data2 = r2.json()
-                    if isinstance(data2, list) and len(data2) >= 20:
-                        klines = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in data2]
-                        return sym, {'klines': klines, 'type': 'crypto'}
-            except Exception: pass
-
-            # 3. KuCoin — not geo-blocked on cloud IPs, 700+ USDT pairs
-            try:
-                kucoin_interval = {'1W': '1week', '1d': '1day', '4h': '4hour'}.get(binance_interval, '1day')
-                import time
-                end_ts = int(time.time())
-                start_ts = end_ts - (limit * {'1week': 604800, '1day': 86400, '4hour': 14400}.get(kucoin_interval, 86400))
-                url3 = f'https://api.kucoin.com/api/v1/market/candles?symbol={sym}-USDT&type={kucoin_interval}&startAt={start_ts}&endAt={end_ts}'
-                r3 = requests.get(url3, headers=HEADERS, timeout=8)
-                if r3.ok:
-                    data3 = r3.json()
-                    candles = data3.get('data', [])
-                    if candles and len(candles) >= 20:
-                        # KuCoin returns newest first: [time, open, close, high, low, volume, turnover]
-                        klines = []
-                        for c in reversed(candles):
-                            try:
-                                klines.append([int(c[0])*1000, float(c[1]), float(c[3]), float(c[4]), float(c[2]), float(c[5])])
-                            except Exception: continue
-                        if len(klines) >= 20:
-                            return sym, {'klines': klines, 'type': 'crypto'}
-            except Exception as e:
-                print(f'KuCoin {sym} error: {e}')
-
-            # 4. OKX — another exchange that works from cloud IPs
-            try:
-                okx_bar = {'1W': '1W', '1d': '1D', '4h': '4H'}.get(binance_interval, '1D')
-                url4 = f'https://www.okx.com/api/v5/market/history-candles?instId={sym}-USDT&bar={okx_bar}&limit={min(limit, 300)}'
-                r4 = requests.get(url4, headers=HEADERS, timeout=8)
-                if r4.ok:
-                    data4 = r4.json()
-                    candles4 = data4.get('data', [])
-                    if candles4 and len(candles4) >= 20:
-                        # OKX: [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
-                        klines = []
-                        for c in reversed(candles4):
-                            try:
-                                klines.append([int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])])
-                            except Exception: continue
-                        if len(klines) >= 20:
-                            return sym, {'klines': klines, 'type': 'crypto'}
-            except Exception as e:
-                print(f'OKX {sym} error: {e}')
-
-            return sym, None
+            end_ts = int(time.time())
+            secs = {'1week': 604800, '1day': 86400, '4hour': 14400}.get(kucoin_interval, 86400)
+            start_ts = end_ts - (limit * secs)
+            url_kc = f'https://api.kucoin.com/api/v1/market/candles?symbol={sym}-USDT&type={kucoin_interval}&startAt={start_ts}&endAt={end_ts}'
+            r = requests.get(url_kc, headers=HEADERS, timeout=10)
+            if r.ok:
+                candles = r.json().get('data', [])
+                if candles and len(candles) >= 20:
+                    klines = []
+                    for c in reversed(candles):
+                        try:
+                            klines.append([int(c[0])*1000, float(c[1]), float(c[3]), float(c[4]), float(c[2]), float(c[5])])
+                        except Exception:
+                            continue
+                    if len(klines) >= 20:
+                        return sym, {'klines': klines, 'type': 'crypto', 'source': 'kucoin'}
+            else:
+                print(f'[CRYPTO] KuCoin {sym}: HTTP {r.status_code}')
         except Exception as e:
-            print(f'Crypto {sym} error: {e}')
-            return sym, None
+            print(f'[CRYPTO] KuCoin {sym} error: {e}')
+
+        # ── 2. OKX ──
+        try:
+            url_okx = f'https://www.okx.com/api/v5/market/history-candles?instId={sym}-USDT&bar={okx_bar}&limit={min(limit, 300)}'
+            r2 = requests.get(url_okx, headers=HEADERS, timeout=10)
+            if r2.ok:
+                candles2 = r2.json().get('data', [])
+                if candles2 and len(candles2) >= 20:
+                    klines = []
+                    for c in reversed(candles2):
+                        try:
+                            klines.append([int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])])
+                        except Exception:
+                            continue
+                    if len(klines) >= 20:
+                        return sym, {'klines': klines, 'type': 'crypto', 'source': 'okx'}
+            else:
+                print(f'[CRYPTO] OKX {sym}: HTTP {r2.status_code}')
+        except Exception as e:
+            print(f'[CRYPTO] OKX {sym} error: {e}')
+
+        # ── 3. Binance Spot ──
+        try:
+            url_bs = f'https://api.binance.com/api/v3/klines?symbol={sym}USDT&interval={binance_interval}&limit={limit}'
+            r3 = requests.get(url_bs, headers=HEADERS, timeout=8)
+            if r3.ok:
+                data3 = r3.json()
+                if isinstance(data3, list) and len(data3) >= 20:
+                    klines = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in data3]
+                    return sym, {'klines': klines, 'type': 'crypto', 'source': 'binance_spot'}
+            else:
+                print(f'[CRYPTO] Binance Spot {sym}: HTTP {r3.status_code} {r3.text[:80]}')
+        except Exception as e:
+            print(f'[CRYPTO] Binance Spot {sym} error: {e}')
+
+        # ── 4. Binance Futures ──
+        try:
+            url_bf = f'https://fapi.binance.com/fapi/v1/klines?symbol={sym}USDT&interval={binance_interval}&limit={limit}'
+            r4 = requests.get(url_bf, headers=HEADERS, timeout=8)
+            if r4.ok:
+                data4 = r4.json()
+                if isinstance(data4, list) and len(data4) >= 20:
+                    klines = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in data4]
+                    return sym, {'klines': klines, 'type': 'crypto', 'source': 'binance_futures'}
+            else:
+                print(f'[CRYPTO] Binance Futures {sym}: HTTP {r4.status_code} {r4.text[:80]}')
+        except Exception as e:
+            print(f'[CRYPTO] Binance Futures {sym} error: {e}')
+
+        print(f'[CRYPTO] ALL sources failed for {sym}')
+        return sym, None
 
     results = {}
-    with ThreadPoolExecutor(max_workers=40) as executor:
+    # Reduced workers to avoid triggering exchange rate limits
+    with ThreadPoolExecutor(max_workers=20) as executor:
         futures = {executor.submit(fetch_one_crypto, sym): sym for sym in symbols}
         for future in as_completed(futures):
             sym, data = future.result()
             if data:
                 results[sym] = data
 
+    sources = {}
+    for d in results.values():
+        src = d.get('source', 'unknown')
+        sources[src] = sources.get(src, 0) + 1
+    print(f'[CRYPTO] Done: {len(results)}/{len(symbols)} fetched. Sources: {sources}')
     return jsonify(results)
 
 
