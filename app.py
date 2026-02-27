@@ -2,6 +2,7 @@ import os
 import csv
 import io
 import time
+import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify, request
@@ -9,6 +10,17 @@ from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
+
+# ── Telegram config (set via environment variables on Render) ─
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
+
+# ── Volume alert config ───────────────────────────────────────
+VOLUME_SPIKE_MULTIPLIER = 2.5   # alert if current vol > 2.5x 20-bar average
+SCAN_INTERVAL_SECONDS   = 3600  # scan every hour
+ALERT_COOLDOWN_SECONDS  = 14400 # don't re-alert same coin within 4 hours
+_last_alert_time = {}           # symbol -> last alert timestamp
+_monitor_running  = False
 
 # ── Cache for Russell 2000 constituents (refresh every 24h) ──
 _russell_cache = None
@@ -21,10 +33,153 @@ HEADERS = {
 }
 
 
+# ── Send Telegram message ────────────────────────────────────
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print('[ALERT] Telegram not configured — skipping notification')
+        return False
+    try:
+        url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
+        payload = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message,
+            'parse_mode': 'HTML'
+        }
+        r = requests.post(url, json=payload, timeout=10)
+        if r.ok:
+            print(f'[ALERT] Telegram sent OK')
+            return True
+        else:
+            print(f'[ALERT] Telegram error: {r.status_code} {r.text}')
+            return False
+    except Exception as e:
+        print(f'[ALERT] Telegram exception: {e}')
+        return False
+
+
+# ── Volume spike detection ────────────────────────────────────
+def detect_volume_spike(symbol, klines):
+    """Returns spike ratio if volume spike detected, else None."""
+    if not klines or len(klines) < 22:
+        return None
+    try:
+        vols = [float(k[5]) for k in klines]
+        avg_vol = sum(vols[-21:-1]) / 20   # 20-bar average excluding current
+        curr_vol = vols[-1]
+        if avg_vol > 0:
+            ratio = curr_vol / avg_vol
+            if ratio >= VOLUME_SPIKE_MULTIPLIER:
+                return round(ratio, 2)
+    except Exception:
+        pass
+    return None
+
+
+# ── Background monitor scan ───────────────────────────────────
+MONITOR_COINS = [
+    'BTC','ETH','BNB','XRP','SOL','ADA','DOGE','TRX','DOT','LTC',
+    'SHIB','AVAX','LINK','ATOM','UNI','XLM','BCH','ALGO','ICP','HBAR',
+    'APT','ARB','NEAR','GRT','AAVE','INJ','OP','SUI','SEI','TIA',
+    'RUNE','PENDLE','JUP','WIF','BONK','FLOKI','PEPE','TON','KAS','TAO',
+    'IMX','RNDR','FIL','THETA','EGLD','MINA','SAND','MANA','AXS','CHZ',
+    'ENJ','GALA','GMT','GMX','DYDX','LDO','CRV','COMP','SNX','STX',
+    'BLUR','KAVA','ROSE','ANKR','ZIL','ETC','VET','1INCH','CAKE','FTM',
+    'MAGIC','PYTH','JTO','STRK','METIS','API3','MASK','ALICE','GLMR','KSM',
+    'ZRX','BAT','OMG','BNT','STORJ','KNC','WAVES','QTUM','ICX','LSK',
+    'JASMY','HIGH','LQTY','RPL','SSV','RDNT','GNS','HOOK','ACE','XAI',
+    'MANTA','ALT','PIXEL','PORTAL','ZETA','DYM','TNSR','REZ','BB','NOT',
+    'IO','ZK','WLD','ETHFI','EIGEN','HMSTR','CATI','NEIRO','SCR','DOGS',
+    'PNUT','ACT','GOAT','MOODENG','TURBO','BRETT','ENA','SAGA','BOME','MEW',
+]
+
+
+def run_monitor_scan():
+    """Scan all monitored coins and send Telegram alerts for volume spikes."""
+    print(f'[MONITOR] Starting volume scan for {len(MONITOR_COINS)} coins...')
+    alerts = []
+    now = time.time()
+
+    def check_coin(sym):
+        # Skip if alerted recently
+        if now - _last_alert_time.get(sym, 0) < ALERT_COOLDOWN_SECONDS:
+            return None
+        try:
+            # Try KuCoin first (reliable from cloud IPs)
+            kucoin_url = f'https://api.kucoin.com/api/v1/market/candles?symbol={sym}-USDT&type=1day&startAt={int(now)-86400*30}&endAt={int(now)}'
+            r = requests.get(kucoin_url, headers=HEADERS, timeout=8)
+            if r.ok:
+                data = r.json().get('data', [])
+                if len(data) >= 22:
+                    # KuCoin newest first: [time, open, close, high, low, vol, turnover]
+                    klines = [[int(c[0])*1000, float(c[1]), float(c[3]), float(c[4]), float(c[2]), float(c[5])] for c in reversed(data)]
+                    spike = detect_volume_spike(sym, klines)
+                    if spike:
+                        price = klines[-1][4]
+                        return {'sym': sym, 'spike': spike, 'price': price, 'source': 'KuCoin'}
+
+            # Try OKX fallback
+            okx_url = f'https://www.okx.com/api/v5/market/history-candles?instId={sym}-USDT&bar=1D&limit=30'
+            r2 = requests.get(okx_url, headers=HEADERS, timeout=8)
+            if r2.ok:
+                data2 = r2.json().get('data', [])
+                if len(data2) >= 22:
+                    klines2 = [[int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in reversed(data2)]
+                    spike = detect_volume_spike(sym, klines2)
+                    if spike:
+                        price = klines2[-1][4]
+                        return {'sym': sym, 'spike': spike, 'price': price, 'source': 'OKX'}
+        except Exception as e:
+            print(f'[MONITOR] {sym} error: {e}')
+        return None
+
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        results = list(executor.map(check_coin, MONITOR_COINS))
+
+    for result in results:
+        if result:
+            alerts.append(result)
+            _last_alert_time[result['sym']] = now
+
+    if alerts:
+        # Sort by spike ratio descending
+        alerts.sort(key=lambda x: x['spike'], reverse=True)
+        lines = [f'🚨 <b>APEX SCANNER — VOLUME SPIKE ALERT</b>']
+        lines.append(f'⏰ {time.strftime("%Y-%m-%d %H:%M UTC")}')
+        lines.append('')
+        for a in alerts[:10]:  # max 10 per message
+            lines.append(f'<b>{a["sym"]}</b>  {a["spike"]}x avg volume')
+            lines.append(f'   Price: ${a["price"]:,.4f}  |  Source: {a["source"]}')
+            lines.append('')
+        send_telegram('\n'.join(lines))
+        print(f'[MONITOR] Sent alert for {len(alerts)} coins: {[a["sym"] for a in alerts]}')
+    else:
+        print(f'[MONITOR] Scan complete — no volume spikes detected')
+
+
+def monitor_loop():
+    """Background thread — runs forever, scanning every SCAN_INTERVAL_SECONDS."""
+    global _monitor_running
+    _monitor_running = True
+    print(f'[MONITOR] Background monitor started — scanning every {SCAN_INTERVAL_SECONDS//60} minutes')
+    # Wait 60s after startup before first scan (let server fully initialize)
+    time.sleep(60)
+    while True:
+        try:
+            run_monitor_scan()
+        except Exception as e:
+            print(f'[MONITOR] Scan error: {e}')
+        time.sleep(SCAN_INTERVAL_SECONDS)
+
+
+# Start background monitor thread on server startup
+_monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+_monitor_thread.start()
+
+
 # ── Health check ─────────────────────────────────────────────
 @app.route('/health')
 def health():
-    return jsonify({'status': 'ok'})
+    return jsonify({'status': 'ok', 'monitor': _monitor_running})
 
 
 # ── Fetch single stock from Yahoo Finance ─────────────────────
@@ -449,6 +604,71 @@ def sp500():
         return jsonify({'tickers': tickers[:505], 'count': len(tickers)})
     except Exception as e:
         return jsonify({'error': str(e)}), 503
+
+
+# ── Monitor control routes ───────────────────────────────────
+@app.route('/monitor/config', methods=['POST'])
+def monitor_config():
+    """Accept token/chat_id from frontend and store for this session."""
+    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+    data = request.get_json(silent=True) or {}
+    token   = data.get('token', '').strip()
+    chat_id = data.get('chat_id', '').strip()
+    if token and chat_id:
+        TELEGRAM_BOT_TOKEN = token
+        TELEGRAM_CHAT_ID   = chat_id
+        print(f'[MONITOR] Telegram configured via frontend — chat_id: {chat_id}')
+        return jsonify({'ok': True, 'message': 'Telegram configured for this session'})
+    return jsonify({'ok': False, 'message': 'Missing token or chat_id'}), 400
+
+
+@app.route('/monitor/status')
+def monitor_status():
+    now = time.time()
+    recent = [sym for sym, t in _last_alert_time.items() if now - t < ALERT_COOLDOWN_SECONDS]
+    return jsonify({
+        'running': _monitor_running,
+        'scan_interval_minutes': SCAN_INTERVAL_SECONDS // 60,
+        'alert_cooldown_hours': ALERT_COOLDOWN_SECONDS // 3600,
+        'spike_threshold': VOLUME_SPIKE_MULTIPLIER,
+        'coins_monitored': len(MONITOR_COINS),
+        'recent_alerts': len(recent),
+        'telegram_configured': bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+    })
+
+
+@app.route('/monitor/test')
+def monitor_test():
+    """Send test message — accepts token/chat_id as query params for one-off test."""
+    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+    # Allow passing token/chat_id directly in URL for test
+    token   = request.args.get('token',   TELEGRAM_BOT_TOKEN).strip()
+    chat_id = request.args.get('chat_id', TELEGRAM_CHAT_ID).strip()
+    if token and chat_id:
+        # Temporarily set for this request
+        old_token, old_cid = TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+        TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID = token, chat_id
+        ok = send_telegram(
+            f'✅ <b>APEX SCANNER</b> — Test notification\n'
+            f'Alerts are working correctly!\n'
+            f'Monitoring <b>{len(MONITOR_COINS)}</b> coins for volume spikes (2.5× threshold).'
+        )
+        TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID = old_token, old_cid
+        return jsonify({'sent': ok})
+    return jsonify({'sent': False, 'error': 'No Telegram token configured'})
+
+
+@app.route('/monitor/scan-now')
+def monitor_scan_now():
+    """Trigger an immediate scan. Accepts token/chat_id to set config first."""
+    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+    token   = request.args.get('token',   '').strip()
+    chat_id = request.args.get('chat_id', '').strip()
+    if token and chat_id:
+        TELEGRAM_BOT_TOKEN = token
+        TELEGRAM_CHAT_ID   = chat_id
+    threading.Thread(target=run_monitor_scan, daemon=True).start()
+    return jsonify({'status': 'scan started', 'coins': len(MONITOR_COINS)})
 
 
 if __name__ == '__main__':
