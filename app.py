@@ -147,6 +147,38 @@ def fetch_one_stock(sym, interval='1wk'):
         return sym, None
 
 
+# ── Binance USDT pairs — fetch real list server-side ─────────
+@app.route('/binance-pairs')
+def binance_pairs():
+    try:
+        # Binance exchange info — no auth needed, returns all trading pairs
+        r = requests.get('https://api.binance.com/api/v3/exchangeInfo', headers=HEADERS, timeout=15)
+        if not r.ok:
+            return jsonify({'error': 'Binance unreachable', 'symbols': []})
+        data = r.json()
+        
+        EXCLUDE = {'USDT','USDC','BUSD','TUSD','USDD','USDP','FDUSD','DAI','FRAX',
+                   'LUSD','PYUSD','GUSD','SUSD','USDB','USDX','EURC','WBTC','WETH',
+                   'WBNB','STETH','WSTETH','CBETH','RETH','BETH','BTCB','HBTC'}
+        
+        # Extract all USDT spot pairs that are actively trading
+        symbols = []
+        seen = set()
+        for s in data.get('symbols', []):
+            if (s.get('quoteAsset') == 'USDT' and 
+                s.get('status') == 'TRADING' and
+                s.get('isSpotTradingAllowed', False)):
+                base = s['baseAsset']
+                if base not in seen and base not in EXCLUDE:
+                    seen.add(base)
+                    symbols.append(base)
+        
+        return jsonify({'symbols': symbols, 'count': len(symbols)})
+    except Exception as e:
+        print(f'binance-pairs error: {e}')
+        return jsonify({'error': str(e), 'symbols': []})
+
+
 # ── Crypto OHLCV data — fetch from Binance server-side ──────
 @app.route('/crypto')
 def crypto():
