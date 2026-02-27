@@ -147,6 +147,57 @@ def fetch_one_stock(sym, interval='1wk'):
         return sym, None
 
 
+# ── Crypto OHLCV data — fetch from Binance server-side ──────
+@app.route('/crypto')
+def crypto():
+    symbols_param = request.args.get('symbols', '')
+    symbols = [s.strip().upper() for s in symbols_param.split(',') if s.strip()][:100]
+    if not symbols:
+        return jsonify({})
+
+    interval = request.args.get('interval', '1d')
+    limit = int(request.args.get('limit', '210'))
+
+    # Normalize interval for Binance
+    interval_map = {'1w': '1W', '1week': '1W', '4h': '4h', '1d': '1d'}
+    binance_interval = interval_map.get(interval, interval)
+
+    def fetch_one_crypto(sym):
+        try:
+            # Try Binance Futures first
+            url = f'https://fapi.binance.com/fapi/v1/klines?symbol={sym}USDT&interval={binance_interval}&limit={limit}'
+            r = requests.get(url, headers=HEADERS, timeout=8)
+            if r.ok:
+                data = r.json()
+                if isinstance(data, list) and len(data) >= 20:
+                    klines = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in data]
+                    return sym, {'klines': klines, 'type': 'crypto'}
+
+            # Try Binance Spot
+            url2 = f'https://api.binance.com/api/v3/klines?symbol={sym}USDT&interval={binance_interval}&limit={limit}'
+            r2 = requests.get(url2, headers=HEADERS, timeout=8)
+            if r2.ok:
+                data2 = r2.json()
+                if isinstance(data2, list) and len(data2) >= 20:
+                    klines = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in data2]
+                    return sym, {'klines': klines, 'type': 'crypto'}
+
+            return sym, None
+        except Exception as e:
+            print(f'Crypto {sym} error: {e}')
+            return sym, None
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=40) as executor:
+        futures = {executor.submit(fetch_one_crypto, sym): sym for sym in symbols}
+        for future in as_completed(futures):
+            sym, data = future.result()
+            if data:
+                results[sym] = data
+
+    return jsonify(results)
+
+
 # ── Stock OHLCV data — parallel fetch via thread pool ────────
 @app.route('/stocks')
 def stocks():
