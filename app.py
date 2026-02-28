@@ -16,9 +16,9 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
 
 # ── Volume alert config ───────────────────────────────────────
-VOLUME_SPIKE_MULTIPLIER = 2.5   # alert if current vol > 2.5x 20-bar average
+VOLUME_SPIKE_MULTIPLIER = 1.8   # alert if current vol > 1.8x 20-bar average
 SCAN_INTERVAL_SECONDS   = 3600  # scan every hour
-ALERT_COOLDOWN_SECONDS  = 14400 # don't re-alert same coin within 4 hours
+ALERT_COOLDOWN_SECONDS  = 7200  # don't re-alert same coin within 2 hours
 _last_alert_time = {}           # symbol -> last alert timestamp
 _monitor_running  = False
 
