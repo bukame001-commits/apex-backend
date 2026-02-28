@@ -8,8 +8,8 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from anthropic import Anthropic
 
 # ── Config ────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
+TELEGRAM_BOT_TOKEN = os.environ.get('YOUTUBE_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID   = os.environ.get('YOUTUBE_CHAT_ID', '')
 ANTHROPIC_API_KEY  = os.environ.get('ANTHROPIC_API_KEY', '')
 CHECK_INTERVAL     = 6 * 3600  # check every 6 hours
 LOOKBACK_HOURS     = 25        # fetch videos published in last 25 hours
