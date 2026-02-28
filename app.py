@@ -59,17 +59,46 @@ def send_telegram(message):
 
 # ── Volume spike detection ────────────────────────────────────
 def detect_volume_spike(symbol, klines):
-    """Returns spike ratio if volume spike detected, else None."""
+    """Returns dict with spike info if volume spike at good entry, else None."""
     if not klines or len(klines) < 22:
         return None
     try:
-        vols = [float(k[5]) for k in klines]
-        avg_vol = sum(vols[-21:-1]) / 20   # 20-bar average excluding current
+        vols   = [float(k[5]) for k in klines]
+        closes = [float(k[4]) for k in klines]
+        lows   = [float(k[3]) for k in klines]
+
+        # ── 1. Volume spike check ──
+        avg_vol  = sum(vols[-21:-1]) / 20   # 20-bar average excluding current
         curr_vol = vols[-1]
-        if avg_vol > 0:
-            ratio = curr_vol / avg_vol
-            if ratio >= VOLUME_SPIKE_MULTIPLIER:
-                return round(ratio, 2)
+        if avg_vol <= 0:
+            return None
+        ratio = curr_vol / avg_vol
+        if ratio < VOLUME_SPIKE_MULTIPLIER:
+            return None
+
+        # ── 2. Volume must be rising for at least 2 consecutive bars ──
+        # Avoids alerting on a single random candle spike
+        if not (vols[-1] > vols[-2]):
+            return None
+
+        # ── 3. Price must be below its 10-bar average (not already pumped) ──
+        avg_price_10 = sum(closes[-11:-1]) / 10
+        curr_price   = closes[-1]
+        if curr_price > avg_price_10 * 1.05:  # allow 5% tolerance
+            return None
+
+        # ── 4. Price must be within 40% of its 30-day low ──
+        low_30 = min(lows[-30:]) if len(lows) >= 30 else min(lows)
+        if low_30 <= 0:
+            return None
+        pct_from_low = (curr_price - low_30) / low_30 * 100
+        if pct_from_low > 40:
+            return None
+
+        return {
+            'ratio': round(ratio, 2),
+            'pct_from_low': round(pct_from_low, 1)
+        }
     except Exception:
         pass
     return None
@@ -190,7 +219,7 @@ def run_monitor_scan():
                     spike = detect_volume_spike(sym, klines)
                     if spike:
                         price = klines[-1][4]
-                        return {'sym': sym, 'spike': spike, 'price': price, 'source': 'KuCoin'}
+                        return {'sym': sym, 'spike': spike['ratio'], 'pct_from_low': spike['pct_from_low'], 'price': price, 'source': 'KuCoin'}
 
             # Try OKX fallback
             okx_url = f'https://www.okx.com/api/v5/market/history-candles?instId={sym}-USDT&bar=1D&limit=30'
@@ -202,7 +231,7 @@ def run_monitor_scan():
                     spike = detect_volume_spike(sym, klines2)
                     if spike:
                         price = klines2[-1][4]
-                        return {'sym': sym, 'spike': spike, 'price': price, 'source': 'OKX'}
+                        return {'sym': sym, 'spike': spike['ratio'], 'pct_from_low': spike['pct_from_low'], 'price': price, 'source': 'OKX'}
         except Exception as e:
             print(f'[MONITOR] {sym} error: {e}')
         return None
@@ -220,10 +249,11 @@ def run_monitor_scan():
         alerts.sort(key=lambda x: x['spike'], reverse=True)
         lines = [f'🚨 <b>APEX SCANNER — VOLUME SPIKE ALERT</b>']
         lines.append(f'⏰ {time.strftime("%Y-%m-%d %H:%M UTC")}')
+        lines.append('✅ Filtered: price below 10-bar avg &amp; within 40% of 30d low')
         lines.append('')
         for a in alerts[:10]:  # max 10 per message
             lines.append(f'<b>{a["sym"]}</b>  {a["spike"]}x avg volume')
-            lines.append(f'   Price: ${a["price"]:,.4f}  |  Source: {a["source"]}')
+            lines.append(f'   Price: ${a["price"]:,.4f}  |  {a["pct_from_low"]}% above 30d low  |  {a["source"]}')
             lines.append('')
         send_telegram('\n'.join(lines))
         print(f'[MONITOR] Sent alert for {len(alerts)} coins: {[a["sym"] for a in alerts]}')
