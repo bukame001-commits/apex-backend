@@ -11,54 +11,49 @@ from anthropic import Anthropic
 TELEGRAM_BOT_TOKEN = os.environ.get('YOUTUBE_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID   = os.environ.get('YOUTUBE_CHAT_ID', '')
 ANTHROPIC_API_KEY  = os.environ.get('ANTHROPIC_API_KEY', '')
-CHECK_INTERVAL     = 6 * 3600  # check every 6 hours
-LOOKBACK_HOURS     = 25        # fetch videos published in last 25 hours
+CHECK_INTERVAL     = 6 * 3600
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ── Channel list ──────────────────────────────────────────────
-# Format: (display_name, youtube_handle_or_channel_id, language)
+# All channel IDs hardcoded — no scraping needed
 CHANNELS = [
     # English
-    ('Coin Bureau',           'UCqK_GSMbpiV8spgD3ZGloSw', 'en'),
-    ('Coin Bureau Trading',   'UCRvqjQPSeaWn-uEx-w0XLIg', 'en'),
-    ('Credible Crypto',       'UCFkLiNTuZHFq6xTAVilFpyg', 'en'),
-    ('DataDash',              'UCCatR7nWbYrkVXdxXb4cGXtA', 'en'),
-    ('Michaël van de Poppe',  'UCdOcUKKU7fIZyIAmVoKU3cg', 'en'),
-    ('Crypto Banter',         'UCN9Nj4tjXbVTLYWN0EKly_Q', 'en'),
-    ('The Limiting Factor',   'UCTlBSoSGmxBSBP7jZnkuAGA', 'en'),
-    ('Rayner Teo',            'UCh6SEPAmBMI8sPMTM8WrAPg', 'en'),
-    ('Peter McCormack',       'UCIQLg9z8CTnDFboGR4BoOSg', 'en'),
-    ('Swan Bitcoin',          'UCISdBpWNRIeGq4JxwNuYr6A', 'en'),
-    ('Crypto Crush Show',     'CRYPTOCRUSHSHOW',            'en'),
+    ('Coin Bureau',          'UCqK_GSMbpiV8spgD3ZGloSw', 'en'),
+    ('Coin Bureau Trading',  'UCRvqjQPSeaWn-uEx-w0XLIg', 'en'),
+    ('Credible Crypto',      'UCFkLiNTuZHFq6xTAVilFpyg', 'en'),
+    ('DataDash',             'UCCatR7nWbYrkVXdxXb4cGXtA', 'en'),
+    ('Michaël van de Poppe', 'UCdOcUKKU7fIZyIAmVoKU3cg', 'en'),
+    ('Crypto Banter',        'UCN9Nj4tjXbVTLYWN0EKly_Q', 'en'),
+    ('The Limiting Factor',  'UCTlBSoSGmxBSBP7jZnkuAGA', 'en'),
+    ('Rayner Teo',           'UCh6SEPAmBMI8sPMTM8WrAPg', 'en'),
+    ('Peter McCormack',      'UCIQLg9z8CTnDFboGR4BoOSg', 'en'),
+    ('Swan Bitcoin',         'UCISdBpWNRIeGq4JxwNuYr6A', 'en'),
+    ('Crypto Crush Show',    'UCEm3DFE4RCKbH1-Ro1UOXZA', 'en'),
     # Turkish
-    ('Kripto Tugay',          'kriptugay',                  'tr'),
-    ('Kripto Ofis',           'kriptoofis',                 'tr'),
-    ('Selcoin',               'Selcoin',                    'tr'),
-    ('Kriptolik',             'Kriptolik',                  'tr'),
-    ('Crypto Mete',           'kriptomete',                 'tr'),
-    ('JrKripto',              'JrKripto_Youtube',           'tr'),
-    ('Tarik Bilen',           'tarikbilenn',                'tr'),
-    ('Kanal Finans',          'KanalFinans',                'tr'),
-    ('Smart Finance',         'AkıllıFinans',               'tr'),
-    ('Turhan Bozkurt',        'TurhanBozkurt',              'tr'),
-    ('Halil Recber',          'halilrecber4608',            'tr'),
-    ('Integral Forextv',      'IntegralForexTV',            'tr'),
-    ('TRADER MAN X',          'TRADERMANX',                 'tr'),
+    ('Kripto Tugay',         'UC5vFx-5UrwQSMBo2jBVRoZA', 'tr'),
+    ('Kripto Ofis',          'UCaYdCdrM3vZsaP9bJXJqzUw', 'tr'),
+    ('Selcoin',              'UCPBKbzQqjpv8aYotZHUV0YA', 'tr'),
+    ('Kriptolik',            'UCNPpHMQGPrAm9MFzBVjCZxA', 'tr'),
+    ('Crypto Mete',          'UCOj-sZB6oNaJBBe6B3xxbkA', 'tr'),
+    ('JrKripto',             'UCnWTsToiAjGpGqLg7xIUKOw', 'tr'),
+    ('Tarik Bilen',          'UCRGGpCBhcPrWB4bOHFGv-Ww', 'tr'),
+    ('Kanal Finans',         'UCY5gEE3IFpEUTqTSUqH0M8w', 'tr'),
+    ('Smart Finance',        'UCz0i7P-jBFlPFRKBqLqLSpA', 'tr'),
+    ('Turhan Bozkurt',       'UCqb9O8rz3aHDJ0l6Wdxydxw', 'tr'),
+    ('Halil Recber',         'UCwP5JExg2M9a2jWNQVqeXNA', 'tr'),
+    ('Integral Forextv',     'UCBkRVBCEo-i7avECPPi2yig', 'tr'),
+    ('TRADER MAN X',         'UCTZvpH2MroVf-tczS_KPVIQ', 'tr'),
 ]
 
-# Track already-processed video IDs to avoid duplicate summaries
 _processed_videos = set()
 
 
-# ── Telegram ──────────────────────────────────────────────────
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print('[YT] Telegram not configured')
         return
     try:
         url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
-        # Split into chunks if too long
         chunks = []
         while len(message) > 4000:
             chunks.append(message[:4000])
@@ -74,109 +69,58 @@ def send_telegram(message):
         print(f'[YT] Telegram error: {e}')
 
 
-# ── Fetch latest videos via RSS ───────────────────────────────
-def get_channel_id_from_handle(handle):
-    """Try to resolve a YouTube @handle to a channel ID via RSS."""
-    # Try direct channel ID first (starts with UC)
-    if handle.startswith('UC') and len(handle) == 24:
-        return handle
-    # Try handle-based RSS
-    urls_to_try = [
-        f'https://www.youtube.com/@{handle}',
-        f'https://www.youtube.com/c/{handle}',
-        f'https://www.youtube.com/user/{handle}',
-    ]
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    for url in urls_to_try:
-        try:
-            r = requests.get(url, headers=headers, timeout=10)
-            if r.ok and 'channel_id' in r.text:
-                # Extract channel ID from page source
-                idx = r.text.find('"channelId":"')
-                if idx != -1:
-                    start = idx + 13
-                    end = r.text.find('"', start)
-                    channel_id = r.text[start:end]
-                    if channel_id.startswith('UC'):
-                        return channel_id
-                # Try alternate pattern
-                idx2 = r.text.find('"externalId":"')
-                if idx2 != -1:
-                    start2 = idx2 + 14
-                    end2 = r.text.find('"', start2)
-                    channel_id2 = r.text[start2:end2]
-                    if channel_id2.startswith('UC'):
-                        return channel_id2
-        except Exception:
-            continue
-    return None
-
-
-def fetch_recent_videos(channel_id, lookback_hours=25):
-    """Fetch videos published in the last N hours via YouTube RSS feed."""
+def fetch_latest_video(channel_id):
     rss_url = f'https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}'
     try:
-        r = requests.get(rss_url, timeout=10)
+        r = requests.get(rss_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
         if not r.ok:
-            return []
-        root = ET.fromstring(r.content)
-        ns = {
-            'atom': 'http://www.w3.org/2005/Atom',
-            'yt':   'http://www.youtube.com/xml/schemas/2015',
-            'media':'http://search.yahoo.com/mrss/'
-        }
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-        videos = []
-        for entry in root.findall('atom:entry', ns):
-            try:
-                video_id  = entry.find('yt:videoId', ns).text
-                title     = entry.find('atom:title', ns).text
-                published = entry.find('atom:published', ns).text
-                pub_dt    = datetime.fromisoformat(published.replace('Z', '+00:00'))
-                if pub_dt >= cutoff:
-                    videos.append({'id': video_id, 'title': title, 'published': pub_dt})
-            except Exception:
-                continue
-        return videos
-    except Exception as e:
-        print(f'[YT] RSS fetch error for {channel_id}: {e}')
-        return []
-
-
-# ── Get transcript ────────────────────────────────────────────
-def get_transcript(video_id, lang='en'):
-    """Fetch transcript for a video. Returns text or None."""
-    try:
-        # Try requested language first, then auto-generated
-        lang_codes = [lang, f'{lang}-auto', 'en', 'tr'] if lang == 'tr' else [lang, 'en']
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        transcript = None
-        for code in lang_codes:
-            try:
-                transcript = transcript_list.find_transcript([code])
-                break
-            except Exception:
-                continue
-        if not transcript:
-            # Try any available transcript
-            try:
-                transcript = transcript_list.find_generated_transcript(['en', 'tr'])
-            except Exception:
-                transcript = next(iter(transcript_list), None)
-        if not transcript:
+            print(f'[YT] RSS failed ({r.status_code}) for {channel_id}')
             return None
-        chunks = transcript.fetch()
-        text = ' '.join([c['text'] for c in chunks])
-        # Limit to ~8000 chars to keep token usage reasonable
-        return text[:8000] if len(text) > 8000 else text
+        root = ET.fromstring(r.content)
+        ns = {'atom': 'http://www.w3.org/2005/Atom', 'yt': 'http://www.youtube.com/xml/schemas/2015'}
+        entries = root.findall('atom:entry', ns)
+        if not entries:
+            return None
+        entry = entries[0]
+        video_id  = entry.find('yt:videoId', ns).text
+        title     = entry.find('atom:title', ns).text
+        published = entry.find('atom:published', ns).text
+        pub_dt    = datetime.fromisoformat(published.replace('Z', '+00:00'))
+        return {'id': video_id, 'title': title, 'published': pub_dt}
     except Exception as e:
-        print(f'[YT] Transcript error for {video_id}: {e}')
+        print(f'[YT] RSS error for {channel_id}: {e}')
         return None
 
 
-# ── Summarize with Claude ──────────────────────────────────────
+def get_transcript(video_id, lang='en'):
+    try:
+        # Try new API style first (v0.6+)
+        ytt_api = YouTubeTranscriptApi()
+        try:
+            transcript = ytt_api.fetch(video_id, languages=[lang, 'en', 'tr'])
+        except Exception:
+            transcript = ytt_api.fetch(video_id)
+        text = ' '.join([s.text for s in transcript])
+        return text[:8000] if len(text) > 8000 else text
+    except Exception:
+        pass
+    try:
+        # Fallback to old API style (v0.5.x)
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        for code in [lang, 'en', 'tr']:
+            try:
+                t = transcript_list.find_transcript([code])
+                chunks = t.fetch()
+                text = ' '.join([c['text'] for c in chunks])
+                return text[:8000] if len(text) > 8000 else text
+            except Exception:
+                continue
+    except Exception as e:
+        print(f'[YT] Transcript error for {video_id}: {e}')
+    return None
+
+
 def summarize(channel_name, video_title, transcript, lang='en'):
-    """Use Claude to summarize the transcript."""
     try:
         if lang == 'tr':
             prompt = f"""Sen bir kripto ve finans içerik analistisin.
@@ -190,12 +134,12 @@ Transkript:
 Lütfen aşağıdaki formatta Türkçe özet yap:
 
 📊 GENEL GÖRÜŞ: (Boğa/Ayı/Nötr ve kısa açıklama)
-💰 BAHSEDİLEN VARLIKLAR: (Ticker sembolleri ve yorum - örn: BTC - güçlü destek)
+💰 BAHSEDİLEN VARLIKLAR: (Ticker sembolleri ve yorum)
 🎯 FİYAT HEDEFLERİ: (Varsa belirt, yoksa "Belirtilmedi")
 ⚠️ RİSKLER: (Bahsedilen riskler)
 💡 ANA MESAJ: (1-2 cümle özet)
 
-Sadece önemli bilgileri yaz, gereksiz detay ekleme."""
+Sadece önemli bilgileri yaz."""
         else:
             prompt = f"""You are a crypto and finance content analyst.
 
@@ -208,7 +152,7 @@ Transcript:
 Provide a concise summary in this exact format:
 
 📊 OVERALL SENTIMENT: (Bullish/Bearish/Neutral + brief reason)
-💰 ASSETS MENTIONED: (Ticker symbols with commentary - e.g. BTC - strong support)
+💰 ASSETS MENTIONED: (Ticker symbols with commentary)
 🎯 PRICE TARGETS: (If mentioned, otherwise "None mentioned")
 ⚠️ RISKS: (Key risks mentioned)
 💡 KEY TAKEAWAY: (1-2 sentence summary)
@@ -222,56 +166,32 @@ Be concise. Only include significant information."""
         )
         return response.content[0].text
     except Exception as e:
-        print(f'[YT] Claude summarize error: {e}')
+        print(f'[YT] Claude error: {e}')
         return None
 
 
-# ── Main scan loop ────────────────────────────────────────────
 def run_youtube_scan():
     print(f'[YT] Starting YouTube scan for {len(CHANNELS)} channels...')
     summaries_sent = 0
-
-    for name, handle, lang in CHANNELS:
+    for name, channel_id, lang in CHANNELS:
         try:
-            # Resolve channel ID
-            if handle.startswith('UC') and len(handle) == 24:
-                channel_id = handle
-            else:
-                channel_id = get_channel_id_from_handle(handle)
-                if not channel_id:
-                    print(f'[YT] Could not resolve channel ID for {name} (@{handle})')
-                    continue
-
-            # Fetch videos and take only the latest one
-            videos = fetch_recent_videos(channel_id, lookback_hours=24*90)  # 90 days to ensure we find something
-            if not videos:
-                print(f'[YT] No videos found for {name}')
+            video = fetch_latest_video(channel_id)
+            if not video:
+                print(f'[YT] No video found for {name}')
                 continue
-
-            # Sort newest first, take only the most recent
-            videos.sort(key=lambda v: v['published'], reverse=True)
-            video = videos[0]
             vid_id = video['id']
-
             if vid_id in _processed_videos:
                 print(f'[YT] Already sent latest for {name} — skipping')
                 continue
-
-            print(f'[YT] Processing latest: {name} — {video["title"]}')
-
-            # Get transcript
+            print(f'[YT] Processing: {name} — {video["title"]}')
             transcript = get_transcript(vid_id, lang)
             if not transcript:
                 print(f'[YT] No transcript for {vid_id} — skipping')
                 _processed_videos.add(vid_id)
                 continue
-
-            # Summarize
             summary = summarize(name, video['title'], transcript, lang)
             if not summary:
                 continue
-
-            # Format and send to Telegram
             pub_str = video['published'].strftime('%d %b %Y %H:%M UTC')
             flag = '🇹🇷' if lang == 'tr' else '🇬🇧'
             message = (
@@ -284,19 +204,15 @@ def run_youtube_scan():
             send_telegram(message)
             _processed_videos.add(vid_id)
             summaries_sent += 1
-            time.sleep(2)  # small delay between messages
-
+            time.sleep(2)
         except Exception as e:
             print(f'[YT] Error processing {name}: {e}')
             continue
-
     print(f'[YT] Scan complete — {summaries_sent} summaries sent')
 
 
 def youtube_monitor_loop():
-    """Background thread — runs forever, scanning every CHECK_INTERVAL seconds."""
     print(f'[YT] YouTube monitor started — checking every {CHECK_INTERVAL//3600} hours')
-    # Wait 2 minutes after startup before first scan
     time.sleep(120)
     while True:
         try:
@@ -306,7 +222,6 @@ def youtube_monitor_loop():
         time.sleep(CHECK_INTERVAL)
 
 
-# ── Start thread (called from app.py) ────────────────────────
 def start_youtube_monitor():
     t = threading.Thread(target=youtube_monitor_loop, daemon=True)
     t.start()
@@ -314,5 +229,4 @@ def start_youtube_monitor():
 
 
 if __name__ == '__main__':
-    # For testing — run once immediately
     run_youtube_scan()
