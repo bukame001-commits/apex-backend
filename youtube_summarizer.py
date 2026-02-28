@@ -46,6 +46,26 @@ CHANNELS = [
 ]
 
 _processed_videos = set()
+_PROCESSED_FILE = '/tmp/yt_processed_videos.txt'
+_scan_lock = threading.Lock()
+
+def _load_processed():
+    """Load processed video IDs from shared file."""
+    try:
+        if os.path.exists(_PROCESSED_FILE):
+            with open(_PROCESSED_FILE, 'r') as f:
+                return set(f.read().splitlines())
+    except Exception:
+        pass
+    return set()
+
+def _save_processed(vid_id):
+    """Append a video ID to the shared processed file."""
+    try:
+        with open(_PROCESSED_FILE, 'a') as f:
+            f.write(vid_id + '\n')
+    except Exception:
+        pass
 
 
 def send_telegram(message):
@@ -176,44 +196,56 @@ Be concise. Only include significant information."""
 
 
 def run_youtube_scan():
-    print(f'[YT] Starting YouTube scan for {len(CHANNELS)} channels...')
-    summaries_sent = 0
-    for name, channel_id, lang in CHANNELS:
-        try:
-            video = fetch_latest_video(channel_id)
-            if not video:
-                print(f'[YT] No video found for {name}')
+    # Prevent multiple workers from scanning simultaneously
+    if not _scan_lock.acquire(blocking=False):
+        print('[YT] Scan already running in another worker — skipping')
+        return
+    try:
+        print(f'[YT] Starting YouTube scan for {len(CHANNELS)} channels...')
+        summaries_sent = 0
+        processed = _load_processed()
+
+        for name, channel_id, lang in CHANNELS:
+            try:
+                video = fetch_latest_video(channel_id)
+                if not video:
+                    print(f'[YT] No video found for {name}')
+                    continue
+                vid_id = video['id']
+                if vid_id in processed:
+                    print(f'[YT] Already sent latest for {name} — skipping')
+                    continue
+                print(f'[YT] Processing: {name} — {video["title"]}')
+                transcript = get_transcript(vid_id, lang)
+                if not transcript:
+                    print(f'[YT] No transcript for {vid_id} — skipping')
+                    _save_processed(vid_id)
+                    processed.add(vid_id)
+                    continue
+                summary = summarize(name, video['title'], transcript, lang)
+                if not summary:
+                    continue
+                pub_str = video['published'].strftime('%d %b %Y %H:%M UTC')
+                flag = '🇹🇷' if lang == 'tr' else '🇬🇧'
+                message = (
+                    f'{flag} <b>{name}</b>\n'
+                    f'📺 {video["title"]}\n'
+                    f'🕐 {pub_str}\n'
+                    f'🔗 https://youtube.com/watch?v={vid_id}\n\n'
+                    f'{summary}'
+                )
+                send_telegram(message)
+                _save_processed(vid_id)
+                processed.add(vid_id)
+                summaries_sent += 1
+                time.sleep(2)
+            except Exception as e:
+                print(f'[YT] Error processing {name}: {e}')
                 continue
-            vid_id = video['id']
-            if vid_id in _processed_videos:
-                print(f'[YT] Already sent latest for {name} — skipping')
-                continue
-            print(f'[YT] Processing: {name} — {video["title"]}')
-            transcript = get_transcript(vid_id, lang)
-            if not transcript:
-                print(f'[YT] No transcript for {vid_id} — skipping')
-                _processed_videos.add(vid_id)
-                continue
-            summary = summarize(name, video['title'], transcript, lang)
-            if not summary:
-                continue
-            pub_str = video['published'].strftime('%d %b %Y %H:%M UTC')
-            flag = '🇹🇷' if lang == 'tr' else '🇬🇧'
-            message = (
-                f'{flag} <b>{name}</b>\n'
-                f'📺 {video["title"]}\n'
-                f'🕐 {pub_str}\n'
-                f'🔗 https://youtube.com/watch?v={vid_id}\n\n'
-                f'{summary}'
-            )
-            send_telegram(message)
-            _processed_videos.add(vid_id)
-            summaries_sent += 1
-            time.sleep(2)
-        except Exception as e:
-            print(f'[YT] Error processing {name}: {e}')
-            continue
-    print(f'[YT] Scan complete — {summaries_sent} summaries sent')
+
+        print(f'[YT] Scan complete — {summaries_sent} summaries sent')
+    finally:
+        _scan_lock.release()
 
 
 def youtube_monitor_loop():
