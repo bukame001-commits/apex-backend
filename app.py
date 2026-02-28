@@ -294,6 +294,71 @@ except Exception as e:
     print(f'[YT] Failed to start YouTube monitor: {e}')
 
 
+
+@app.route('/citadel-report', methods=['POST'])
+def citadel_report():
+    """Generate a Citadel-style technical analysis report for top 50 coins."""
+    try:
+        from anthropic import Anthropic
+        data = request.get_json()
+        coins_data = data.get('coins', '')
+        count = data.get('count', 50)
+        timeframe = data.get('timeframe', 'N/A')
+
+        client = Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY', ''))
+
+        prompt = f"""You are a senior quantitative trader at Citadel who combines technical analysis with statistical models to time entries and exits.
+
+I have scanned {count} crypto/stock assets on the {timeframe} timeframe and ranked them by signal strength. Here is the full data:
+
+{coins_data}
+
+Provide a comprehensive Citadel-style technical analysis report covering:
+
+1. MARKET OVERVIEW — Overall market condition based on this scan. What does the breadth of signals tell us?
+
+2. TIER 1 — TOP CONVICTION (top 5 assets)
+For each: trend direction, key levels, RSI/WT reading interpretation, entry zone, stop-loss, profit target, risk-reward ratio, confidence rating (Strong Buy / Buy / Neutral / Sell / Strong Sell)
+
+3. TIER 2 — WATCHLIST (next 10 assets)
+Brief technical setup for each — one line per asset with the key signal and what to watch
+
+4. SECTOR/THEME PATTERNS — Are there recurring patterns? (e.g. DeFi tokens all showing oversold, L2s showing momentum)
+
+5. RISK FACTORS — What could invalidate these setups? Key macro or on-chain risks to monitor
+
+6. EXECUTION SUMMARY — Prioritized action plan: what to act on now vs. what to monitor
+
+Format as a professional quantitative research memo. Be direct and specific. Use actual numbers from the data."""
+
+        response = client.messages.create(
+            model='claude-sonnet-4-20250514',
+            max_tokens=4000,
+            messages=[{'role': 'user', 'content': prompt}]
+        )
+        report = response.content[0].text
+
+        # Send to Telegram (existing scan bot)
+        tg_token = os.environ.get('TELEGRAM_BOT_TOKEN', '') or TELEGRAM_BOT_TOKEN
+        tg_chat  = os.environ.get('TELEGRAM_CHAT_ID', '') or TELEGRAM_CHAT_ID
+        if tg_token and tg_chat:
+            header = f'⚔ <b>CITADEL REPORT — TOP {count} ASSETS ({timeframe})</b>\n\n'
+            full_msg = header + report
+            # Split into chunks of 4000 chars
+            chunks = []
+            while len(full_msg) > 4000:
+                chunks.append(full_msg[:4000])
+                full_msg = full_msg[4000:]
+            chunks.append(full_msg)
+            tg_url = f'https://api.telegram.org/bot{tg_token}/sendMessage'
+            for chunk in chunks:
+                requests.post(tg_url, json={'chat_id': tg_chat, 'text': chunk, 'parse_mode': 'HTML'}, timeout=10)
+
+        return jsonify({'report': report})
+    except Exception as e:
+        print(f'[CITADEL] Error: {e}')
+        return jsonify({'error': str(e)}), 500
+
 # ── Health check ─────────────────────────────────────────────
 @app.route('/health')
 def health():
