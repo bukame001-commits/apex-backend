@@ -20,15 +20,15 @@ CHANNELS = [
     # English
     ('Coin Bureau',          'UCqK_GSMbpiV8spgD3ZGloSw', 'en'),
     ('Coin Bureau Trading',  'UCRvqjQPSeaWn-uEx-w0XLIg', 'en'),
-    ('Credible Crypto',      'UCFkLiNTuZHFq6xTAVilFpyg', 'en'),
+    ('Credible Crypto',      'UCFSn-h8wTnhpKJMteN76Abg', 'en'),
     ('DataDash',             'UCCatR7nWbYrkVXdxXb4cGXtA', 'en'),
     ('Michaël van de Poppe', 'UCdOcUKKU7fIZyIAmVoKU3cg', 'en'),
     ('Crypto Banter',        'UCN9Nj4tjXbVTLYWN0EKly_Q', 'en'),
     ('The Limiting Factor',  'UCTlBSoSGmxBSBP7jZnkuAGA', 'en'),
     ('Rayner Teo',           'UCh6SEPAmBMI8sPMTM8WrAPg', 'en'),
-    ('Peter McCormack',      'UCIQLg9z8CTnDFboGR4BoOSg', 'en'),
-    ('Swan Bitcoin',         'UCISdBpWNRIeGq4JxwNuYr6A', 'en'),
-    ('Crypto Crush Show',    'UCEm3DFE4RCKbH1-Ro1UOXZA', 'en'),
+    ('Peter McCormack',      'UCzrWKkFIRS0kjZf7x24GdGg', 'en'),
+    ('Swan Bitcoin',         'Swan_Bitcoin', 'en'),
+    ('Crypto Crush Show',    'CRYPTOCRUSHSHOW', 'en'),
     # Turkish
     ('Kripto Tugay',         'UC5vFx-5UrwQSMBo2jBVRoZA', 'tr'),
     ('Kripto Ofis',          'UCaYdCdrM3vZsaP9bJXJqzUw', 'tr'),
@@ -70,7 +70,12 @@ def send_telegram(message):
 
 
 def fetch_latest_video(channel_id):
-    rss_url = f'https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}'
+    # Support both UC... channel IDs and @handle format
+    if channel_id.startswith('UC'):
+        rss_url = f'https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}'
+    else:
+        # Try handle-based RSS (works for some channels)
+        rss_url = f'https://www.youtube.com/feeds/videos.xml?user={channel_id}'
     try:
         r = requests.get(rss_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
         if not r.ok:
