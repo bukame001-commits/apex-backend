@@ -429,6 +429,65 @@ def fetch_monitor_coins():
     print(f'[MONITOR] All exchanges failed — using built-in list of {len(MONITOR_COINS)} coins')
 
 
+
+def gemini_spike_commentary(alert):
+    """
+    Ask Gemini to interpret a volume spike alert using ONLY the live data we provide.
+    Never asks Gemini to invent or recall prices — all data is passed in explicitly.
+    Returns a 2-3 line commentary string or None if Gemini unavailable.
+    """
+    gemini_key = os.environ.get('GEMINI_API_KEY', '')
+    if not gemini_key:
+        return None
+
+    sym        = alert.get('sym', '?')
+    price      = alert.get('price', 0)
+    spike      = alert.get('spike', 0)
+    usd_vol    = alert.get('usd_vol', 0)
+    mfi        = alert.get('mfi', 'N/A')
+    cvroc      = alert.get('cvroc', 'N/A')
+    score      = alert.get('score', 0)
+    pct_low    = alert.get('pct_from_low', 0)
+    funding    = alert.get('funding', 'N/A')
+    oi_rising  = alert.get('oi_rising', None)
+    labels     = ', '.join(alert.get('labels', []))
+
+    oi_str = 'rising' if oi_rising else ('flat/falling' if oi_rising is False else 'unknown')
+
+    prompt = f"""You are a professional crypto market analyst. Interpret this LIVE volume spike alert. 
+Use ONLY the data provided below — do not assume or invent any other information.
+
+LIVE DATA FOR {sym}/USDT:
+- Current price: ${price:,.6g}
+- Volume spike: {spike}x above 20-bar Fibonacci-weighted average
+- USD volume this candle: ${usd_vol:,}
+- Money Flow Index (MFI): {mfi} (above 50 = money flowing in)
+- CVROC (volume momentum): {cvroc}% (positive = accelerating)
+- Open Interest: {oi_str}
+- Funding rate: {funding}% per hour
+- Price position: {pct_low}% above 30-bar low (near lows = potential accumulation)
+- Confirmed signals: {labels}
+- Overall conviction score: {score}/7
+
+Based ONLY on this live data, provide a 3-line interpretation:
+Line 1: What this spike most likely represents (accumulation / distribution / squeeze setup / stop hunt / organic buying)
+Line 2: The single most important signal from this data and what it implies
+Line 3: One specific thing to watch that would confirm or invalidate this signal
+
+Be direct. No disclaimers. No invented data. Max 60 words total."""
+
+    try:
+        url  = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}'
+        resp = requests.post(url, json={
+            'contents': [{'parts': [{'text': prompt}]}],
+            'generationConfig': {'maxOutputTokens': 150, 'temperature': 0.3}
+        }, timeout=15)
+        if resp.ok:
+            return resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+    except Exception as e:
+        print(f'[MONITOR] Gemini commentary error for {sym}: {e}')
+    return None
+
 def run_monitor_scan():
     """Scan all monitored coins and send Telegram alerts for volume spikes."""
     print(f'[MONITOR] Starting volume scan for {len(MONITOR_COINS)} coins...')
@@ -551,13 +610,18 @@ def run_monitor_scan():
             vol_str    = f'${usd_vol/1000:.0f}k' if usd_vol < 1_000_000 else f'${usd_vol/1_000_000:.1f}M'
             candle_tag = '[prev]' if a.get('candle') == 'previous' else ''
             labels     = a.get('labels', [])
-            mfi_str    = f'MFI:{a["mfi"]}' if a.get('mfi') else ''
-            cvroc_str  = f'CVROC:{a["cvroc"]}' if a.get('cvroc') else ''
             tag_line   = ' · '.join(filter(None, labels))
             lines.append(f'{stars} <b>{a["sym"]}</b>  {a["spike"]}x vol  {candle_tag}'.strip())
             lines.append(f'   💰 ${a["price"]:,.6g}  |  Vol: {vol_str}  |  {a["pct_from_low"]}% from low')
             if tag_line:
                 lines.append(f'   📊 {tag_line}')
+            # ── Gemini commentary (grounded in live data only) ──
+            commentary = gemini_spike_commentary(a)
+            if commentary:
+                for cl in commentary.split('\n'):
+                    cl = cl.strip()
+                    if cl:
+                        lines.append(f'   🤖 {cl}')
             lines.append('')
         send_telegram('\n'.join(lines))
         print(f'[MONITOR] Sent alert for {len(alerts)} coins: {[a["sym"] for a in alerts]}')
