@@ -122,14 +122,23 @@ def _save_to_railway(key, value):
 # ── Auth Step 1: Send code to phone ──────────────────────────
 def auth_send_code(api_id, api_hash, phone):
     global _tg_client, _phone_hash
+    import asyncio
     try:
-        from telethon.sync import TelegramClient
+        from telethon import TelegramClient
         from telethon.sessions import StringSession
-        with _client_lock:
-            _tg_client = TelegramClient(StringSession(), int(api_id), api_hash)
-            _tg_client.connect()
-            result     = _tg_client.send_code_request(phone)
+
+        async def _send():
+            global _tg_client, _phone_hash
+            client = TelegramClient(StringSession(), int(api_id), api_hash)
+            await client.connect()
+            result      = await client.send_code_request(phone)
+            _tg_client  = client
             _phone_hash = result.phone_code_hash
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_send())
+        # Don't close loop — client needs it for verify step
         print(f'[TG-INTEL] Code sent to {phone}')
         return {'ok': True}
     except Exception as e:
@@ -140,17 +149,31 @@ def auth_send_code(api_id, api_hash, phone):
 # ── Auth Step 2: Verify code ──────────────────────────────────
 def auth_verify_code(phone, code, api_id, api_hash):
     global _tg_client, _phone_hash
+    import asyncio
     try:
-        with _client_lock:
+        async def _verify():
+            global _tg_client
             if not _tg_client:
-                return {'ok': False, 'error': 'Session expired — resend code'}
+                raise Exception('Session expired — resend code')
             try:
-                _tg_client.sign_in(phone=phone, code=code, phone_code_hash=_phone_hash)
+                await _tg_client.sign_in(phone=phone, code=code, phone_code_hash=_phone_hash)
             except Exception as e:
                 if 'Two-steps' in str(e) or '2FA' in str(e) or 'password' in str(e).lower():
-                    return {'ok': False, 'needs_2fa': True, 'error': '2FA required'}
+                    raise Exception('__2FA__')
                 raise
-            session_str = _tg_client.session.save()
+            return _tg_client.session.save()
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            session_str = loop.run_until_complete(_verify())
+        except Exception as e:
+            if '__2FA__' in str(e):
+                return {'ok': False, 'needs_2fa': True, 'error': '2FA required'}
+            raise
+        finally:
+            loop.close()
+
         _save_to_railway('TELEGRAM_SESSION',  session_str)
         _save_to_railway('TELEGRAM_API_ID',   str(api_id))
         _save_to_railway('TELEGRAM_API_HASH', api_hash)
@@ -164,12 +187,18 @@ def auth_verify_code(phone, code, api_id, api_hash):
 # ── Auth Step 2b: 2FA password ────────────────────────────────
 def auth_verify_2fa(password, api_id, api_hash):
     global _tg_client
+    import asyncio
     try:
-        with _client_lock:
+        async def _2fa():
             if not _tg_client:
-                return {'ok': False, 'error': 'Session expired — resend code'}
-            _tg_client.sign_in(password=password)
-            session_str = _tg_client.session.save()
+                raise Exception('Session expired — resend code')
+            await _tg_client.sign_in(password=password)
+            return _tg_client.session.save()
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        session_str = loop.run_until_complete(_2fa())
+        loop.close()
         _save_to_railway('TELEGRAM_SESSION',  session_str)
         _save_to_railway('TELEGRAM_API_ID',   str(api_id))
         _save_to_railway('TELEGRAM_API_HASH', api_hash)
@@ -182,51 +211,65 @@ def auth_verify_2fa(password, api_id, api_hash):
 
 # ── Fetch posts from channels ─────────────────────────────────
 def fetch_posts(channels, lookback_hours=24, limit=25):
+    """Fetch posts using asyncio in a fresh event loop — avoids gunicorn conflicts."""
+    import asyncio
     from datetime import datetime, timezone, timedelta
-    session = os.environ.get('TELEGRAM_SESSION', '')
-    api_id  = os.environ.get('TELEGRAM_API_ID', '')
+
+    session  = os.environ.get('TELEGRAM_SESSION', '')
+    api_id   = os.environ.get('TELEGRAM_API_ID', '')
     api_hash = os.environ.get('TELEGRAM_API_HASH', '')
+
     if not session:
         return [], 'Not authenticated'
+
     try:
-        from telethon.sync import TelegramClient
+        from telethon import TelegramClient
         from telethon.sessions import StringSession
     except ImportError:
-        return [], 'telethon not installed — run: pip install telethon'
+        return [], 'telethon not installed'
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
     posts  = []
-    try:
+
+    async def _fetch():
         client = TelegramClient(StringSession(session), int(api_id), api_hash)
-        client.connect()
-        for name, cid in channels:
-            try:
+        await client.connect()
+        try:
+            for name, cid in channels:
                 try:
-                    cid_val = int(cid)
-                except (ValueError, TypeError):
-                    cid_val = cid
-                msgs  = client.get_messages(cid_val, limit=limit)
-                count = 0
-                for msg in msgs:
-                    if not msg.text or not msg.text.strip():
-                        continue
-                    d = msg.date
-                    if d.tzinfo is None:
-                        d = d.replace(tzinfo=timezone.utc)
-                    if d < cutoff:
-                        continue
-                    posts.append({
-                        'channel': name,
-                        'text':    msg.text.strip()[:600],
-                        'date':    d.strftime('%b %d %H:%M UTC'),
-                    })
-                    count += 1
-                print(f'[TG-INTEL] {name}: {count} posts')
-            except Exception as e:
-                print(f'[TG-INTEL] {name} failed: {e}')
-        client.disconnect()
+                    try:
+                        cid_val = int(cid)
+                    except (ValueError, TypeError):
+                        cid_val = str(cid).replace('t.me/', '@').strip()
+                    count = 0
+                    async for msg in client.iter_messages(cid_val, limit=limit):
+                        if not msg.text or not msg.text.strip():
+                            continue
+                        d = msg.date
+                        if d.tzinfo is None:
+                            d = d.replace(tzinfo=timezone.utc)
+                        if d < cutoff:
+                            continue
+                        posts.append({
+                            'channel': name,
+                            'text':    msg.text.strip()[:600],
+                            'date':    d.strftime('%b %d %H:%M UTC'),
+                        })
+                        count += 1
+                    print(f'[TG-INTEL] {name}: {count} posts')
+                except Exception as e:
+                    print(f'[TG-INTEL] {name} failed: {e}')
+        finally:
+            await client.disconnect()
+
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_fetch())
+        loop.close()
     except Exception as e:
         return [], f'Fetch error: {e}'
+
     print(f'[TG-INTEL] Total posts: {len(posts)}')
     return posts, None
 
