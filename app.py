@@ -586,13 +586,14 @@ _monitor_thread.start()
 def citadel_report():
     """Generate a Citadel-style technical analysis report for top 50 coins."""
     try:
-        from anthropic import Anthropic
         data = request.get_json()
         coins_data = data.get('coins', '')
         count = data.get('count', 50)
         timeframe = data.get('timeframe', 'N/A')
 
-        client = Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY', ''))
+        gemini_key = os.environ.get('GEMINI_API_KEY', '')
+        if not gemini_key:
+            return jsonify({'error': 'GEMINI_API_KEY not set'}), 500
 
         prompt = f"""You are a senior quantitative trader at Citadel who combines technical analysis with statistical models to time entries and exits.
 
@@ -618,12 +619,14 @@ Brief technical setup for each — one line per asset with the key signal and wh
 
 Format as a professional quantitative research memo. Be direct and specific. Use actual numbers from the data."""
 
-        response = client.messages.create(
-            model='claude-sonnet-4-20250514',
-            max_tokens=4000,
-            messages=[{'role': 'user', 'content': prompt}]
-        )
-        report = response.content[0].text
+        gemini_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}'
+        gemini_resp = requests.post(gemini_url, json={
+            'contents': [{'parts': [{'text': prompt}]}],
+            'generationConfig': {'maxOutputTokens': 4000, 'temperature': 0.7}
+        }, timeout=60)
+        if not gemini_resp.ok:
+            return jsonify({'error': f'Gemini error: {gemini_resp.text[:200]}'}), 500
+        report = gemini_resp.json()['candidates'][0]['content']['parts'][0]['text']
 
         # Send to Telegram (existing scan bot)
         tg_token = os.environ.get('TELEGRAM_BOT_TOKEN', '') or TELEGRAM_BOT_TOKEN

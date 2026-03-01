@@ -371,30 +371,21 @@ def run_analysis(channels, lookback_hours=24):
         return None, 'No posts found in the last 24h'
 
     prompt  = _build_prompt(posts, _last_apex_alerts, _last_volume_spikes, channels)
-    api_key = os.environ.get('ANTHROPIC_API_KEY', '')
-    if not api_key:
-        return None, 'ANTHROPIC_API_KEY not set'
+    gemini_key = os.environ.get('GEMINI_API_KEY', '')
+    if not gemini_key:
+        return None, 'GEMINI_API_KEY not set'
 
     try:
-        resp = requests.post(
-            'https://api.anthropic.com/v1/messages',
-            headers={
-                'x-api-key':         api_key,
-                'anthropic-version': '2023-06-01',
-                'content-type':      'application/json',
-            },
-            json={
-                'model':      'claude-sonnet-4-20250514',
-                'max_tokens': 4000,
-                'messages':   [{'role': 'user', 'content': prompt}]
-            },
-            timeout=90
-        )
+        gemini_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}'
+        resp = requests.post(gemini_url, json={
+            'contents': [{'parts': [{'text': prompt}]}],
+            'generationConfig': {'maxOutputTokens': 4000, 'temperature': 0.7}
+        }, timeout=90)
         if not resp.ok:
-            return None, f'Claude API error {resp.status_code}: {resp.text[:200]}'
-        report = resp.json()['content'][0]['text']
+            return None, f'Gemini API error {resp.status_code}: {resp.text[:200]}'
+        report = resp.json()['candidates'][0]['content']['parts'][0]['text']
     except Exception as e:
-        return None, f'Claude call failed: {e}'
+        return None, f'Gemini call failed: {e}'
 
     _post_to_telegram(report, len(posts), len(channels))
     return report, None
