@@ -18,7 +18,7 @@ TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
 # ── Volume alert config ───────────────────────────────────────
 VOLUME_SPIKE_MULTIPLIER = 2.0   # alert if current vol > 2x 20-bar average
 SCAN_INTERVAL_SECONDS   = 3600  # scan every hour
-ALERT_COOLDOWN_SECONDS  = 7200  # don't re-alert same coin within 2 hours
+ALERT_COOLDOWN_SECONDS  = 14400  # don't re-alert same coin within 4 hours
 _last_alert_time = {}           # symbol -> last alert timestamp
 _monitor_running  = False
 
@@ -57,39 +57,198 @@ def send_telegram(message):
         return False
 
 
+# ── Kıvanç-inspired helper indicators ────────────────────────
+
+def calc_mfi(highs, lows, closes, vols, period=14):
+    """
+    Money Flow Index — Kıvanç uses MFI as the volume component in AlphaTrend.
+    MFI > 50 = money flowing in (bullish). MFI rising = accelerating inflow.
+    Uses typical price (HLC/3) like the original.
+    """
+    if len(closes) < period + 2:
+        return None, None
+    typical = [(highs[i] + lows[i] + closes[i]) / 3 for i in range(len(closes))]
+    raw_mfi = []
+    for i in range(1, len(typical)):
+        tp_cur  = typical[i]
+        tp_prev = typical[i - 1]
+        vol     = vols[i]
+        if tp_cur > tp_prev:
+            raw_mfi.append((tp_cur * vol, 0.0))   # positive money flow
+        elif tp_cur < tp_prev:
+            raw_mfi.append((0.0, tp_cur * vol))   # negative money flow
+        else:
+            raw_mfi.append((0.0, 0.0))
+
+    # Calculate MFI for the last bar using 'period' lookback
+    if len(raw_mfi) < period:
+        return None, None
+    window = raw_mfi[-period:]
+    pos_mf = sum(x[0] for x in window)
+    neg_mf = sum(x[1] for x in window)
+    if neg_mf == 0:
+        mfi_now = 100.0
+    else:
+        mfi_now = 100 - (100 / (1 + pos_mf / neg_mf))
+
+    # Also compute MFI 3 bars ago to check if it's rising
+    if len(raw_mfi) < period + 3:
+        return mfi_now, None
+    window_prev = raw_mfi[-(period + 3):-3]
+    pos_prev = sum(x[0] for x in window_prev)
+    neg_prev = sum(x[1] for x in window_prev)
+    if neg_prev == 0:
+        mfi_prev = 100.0
+    else:
+        mfi_prev = 100 - (100 / (1 + pos_prev / neg_prev))
+
+    return mfi_now, mfi_prev
+
+
+def calc_cvroc(vols, period=21):
+    """
+    CVROC — Close Volume Rate of Change (Kıvanç's crypto indicator).
+    Measures how fast volume is accelerating vs the baseline period.
+    Positive and rising = real momentum behind the move.
+    """
+    if len(vols) < period + 4:
+        return None, None
+    # CVROC = (current vol - vol N bars ago) / vol N bars ago * 100
+    cvroc_now  = (vols[-1] - vols[-(period + 1)]) / vols[-(period + 1)] * 100 if vols[-(period + 1)] > 0 else None
+    cvroc_prev = (vols[-2] - vols[-(period + 2)]) / vols[-(period + 2)] * 100 if vols[-(period + 2)] > 0 else None
+    return cvroc_now, cvroc_prev
+
+
+def calc_mavilimw(closes, f1=3, f2=5):
+    """
+    MavilimW — Kıvanç's Fibonacci-based weighted moving average.
+    Uses Fibonacci sequence for period calculation to reduce noise.
+    f1=3, f2=5 optimised for 1H. f1=5, f2=8 for 4H/daily.
+    Returns current MavilimW value and direction (+1 up, -1 down).
+    """
+    # Fibonacci period sequence derived from f1, f2
+    f3 = f1 + f2           # 8
+    f4 = f2 + f3           # 13
+    f5 = f3 + f4           # 21
+    periods = [f1, f2, f3, f4, f5]
+    max_p = max(periods)
+
+    if len(closes) < max_p + 5:
+        return None, None
+
+    def wma(data, p):
+        """Weighted moving average."""
+        if len(data) < p:
+            return None
+        weights = list(range(1, p + 1))
+        total_w = sum(weights)
+        segment = data[-p:]
+        return sum(w * v for w, v in zip(weights, segment)) / total_w
+
+    # Build MavilimW as WMA of WMAs (Kıvanç's layered approach)
+    m1 = wma(closes, f1)
+    m2 = wma(closes, f2)
+    if m1 is None or m2 is None:
+        return None, None
+
+    # Use WMA of [m1 values] with f3 — approximate with available closes
+    # We compute a simplified but faithful version
+    mav_now = (m1 * f2 + m2 * f1) / (f1 + f2)
+
+    # Previous bar MavilimW for direction
+    m1_p = wma(closes[:-1], f1)
+    m2_p = wma(closes[:-1], f2)
+    if m1_p is None or m2_p is None:
+        return mav_now, None
+    mav_prev = (m1_p * f2 + m2_p * f1) / (f1 + f2)
+
+    direction = 1 if mav_now > mav_prev else -1
+    return mav_now, direction
+
+
 # ── Volume spike detection ────────────────────────────────────
 def detect_volume_spike(symbol, klines):
-    """Returns dict with spike info if either of last 2 candles has a 1.5x+ volume spike."""
-    if not klines or len(klines) < 22:
+    """
+    Multi-layer unusual activity detector using Kıvanç Özbilgiç methodology:
+    - Raw 2x volume spike (baseline)
+    - MFI > 50 and rising (money flow confirmation)
+    - CVROC positive and accelerating (volume rate of change)
+    - MavilimW trending up (Fibonacci-smoothed trend confirmation)
+    - OBV-style body/wick, price position, USD volume filters
+    Optimised for 1H candles on crypto.
+    """
+    if not klines or len(klines) < 35:
         return None
     try:
-        vols   = [float(k[5]) for k in klines]
-        closes = [float(k[4]) for k in klines]
-        lows   = [float(k[3]) for k in klines]
+        opens   = [float(k[1]) for k in klines]
+        highs   = [float(k[2]) for k in klines]
+        lows    = [float(k[3]) for k in klines]
+        closes  = [float(k[4]) for k in klines]
+        vols    = [float(k[5]) for k in klines]
 
-        # ── 20-bar average (excludes last 2 candles being tested) ──
-        avg_vol = sum(vols[-22:-2]) / 20
-        if avg_vol <= 0:
+        curr_price   = closes[-1]
+        curr_usd_vol = vols[-1] * curr_price
+
+        # ── Gate 1: Minimum USD liquidity ──
+        if curr_usd_vol < 50_000:
             return None
 
-        # ── Check last 2 candles — either one triggering is enough ──
-        ratio_last  = vols[-1] / avg_vol
-        ratio_prev  = vols[-2] / avg_vol
-        best_ratio  = max(ratio_last, ratio_prev)
+        # ── Gate 2: Raw volume spike — 2x Fibonacci-smoothed baseline ──
+        # Use MavilimW Fibonacci periods (3,5,8,13,21) for baseline
+        # instead of simple 20-bar SMA — reduces noise in baseline itself
+        fib_periods = [3, 5, 8, 13, 21]
+        weighted_vol_sum = 0
+        weight_total = 0
+        for p in fib_periods:
+            if len(vols) >= p + 2:
+                avg = sum(vols[-(p + 2):-2]) / p
+                weighted_vol_sum += avg * p
+                weight_total += p
+        if weight_total == 0:
+            return None
+        fib_avg_vol = weighted_vol_sum / weight_total  # Fibonacci-weighted baseline
+
+        ratio_last = vols[-1] / fib_avg_vol if fib_avg_vol > 0 else 0
+        ratio_prev = vols[-2] / fib_avg_vol if fib_avg_vol > 0 else 0
+        best_ratio = max(ratio_last, ratio_prev)
+        trigger_idx = -1 if ratio_last >= ratio_prev else -2
 
         if best_ratio < VOLUME_SPIKE_MULTIPLIER:
             return None
 
-        # ── Use the candle that triggered as reference ──
-        trigger_idx = -1 if ratio_last >= ratio_prev else -2
-        curr_price  = closes[trigger_idx]
+        # ── Gate 3: MFI confirmation (Kıvanç AlphaTrend methodology) ──
+        mfi_now, mfi_prev = calc_mfi(highs, lows, closes, vols, period=14)
+        if mfi_now is None:
+            return None
+        if mfi_now < 50:
+            # Money flowing out, not in — skip
+            return None
+        mfi_rising = (mfi_prev is not None) and (mfi_now > mfi_prev)
 
-        # ── Price must be below its 10-bar average (not already pumped) ──
-        avg_price_10 = sum(closes[-12:-2]) / 10
-        if curr_price > avg_price_10 * 1.05:
+        # ── Gate 4: CVROC confirmation (Kıvanç's crypto volume indicator) ──
+        cvroc_now, cvroc_prev = calc_cvroc(vols, period=21)
+        if cvroc_now is None:
+            return None
+        if cvroc_now <= 0:
+            # Volume rate of change is negative — momentum not building
+            return None
+        cvroc_accelerating = (cvroc_prev is not None) and (cvroc_now > cvroc_prev)
+
+        # ── Gate 5: MavilimW trend direction (Fibonacci WMA) ──
+        mav_val, mav_dir = calc_mavilimw(closes, f1=3, f2=5)
+        if mav_val is None:
+            return None
+        # Price should be above or approaching MavilimW (not deep below in freefall)
+        pct_vs_mav = (curr_price - mav_val) / mav_val * 100
+        if pct_vs_mav < -8:
+            # Price more than 8% below MavilimW — downtrend still dominant
             return None
 
-        # ── Price must be within 40% of its 30-bar low ──
+        # ── Gate 6: Price position filters ──
+        avg_price_10 = sum(closes[-12:-2]) / 10
+        if curr_price > avg_price_10 * 1.03:
+            return None  # already pumped
+
         low_30 = min(lows[-32:-2]) if len(lows) >= 32 else min(lows[:-2])
         if low_30 <= 0:
             return None
@@ -97,14 +256,84 @@ def detect_volume_spike(symbol, klines):
         if pct_from_low > 40:
             return None
 
+        # ── Gate 7: Candle body quality (not a wick-only spike) ──
+        body   = abs(closes[trigger_idx] - opens[trigger_idx])
+        range_ = highs[trigger_idx] - lows[trigger_idx]
+        if range_ > 0 and (body / range_) < 0.25:
+            return None
+
+        # ── Compute conviction score from Kıvanç indicators ──
+        kivanc_score = 0
+        kivanc_tags  = []
+        if mfi_now >= 60:
+            kivanc_score += 1
+            kivanc_tags.append(f'MFI {round(mfi_now, 1)}')
+        if mfi_rising:
+            kivanc_score += 1
+            kivanc_tags.append('MFI↑')
+        if cvroc_accelerating:
+            kivanc_score += 1
+            kivanc_tags.append('CVROC↑')
+        if mav_dir == 1:
+            kivanc_score += 1
+            kivanc_tags.append('MavilimW↑')
+
         return {
-            'ratio': round(best_ratio, 2),
+            'ratio':        round(best_ratio, 2),
             'pct_from_low': round(pct_from_low, 1),
-            'candle': 'current' if trigger_idx == -1 else 'previous'
+            'candle':       'current' if trigger_idx == -1 else 'previous',
+            'usd_vol':      round(curr_usd_vol),
+            'mfi':          round(mfi_now, 1),
+            'cvroc':        round(cvroc_now, 1),
+            'kivanc_score': kivanc_score,
+            'kivanc_tags':  kivanc_tags,
         }
-    except Exception:
+    except Exception as e:
         pass
     return None
+
+
+def fetch_oi_and_funding(sym):
+    """
+    Fetch open interest and funding rate from Binance futures.
+    Returns dict or None if futures don't exist for this coin.
+    """
+    try:
+        # Open Interest
+        oi_url = f'https://fapi.binance.com/fapi/v1/openInterest?symbol={sym}USDT'
+        r = requests.get(oi_url, headers=HEADERS, timeout=5)
+        if not r.ok:
+            return None
+        oi_data = r.json()
+        oi = float(oi_data.get('openInterest', 0))
+
+        # Funding rate (latest)
+        fund_url = f'https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym}USDT'
+        r2 = requests.get(fund_url, headers=HEADERS, timeout=5)
+        if not r2.ok:
+            return None
+        fund_data = r2.json()
+        funding = float(fund_data.get('lastFundingRate', 0))
+
+        # OI history (last 5 periods) to check if OI is rising
+        oi_hist_url = f'https://fapi.binance.com/futures/data/openInterestHist?symbol={sym}USDT&period=1h&limit=6'
+        r3 = requests.get(oi_hist_url, headers=HEADERS, timeout=5)
+        oi_rising = None
+        if r3.ok:
+            hist = r3.json()
+            if isinstance(hist, list) and len(hist) >= 3:
+                oi_vals = [float(h['sumOpenInterest']) for h in hist]
+                # OI rising if last value > average of previous 4
+                oi_avg_prev = sum(oi_vals[:-1]) / len(oi_vals[:-1])
+                oi_rising = oi_vals[-1] > oi_avg_prev * 1.02  # 2%+ increase
+
+        return {
+            'oi':        oi,
+            'funding':   round(funding * 100, 4),   # as percentage
+            'oi_rising': oi_rising,
+        }
+    except Exception:
+        return None
 
 
 # ── Background monitor scan ───────────────────────────────────
@@ -207,34 +436,92 @@ def run_monitor_scan():
     now = time.time()
 
     def check_coin(sym):
-        # Skip if alerted recently
+        # Skip if alerted recently (4h cooldown)
         if now - _last_alert_time.get(sym, 0) < ALERT_COOLDOWN_SECONDS:
             return None
         try:
-            # Try KuCoin first (reliable from cloud IPs)
-            kucoin_url = f'https://api.kucoin.com/api/v1/market/candles?symbol={sym}-USDT&type=1hour&startAt={int(now)-3600*60}&endAt={int(now)}'
+            spike = None
+            price = None
+            source = None
+            klines_ref = None
+
+            # ── 1. KuCoin (most reliable from cloud IPs) ──
+            kucoin_url = f'https://api.kucoin.com/api/v1/market/candles?symbol={sym}-USDT&type=1hour&startAt={int(now)-3600*65}&endAt={int(now)}'
             r = requests.get(kucoin_url, headers=HEADERS, timeout=8)
             if r.ok:
                 data = r.json().get('data', [])
-                if len(data) >= 22:
-                    # KuCoin newest first: [time, open, close, high, low, vol, turnover]
+                if len(data) >= 24:
                     klines = [[int(c[0])*1000, float(c[1]), float(c[3]), float(c[4]), float(c[2]), float(c[5])] for c in reversed(data)]
                     spike = detect_volume_spike(sym, klines)
                     if spike:
-                        price = klines[-1][4]
-                        return {'sym': sym, 'spike': spike['ratio'], 'pct_from_low': spike['pct_from_low'], 'price': price, 'source': 'KuCoin', 'candle': spike.get('candle','current')}
+                        price  = klines[-1][4]
+                        source = 'KuCoin'
+                        klines_ref = klines
 
-            # Try OKX fallback
-            okx_url = f'https://www.okx.com/api/v5/market/history-candles?instId={sym}-USDT&bar=1H&limit=60'
-            r2 = requests.get(okx_url, headers=HEADERS, timeout=8)
-            if r2.ok:
-                data2 = r2.json().get('data', [])
-                if len(data2) >= 22:
-                    klines2 = [[int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in reversed(data2)]
-                    spike = detect_volume_spike(sym, klines2)
-                    if spike:
-                        price = klines2[-1][4]
-                        return {'sym': sym, 'spike': spike['ratio'], 'pct_from_low': spike['pct_from_low'], 'price': price, 'source': 'OKX', 'candle': spike.get('candle','current')}
+            # ── 2. OKX fallback ──
+            if not spike:
+                okx_url = f'https://www.okx.com/api/v5/market/history-candles?instId={sym}-USDT&bar=1H&limit=65'
+                r2 = requests.get(okx_url, headers=HEADERS, timeout=8)
+                if r2.ok:
+                    data2 = r2.json().get('data', [])
+                    if len(data2) >= 24:
+                        klines2 = [[int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in reversed(data2)]
+                        spike = detect_volume_spike(sym, klines2)
+                        if spike:
+                            price  = klines2[-1][4]
+                            source = 'OKX'
+
+            if not spike:
+                return None
+
+            # ── 3. Fetch OI + Funding from Binance futures ──
+            oi_info = fetch_oi_and_funding(sym)
+
+            # ── 4. Score the signal (1–6 conviction) ──
+            # Base score from Kıvanç indicators (0–4)
+            score  = spike.get('kivanc_score', 0) + 1  # +1 base for passing all gates
+            labels = list(spike.get('kivanc_tags', []))
+
+            if oi_info:
+                funding  = oi_info['funding']
+                oi_rising = oi_info['oi_rising']
+
+                # OI rising = real money entering
+                if oi_rising:
+                    score += 1
+                    labels.append('OI↑')
+
+                # Funding neutral or negative = not overleveraged longs
+                if funding <= 0.005:
+                    score += 1
+                    if funding < 0:
+                        labels.append(f'Funding {oi_info["funding"]}% (shorts crowded)')
+                    else:
+                        labels.append(f'Funding {oi_info["funding"]}% (neutral)')
+                elif funding > 0.02:
+                    # High positive funding = leveraged FOMO = skip
+                    return None
+
+            # ── 5. Only alert if conviction score >= 3 ──
+            # Requires at least: raw spike + 2 Kıvanç confirmations
+            if score < 3:
+                return None
+
+            return {
+                'sym':         sym,
+                'spike':       spike['ratio'],
+                'pct_from_low':spike['pct_from_low'],
+                'price':       price,
+                'source':      source,
+                'candle':      spike.get('candle', 'current'),
+                'usd_vol':     spike.get('usd_vol', 0),
+                'mfi':         spike.get('mfi'),
+                'cvroc':       spike.get('cvroc'),
+                'score':       score,
+                'labels':      labels,
+                'funding':     oi_info['funding'] if oi_info else None,
+                'oi_rising':   oi_info['oi_rising'] if oi_info else None,
+            }
         except Exception as e:
             print(f'[MONITOR] {sym} error: {e}')
         return None
@@ -250,14 +537,27 @@ def run_monitor_scan():
     if alerts:
         # Sort by spike ratio descending
         alerts.sort(key=lambda x: x['spike'], reverse=True)
-        lines = [f'🚨 <b>APEX SCANNER — VOLUME SPIKE ALERT</b>']
-        lines.append(f'⏰ {time.strftime("%Y-%m-%d %H:%M UTC")} | Timeframe: 1H')
-        lines.append('✅ Filtered: price below 10-bar avg &amp; within 40% of 30d low')
+        # Sort by conviction score first, then spike ratio
+        alerts.sort(key=lambda x: (x['score'], x['spike']), reverse=True)
+
+        lines = [f'🚨 <b>APEX SCANNER — UNUSUAL ACTIVITY ALERT</b>']
+        lines.append(f'⏰ {time.strftime("%Y-%m-%d %H:%M UTC")} | 1H candles')
+        lines.append('✅ Filters: 2x vol spike · $50k min · body>wick · OI · funding')
         lines.append('')
-        for a in alerts[:10]:  # max 10 per message
-            candle_tag = '(prev candle)' if a.get('candle') == 'previous' else ''
-            lines.append(f'<b>{a["sym"]}</b>  {a["spike"]}x avg volume {candle_tag}'.strip())
-            lines.append(f'   Price: ${a["price"]:,.6g}  |  {a["pct_from_low"]}% above 30d low  |  {a["source"]}')
+        for a in alerts[:10]:
+            score      = a.get('score', 1)
+            stars      = '⭐' * min(score, 6)
+            usd_vol    = a.get('usd_vol', 0)
+            vol_str    = f'${usd_vol/1000:.0f}k' if usd_vol < 1_000_000 else f'${usd_vol/1_000_000:.1f}M'
+            candle_tag = '[prev]' if a.get('candle') == 'previous' else ''
+            labels     = a.get('labels', [])
+            mfi_str    = f'MFI:{a["mfi"]}' if a.get('mfi') else ''
+            cvroc_str  = f'CVROC:{a["cvroc"]}' if a.get('cvroc') else ''
+            tag_line   = ' · '.join(filter(None, labels))
+            lines.append(f'{stars} <b>{a["sym"]}</b>  {a["spike"]}x vol  {candle_tag}'.strip())
+            lines.append(f'   💰 ${a["price"]:,.6g}  |  Vol: {vol_str}  |  {a["pct_from_low"]}% from low')
+            if tag_line:
+                lines.append(f'   📊 {tag_line}')
             lines.append('')
         send_telegram('\n'.join(lines))
         print(f'[MONITOR] Sent alert for {len(alerts)} coins: {[a["sym"] for a in alerts]}')
