@@ -579,12 +579,6 @@ def monitor_loop():
 _monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
 _monitor_thread.start()
 
-# Start YouTube summarizer monitor
-try:
-    from youtube_summarizer import start_youtube_monitor
-    start_youtube_monitor()
-except Exception as e:
-    print(f'[YT] Failed to start YouTube monitor: {e}')
 
 
 
