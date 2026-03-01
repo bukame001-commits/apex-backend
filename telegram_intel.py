@@ -376,7 +376,7 @@ def run_analysis(channels, lookback_hours=24):
         return None, 'GEMINI_API_KEY not set'
 
     try:
-        gemini_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key={gemini_key}'
+        gemini_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}'
         resp = requests.post(gemini_url, json={
             'contents': [{'parts': [{'text': prompt}]}],
             'generationConfig': {'maxOutputTokens': 4000, 'temperature': 0.7}
