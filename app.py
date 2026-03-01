@@ -598,6 +598,9 @@ def run_monitor_scan():
         alerts.sort(key=lambda x: x['spike'], reverse=True)
         # Sort by conviction score first, then spike ratio
         alerts.sort(key=lambda x: (x['score'], x['spike']), reverse=True)
+        # Store in tg_intel for Intelligence cross-reference
+        if tg_intel:
+            tg_intel.set_volume_spikes(alerts)
 
         lines = [f'🚨 <b>APEX SCANNER — UNUSUAL ACTIVITY ALERT</b>']
         lines.append(f'⏰ {time.strftime("%Y-%m-%d %H:%M UTC")} | 1H candles')
@@ -1310,6 +1313,36 @@ def tg_intel_run():
             print(f'[TG-INTEL] Analysis error: {err}')
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({'ok': True, 'status': 'Analysis started — report will arrive on Telegram'})
+
+
+@app.route('/apex-results', methods=['POST'])
+def apex_results():
+    """Receive APEX scan results from frontend and store for Intelligence analysis."""
+    try:
+        if not tg_intel:
+            return jsonify({'ok': False})
+        data    = request.get_json()
+        alerts  = data.get('alerts', [])
+        tg_intel.set_apex_alerts(alerts)
+        print(f'[TG-INTEL] Received {len(alerts)} APEX results from frontend')
+        return jsonify({'ok': True, 'count': len(alerts)})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+
+@app.route('/volume-results', methods=['POST'])
+def volume_results():
+    """Receive volume spike results from frontend and store for Intelligence analysis."""
+    try:
+        if not tg_intel:
+            return jsonify({'ok': False})
+        data   = request.get_json()
+        spikes = data.get('spikes', [])
+        tg_intel.set_volume_spikes(spikes)
+        print(f'[TG-INTEL] Received {len(spikes)} volume spikes from frontend')
+        return jsonify({'ok': True, 'count': len(spikes)})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
 
 
 if __name__ == '__main__':
