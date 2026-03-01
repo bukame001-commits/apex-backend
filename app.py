@@ -16,7 +16,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
 
 # ── Volume alert config ───────────────────────────────────────
-VOLUME_SPIKE_MULTIPLIER = 1.8   # alert if current vol > 1.8x 20-bar average
+VOLUME_SPIKE_MULTIPLIER = 2.0   # alert if current vol > 2x 20-bar average
 SCAN_INTERVAL_SECONDS   = 3600  # scan every hour
 ALERT_COOLDOWN_SECONDS  = 7200  # don't re-alert same coin within 2 hours
 _last_alert_time = {}           # symbol -> last alert timestamp
@@ -59,7 +59,7 @@ def send_telegram(message):
 
 # ── Volume spike detection ────────────────────────────────────
 def detect_volume_spike(symbol, klines):
-    """Returns dict with spike info if volume spike at good entry, else None."""
+    """Returns dict with spike info if either of last 2 candles has a 1.5x+ volume spike."""
     if not klines or len(klines) < 22:
         return None
     try:
@@ -67,28 +67,30 @@ def detect_volume_spike(symbol, klines):
         closes = [float(k[4]) for k in klines]
         lows   = [float(k[3]) for k in klines]
 
-        # ── 1. Volume spike check ──
-        avg_vol  = sum(vols[-21:-1]) / 20   # 20-bar average excluding current
-        curr_vol = vols[-1]
+        # ── 20-bar average (excludes last 2 candles being tested) ──
+        avg_vol = sum(vols[-22:-2]) / 20
         if avg_vol <= 0:
             return None
-        ratio = curr_vol / avg_vol
-        if ratio < VOLUME_SPIKE_MULTIPLIER:
+
+        # ── Check last 2 candles — either one triggering is enough ──
+        ratio_last  = vols[-1] / avg_vol
+        ratio_prev  = vols[-2] / avg_vol
+        best_ratio  = max(ratio_last, ratio_prev)
+
+        if best_ratio < VOLUME_SPIKE_MULTIPLIER:
             return None
 
-        # ── 2. Volume must be rising for at least 2 consecutive bars ──
-        # Avoids alerting on a single random candle spike
-        if not (vols[-1] > vols[-2]):
+        # ── Use the candle that triggered as reference ──
+        trigger_idx = -1 if ratio_last >= ratio_prev else -2
+        curr_price  = closes[trigger_idx]
+
+        # ── Price must be below its 10-bar average (not already pumped) ──
+        avg_price_10 = sum(closes[-12:-2]) / 10
+        if curr_price > avg_price_10 * 1.05:
             return None
 
-        # ── 3. Price must be below its 10-bar average (not already pumped) ──
-        avg_price_10 = sum(closes[-11:-1]) / 10
-        curr_price   = closes[-1]
-        if curr_price > avg_price_10 * 1.05:  # allow 5% tolerance
-            return None
-
-        # ── 4. Price must be within 40% of its 30-day low ──
-        low_30 = min(lows[-30:]) if len(lows) >= 30 else min(lows)
+        # ── Price must be within 40% of its 30-bar low ──
+        low_30 = min(lows[-32:-2]) if len(lows) >= 32 else min(lows[:-2])
         if low_30 <= 0:
             return None
         pct_from_low = (curr_price - low_30) / low_30 * 100
@@ -96,8 +98,9 @@ def detect_volume_spike(symbol, klines):
             return None
 
         return {
-            'ratio': round(ratio, 2),
-            'pct_from_low': round(pct_from_low, 1)
+            'ratio': round(best_ratio, 2),
+            'pct_from_low': round(pct_from_low, 1),
+            'candle': 'current' if trigger_idx == -1 else 'previous'
         }
     except Exception:
         pass
@@ -209,7 +212,7 @@ def run_monitor_scan():
             return None
         try:
             # Try KuCoin first (reliable from cloud IPs)
-            kucoin_url = f'https://api.kucoin.com/api/v1/market/candles?symbol={sym}-USDT&type=1day&startAt={int(now)-86400*30}&endAt={int(now)}'
+            kucoin_url = f'https://api.kucoin.com/api/v1/market/candles?symbol={sym}-USDT&type=1hour&startAt={int(now)-3600*60}&endAt={int(now)}'
             r = requests.get(kucoin_url, headers=HEADERS, timeout=8)
             if r.ok:
                 data = r.json().get('data', [])
@@ -219,10 +222,10 @@ def run_monitor_scan():
                     spike = detect_volume_spike(sym, klines)
                     if spike:
                         price = klines[-1][4]
-                        return {'sym': sym, 'spike': spike['ratio'], 'pct_from_low': spike['pct_from_low'], 'price': price, 'source': 'KuCoin'}
+                        return {'sym': sym, 'spike': spike['ratio'], 'pct_from_low': spike['pct_from_low'], 'price': price, 'source': 'KuCoin', 'candle': spike.get('candle','current')}
 
             # Try OKX fallback
-            okx_url = f'https://www.okx.com/api/v5/market/history-candles?instId={sym}-USDT&bar=1D&limit=30'
+            okx_url = f'https://www.okx.com/api/v5/market/history-candles?instId={sym}-USDT&bar=1H&limit=60'
             r2 = requests.get(okx_url, headers=HEADERS, timeout=8)
             if r2.ok:
                 data2 = r2.json().get('data', [])
@@ -231,7 +234,7 @@ def run_monitor_scan():
                     spike = detect_volume_spike(sym, klines2)
                     if spike:
                         price = klines2[-1][4]
-                        return {'sym': sym, 'spike': spike['ratio'], 'pct_from_low': spike['pct_from_low'], 'price': price, 'source': 'OKX'}
+                        return {'sym': sym, 'spike': spike['ratio'], 'pct_from_low': spike['pct_from_low'], 'price': price, 'source': 'OKX', 'candle': spike.get('candle','current')}
         except Exception as e:
             print(f'[MONITOR] {sym} error: {e}')
         return None
@@ -248,12 +251,13 @@ def run_monitor_scan():
         # Sort by spike ratio descending
         alerts.sort(key=lambda x: x['spike'], reverse=True)
         lines = [f'🚨 <b>APEX SCANNER — VOLUME SPIKE ALERT</b>']
-        lines.append(f'⏰ {time.strftime("%Y-%m-%d %H:%M UTC")}')
+        lines.append(f'⏰ {time.strftime("%Y-%m-%d %H:%M UTC")} | Timeframe: 1H')
         lines.append('✅ Filtered: price below 10-bar avg &amp; within 40% of 30d low')
         lines.append('')
         for a in alerts[:10]:  # max 10 per message
-            lines.append(f'<b>{a["sym"]}</b>  {a["spike"]}x avg volume')
-            lines.append(f'   Price: ${a["price"]:,.4f}  |  {a["pct_from_low"]}% above 30d low  |  {a["source"]}')
+            candle_tag = '(prev candle)' if a.get('candle') == 'previous' else ''
+            lines.append(f'<b>{a["sym"]}</b>  {a["spike"]}x avg volume {candle_tag}'.strip())
+            lines.append(f'   Price: ${a["price"]:,.6g}  |  {a["pct_from_low"]}% above 30d low  |  {a["source"]}')
             lines.append('')
         send_telegram('\n'.join(lines))
         print(f'[MONITOR] Sent alert for {len(alerts)} coins: {[a["sym"] for a in alerts]}')
@@ -262,27 +266,16 @@ def run_monitor_scan():
 
 
 def monitor_loop():
-    """Background thread — runs forever, scanning every SCAN_INTERVAL_SECONDS."""
+    """Startup thread — fetches coin list once, no auto-scanning (on-demand only)."""
     global _monitor_running
     _monitor_running = True
-    print(f'[MONITOR] Background monitor started — scanning every {SCAN_INTERVAL_SECONDS//60} minutes')
-    # Wait 30s after startup then fetch full coin list
+    print('[MONITOR] On-demand mode — fetching coin list on startup...')
     time.sleep(30)
     fetch_monitor_coins()
-    # Wait another 30s before first scan
-    time.sleep(30)
-    while True:
-        try:
-            run_monitor_scan()
-        except Exception as e:
-            print(f'[MONITOR] Scan error: {e}')
-        # Refresh coin list every 24 hours
-        if int(time.time()) % 86400 < SCAN_INTERVAL_SECONDS:
-            fetch_monitor_coins()
-        time.sleep(SCAN_INTERVAL_SECONDS)
+    print('[MONITOR] Ready. Volume scan is on-demand only.')
 
 
-# Start background monitor thread on server startup
+# Start background thread just to initialise coin list
 _monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
 _monitor_thread.start()
 
