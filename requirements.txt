@@ -4,3 +4,4 @@ gunicorn
 requests
 anthropic
 youtube-transcript-api
+telethon

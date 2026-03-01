@@ -1159,6 +1159,92 @@ def monitor_scan_now():
     return jsonify({'status': 'scan started', 'coins': len(MONITOR_COINS)})
 
 
+# ── Telegram Intelligence — import module ────────────────────
+try:
+    import telegram_intel as tg_intel
+    print('[TG-INTEL] Module loaded')
+except Exception as e:
+    tg_intel = None
+    print(f'[TG-INTEL] Module load failed: {e}')
+
+
+@app.route('/tg-intel/status')
+def tg_intel_status():
+    if not tg_intel:
+        return jsonify({'ok': False, 'error': 'Module not loaded'})
+    return jsonify({
+        'ok':             True,
+        'authenticated':  tg_intel.is_authenticated(),
+        'has_apex_data':  len(tg_intel._last_apex_alerts) > 0,
+        'has_vol_data':   len(tg_intel._last_volume_spikes) > 0,
+        'apex_count':     len(tg_intel._last_apex_alerts),
+        'vol_count':      len(tg_intel._last_volume_spikes),
+    })
+
+
+@app.route('/tg-intel/send-code', methods=['POST'])
+def tg_intel_send_code():
+    if not tg_intel:
+        return jsonify({'ok': False, 'error': 'Module not loaded'})
+    data     = request.get_json()
+    api_id   = data.get('api_id', '').strip()
+    api_hash = data.get('api_hash', '').strip()
+    phone    = data.get('phone', '').strip()
+    if not api_id or not api_hash or not phone:
+        return jsonify({'ok': False, 'error': 'api_id, api_hash and phone required'})
+    result = tg_intel.auth_send_code(api_id, api_hash, phone)
+    return jsonify(result)
+
+
+@app.route('/tg-intel/verify-code', methods=['POST'])
+def tg_intel_verify_code():
+    if not tg_intel:
+        return jsonify({'ok': False, 'error': 'Module not loaded'})
+    data     = request.get_json()
+    phone    = data.get('phone', '').strip()
+    code     = data.get('code', '').strip()
+    api_id   = data.get('api_id', '').strip()
+    api_hash = data.get('api_hash', '').strip()
+    if not phone or not code:
+        return jsonify({'ok': False, 'error': 'phone and code required'})
+    result = tg_intel.auth_verify_code(phone, code, api_id, api_hash)
+    return jsonify(result)
+
+
+@app.route('/tg-intel/verify-2fa', methods=['POST'])
+def tg_intel_verify_2fa():
+    if not tg_intel:
+        return jsonify({'ok': False, 'error': 'Module not loaded'})
+    data     = request.get_json()
+    password = data.get('password', '').strip()
+    api_id   = data.get('api_id', '').strip()
+    api_hash = data.get('api_hash', '').strip()
+    if not password:
+        return jsonify({'ok': False, 'error': 'password required'})
+    result = tg_intel.auth_verify_2fa(password, api_id, api_hash)
+    return jsonify(result)
+
+
+@app.route('/tg-intel/run', methods=['POST'])
+def tg_intel_run():
+    if not tg_intel:
+        return jsonify({'ok': False, 'error': 'Module not loaded'})
+    if not tg_intel.is_authenticated():
+        return jsonify({'ok': False, 'error': 'Not authenticated — complete setup first'})
+    data     = request.get_json()
+    channels = data.get('channels', [])   # list of [name, id] pairs
+    hours    = int(data.get('hours', 24))
+    if not channels:
+        return jsonify({'ok': False, 'error': 'No channels provided'})
+    # Run in background thread — returns immediately
+    def _run():
+        report, err = tg_intel.run_analysis(channels, lookback_hours=hours)
+        if err:
+            print(f'[TG-INTEL] Analysis error: {err}')
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({'ok': True, 'status': 'Analysis started — report will arrive on Telegram'})
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 3000))
     app.run(host='0.0.0.0', port=port)
