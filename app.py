@@ -477,7 +477,7 @@ Line 3: One specific thing to watch that would confirm or invalidate this signal
 Be direct. No disclaimers. No invented data. Max 60 words total."""
 
     try:
-        url  = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}'
+        url  = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key={gemini_key}'
         resp = requests.post(url, json={
             'contents': [{'parts': [{'text': prompt}]}],
             'generationConfig': {'maxOutputTokens': 150, 'temperature': 0.3}
@@ -683,7 +683,7 @@ Brief technical setup for each — one line per asset with the key signal and wh
 
 Format as a professional quantitative research memo. Be direct and specific. Use actual numbers from the data."""
 
-        gemini_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}'
+        gemini_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key={gemini_key}'
         gemini_resp = requests.post(gemini_url, json={
             'contents': [{'parts': [{'text': prompt}]}],
             'generationConfig': {'maxOutputTokens': 4000, 'temperature': 0.7}
@@ -1286,12 +1286,18 @@ def tg_intel_verify_2fa():
     return jsonify(result)
 
 
+_app_start_time = time.time()
+
 @app.route('/tg-intel/run', methods=['POST'])
 def tg_intel_run():
     if not tg_intel:
         return jsonify({'ok': False, 'error': 'Module not loaded'})
     if not tg_intel.is_authenticated():
         return jsonify({'ok': False, 'error': 'Not authenticated — complete setup first'})
+    # Ignore requests that arrive within 90s of startup (stale browser requests)
+    if time.time() - _app_start_time < 90:
+        print('[TG-INTEL] Ignoring run request — too soon after startup')
+        return jsonify({'ok': False, 'error': 'Server just started — please wait a moment and try again'})
     data     = request.get_json()
     channels = data.get('channels', [])   # list of [name, id] pairs
     hours    = int(data.get('hours', 24))
