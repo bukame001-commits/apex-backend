@@ -399,26 +399,42 @@ def _post_to_telegram(report, post_count, channel_count):
     from datetime import datetime, timezone
     now    = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     header = (
-        f'🧠 <b>APEX INTELLIGENCE REPORT</b>\n'
+        f'🧠 APEX INTELLIGENCE REPORT\n'
         f'⏰ {now}\n'
         f'📡 {channel_count} channels · {post_count} posts analyzed\n\n'
     )
-    full   = header + report
-    url    = f'https://api.telegram.org/bot{bot_token}/sendMessage'
+    # Strip markdown formatting that breaks Telegram
+    import re
+    clean = report
+    clean = re.sub(r'\*\*(.+?)\*\*', r'\1', clean)   # **bold** → plain
+    clean = re.sub(r'\*(.+?)\*',     r'\1', clean)   # *italic* → plain
+    clean = re.sub(r'^#{1,3}\s+',    '',    clean, flags=re.MULTILINE)  # ### headers
+    clean = re.sub(r'`(.+?)`',       r'\1', clean)   # `code` → plain
+
+    full = header + clean
+    url  = f'https://api.telegram.org/bot{bot_token}/sendMessage'
+
+    # Split into safe 3800-char chunks at newline boundaries
     chunks = []
-    while len(full) > 4000:
-        split = full[:4000].rfind('\n')
-        if split < 3000:
-            split = 4000
-        chunks.append(full[:split])
-        full  = full[split:]
-    chunks.append(full)
-    for chunk in chunks:
+    while len(full) > 3800:
+        split = full[:3800].rfind('\n')
+        if split < 2000:
+            split = 3800
+        chunks.append(full[:split].strip())
+        full = full[split:].strip()
+    if full:
+        chunks.append(full)
+
+    print(f'[TG-INTEL] Sending report in {len(chunks)} chunks...')
+    for i, chunk in enumerate(chunks):
         try:
-            requests.post(url, json={
-                'chat_id': chat_id, 'text': chunk, 'parse_mode': 'HTML'
+            r = requests.post(url, json={
+                'chat_id': chat_id,
+                'text':    chunk,
             }, timeout=10)
-            time.sleep(0.5)
+            if not r.ok:
+                print(f'[TG-INTEL] Chunk {i+1} failed: {r.text[:100]}')
+            time.sleep(0.8)
         except Exception as e:
-            print(f'[TG-INTEL] Send error: {e}')
+            print(f'[TG-INTEL] Send error chunk {i+1}: {e}')
     print(f'[TG-INTEL] Report sent ({len(chunks)} messages)')
