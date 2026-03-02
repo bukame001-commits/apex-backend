@@ -379,7 +379,7 @@ def run_analysis(channels, lookback_hours=24):
         gemini_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}'
         resp = requests.post(gemini_url, json={
             'contents': [{'parts': [{'text': prompt}]}],
-            'generationConfig': {'maxOutputTokens': 4000, 'temperature': 0.7}
+            'generationConfig': {'maxOutputTokens': 8000, 'temperature': 0.7}
         }, timeout=90)
         if not resp.ok:
             return None, f'Gemini API error {resp.status_code}: {resp.text[:200]}'
