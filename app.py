@@ -421,23 +421,26 @@ def fetch_nupl():
     except Exception:
         pass
 
-    # Fallback: approximate NUPL using BTC 200d MA vs current price
+    # Fallback: true NUPL = (MarketCap - RealizedCap) / MarketCap via Coinmetrics
     try:
-        klines_url = 'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=210'
-        r2 = requests.get(klines_url, headers=HEADERS, timeout=8)
+        r2 = requests.get(
+            'https://community-api.coinmetrics.io/v4/timeseries/asset-metrics',
+            params={'assets': 'btc', 'metrics': 'CapMrktCurUSD,CapRealUSD', 'frequency': '1d', 'limit': 3},
+            timeout=10
+        )
         if r2.ok:
-            klines = r2.json()
-            closes = [float(k[4]) for k in klines]
-            if len(closes) >= 200:
-                current = closes[-1]
-                ma200   = sum(closes[-200:]) / 200
-                # Simplified NUPL proxy: (current - ma200) / current
-                nupl_approx = (current - ma200) / current
-                _nupl_cache = {'value': round(nupl_approx, 4), 'ts': time.time()}
-                print(f'[MONITOR] NUPL approx (200d MA proxy): {nupl_approx:.4f}')
-                return nupl_approx
+            data = r2.json().get('data', [])
+            if data:
+                latest   = data[-1]
+                mkt_cap  = float(latest.get('CapMrktCurUSD') or 0)
+                real_cap = float(latest.get('CapRealUSD') or 0)
+                if mkt_cap > 0:
+                    nupl_calc = (mkt_cap - real_cap) / mkt_cap
+                    _nupl_cache = {'value': round(nupl_calc, 4), 'ts': time.time()}
+                    print(f'[MONITOR] NUPL (CapMrktCurUSD - CapRealUSD) / CapMrktCurUSD: {nupl_calc:.4f}')
+                    return nupl_calc
     except Exception as e:
-        print(f'[MONITOR] NUPL fallback error: {e}')
+        print(f'[MONITOR] NUPL Coinmetrics fallback error: {e}')
 
     return None
 
@@ -463,67 +466,85 @@ _lth_cache = {'value': None, 'ts': 0}
 
 def fetch_lth_realized_price():
     """
-    Fetch LTH Realized Price. Priority:
-    1. Coinmetrics Community API (free, no key) - CapRealUSD/SplyCur
-    2. Bitbo.io public API (free, no key)
-    3. 2-year MA proxy via Binance (tracks LTH realized price closely)
+    Fetch TRUE LTH Realized Price — average cost basis of coins held 155+ days.
+    Priority:
+    1. Coinmetrics CapLTHRealUSD / SplyLTHCur  (true LTH metric, ~$80-95k range in current cycle)
+    2. Coinmetrics CapRealUSD / SplyCur         (all-holder realized price, lower — labelled as fallback)
+    3. 155-day VWAP via Binance                 (volume-weighted proxy for LTH entry price)
     Cached 6 hours.
     """
     global _lth_cache
     if time.time() - _lth_cache['ts'] < 21600 and _lth_cache['value'] is not None:
         return _lth_cache['value']
 
-    # Method 1: Coinmetrics Community API
+    base_url = 'https://community-api.coinmetrics.io/v4/timeseries/asset-metrics'
+
+    # Method 1: True LTH metric — realized cap of coins held 155+ days / LTH supply
     try:
-        url = (
-            'https://community-api.coinmetrics.io/v4/timeseries/asset-metrics'
-            '?assets=btc&metrics=CapRealUSD,SplyCur&frequency=1d&limit=2'
-        )
-        r = requests.get(url, timeout=10)
+        r = requests.get(base_url, params={
+            'assets': 'btc',
+            'metrics': 'CapLTHRealUSD,SplyLTHCur',
+            'frequency': '1d',
+            'limit': 3,
+        }, timeout=10)
         if r.ok:
             data = r.json().get('data', [])
             if data:
+                latest    = data[-1]
+                cap_lth   = float(latest.get('CapLTHRealUSD') or 0)
+                sply_lth  = float(latest.get('SplyLTHCur') or 0)
+                if cap_lth > 0 and sply_lth > 0:
+                    lth_rp = cap_lth / sply_lth
+                    if 20000 < lth_rp < 300000:
+                        _lth_cache = {'value': round(lth_rp, 0), 'ts': time.time()}
+                        print(f'[LTH] TRUE LTH Realized Price (CapLTHRealUSD/SplyLTHCur): ${lth_rp:,.0f}')
+                        return _lth_cache['value']
+    except Exception as e:
+        print(f'[LTH] Method 1 (CapLTHRealUSD) failed: {e}')
+
+    # Method 2: All-holder realized price fallback
+    try:
+        r2 = requests.get(base_url, params={
+            'assets': 'btc',
+            'metrics': 'CapRealUSD,SplyCur',
+            'frequency': '1d',
+            'limit': 3,
+        }, timeout=10)
+        if r2.ok:
+            data = r2.json().get('data', [])
+            if data:
                 latest   = data[-1]
-                cap_real = float(latest.get('CapRealUSD', 0))
-                sply_cur = float(latest.get('SplyCur', 0))
+                cap_real = float(latest.get('CapRealUSD') or 0)
+                sply_cur = float(latest.get('SplyCur') or 0)
                 if cap_real > 0 and sply_cur > 0:
                     rp = cap_real / sply_cur
-                    _lth_cache = {'value': round(rp, 0), 'ts': time.time()}
-                    print(f'[MONITOR] Realized Price (Coinmetrics): ${rp:,.0f}')
-                    return _lth_cache['value']
+                    if 20000 < rp < 300000:
+                        _lth_cache = {'value': round(rp, 0), 'ts': time.time()}
+                        print(f'[LTH] Fallback realized price (all holders, CapRealUSD/SplyCur): ${rp:,.0f}')
+                        return _lth_cache['value']
     except Exception as e:
-        print(f'[MONITOR] Coinmetrics LTH error: {e}')
+        print(f'[LTH] Method 2 (CapRealUSD) failed: {e}')
 
-    # Method 2: Bitbo.io
-    try:
-        r2 = requests.get('https://bitbo.io/api/v1/stats/', timeout=8,
-                          headers={'User-Agent': 'Mozilla/5.0'})
-        if r2.ok:
-            d  = r2.json()
-            rp = d.get('realized_price') or d.get('realizedPrice')
-            if rp:
-                _lth_cache = {'value': round(float(rp), 0), 'ts': time.time()}
-                print(f'[MONITOR] Realized Price (Bitbo): ${float(rp):,.0f}')
-                return _lth_cache['value']
-    except Exception as e:
-        print(f'[MONITOR] Bitbo LTH error: {e}')
-
-    # Method 3: 2-year MA proxy (Binance)
+    # Method 3: 155-day VWAP via Binance (better proxy than 2yr MA)
     try:
         r3 = requests.get(
-            'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=730',
+            'https://api.binance.com/api/v3/klines',
+            params={'symbol': 'BTCUSDT', 'interval': '1d', 'limit': 155},
             headers=HEADERS, timeout=10
         )
         if r3.ok:
-            closes = [float(k[4]) for k in r3.json()]
-            if len(closes) >= 730:
-                ma2y = sum(closes[-730:]) / 730
-                _lth_cache = {'value': round(ma2y, 0), 'ts': time.time()}
-                print(f'[MONITOR] Realized Price (2yr MA proxy): ${ma2y:,.0f}')
+            klines     = r3.json()
+            total_vol  = sum(float(k[5]) for k in klines)
+            total_vwap = sum(float(k[4]) * float(k[5]) for k in klines)  # close * volume
+            if total_vol > 0:
+                vwap_155 = total_vwap / total_vol
+                _lth_cache = {'value': round(vwap_155, 0), 'ts': time.time()}
+                print(f'[LTH] Fallback 155-day VWAP: ${vwap_155:,.0f}')
                 return _lth_cache['value']
     except Exception as e:
-        print(f'[MONITOR] LTH 2yr MA error: {e}')
+        print(f'[LTH] Method 3 (155d VWAP) failed: {e}')
 
+    print('[LTH] All methods failed — returning None')
     return None
 
 
