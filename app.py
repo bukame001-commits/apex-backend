@@ -166,6 +166,33 @@ def calc_mavilimw(closes, f1=3, f2=5):
     return mav_now, direction
 
 
+
+def calc_ema(closes, period):
+    """Exponential Moving Average."""
+    if len(closes) < period:
+        return None
+    k = 2 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for price in closes[period:]:
+        ema = price * k + ema * (1 - k)
+    return ema
+
+
+def _calc_atr_1h(klines, period=14):
+    """ATR from 1H klines — used for setup calculations in spike alerts."""
+    if len(klines) < period + 2:
+        return None
+    trs = []
+    for i in range(1, len(klines)):
+        high  = klines[i][2]
+        low   = klines[i][3]
+        prev_close = klines[i-1][4]
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    if len(trs) < period:
+        return None
+    atr = sum(trs[-period:]) / period
+    return round(atr, 8)
+
 # ── Volume spike detection ────────────────────────────────────
 def detect_volume_spike(symbol, klines):
     """
@@ -468,50 +495,66 @@ def fetch_lth_realized_price():
     """
     Fetch TRUE LTH Realized Price — average cost basis of coins held 155+ days.
     Priority:
-    1. Coinmetrics CapLTHRealUSD / SplyLTHCur  (true LTH metric, ~$80-95k range in current cycle)
-    2. Coinmetrics CapRealUSD / SplyCur         (all-holder realized price, lower — labelled as fallback)
-    3. 155-day VWAP via Binance                 (volume-weighted proxy for LTH entry price)
+    1. Glassnode free API — lth_realized_price (actual LTH metric, free tier)
+    2. CoinGlass BTC on-chain data — lth_realized_price field
+    3. Coinmetrics community — CapRealUSD/SplyCur (all-holder realized price, ~$40-50k, labelled)
+    4. 155-day VWAP via Binance (last resort proxy)
     Cached 6 hours.
+    Note: CapLTHRealUSD/SplyLTHCur are PAID Coinmetrics metrics — not available on free tier.
     """
     global _lth_cache
     if time.time() - _lth_cache['ts'] < 21600 and _lth_cache['value'] is not None:
         return _lth_cache['value']
 
-    base_url = 'https://community-api.coinmetrics.io/v4/timeseries/asset-metrics'
-
-    # Method 1: True LTH metric — realized cap of coins held 155+ days / LTH supply
+    # Method 1: Glassnode free API — true LTH realized price
     try:
-        r = requests.get(base_url, params={
-            'assets': 'btc',
-            'metrics': 'CapLTHRealUSD,SplyLTHCur',
-            'frequency': '1d',
-            'limit': 3,
-        }, timeout=10)
+        r = requests.get(
+            'https://api.glassnode.com/v1/metrics/indicators/lth_realized_price',
+            params={'a': 'BTC', 'i': '24h', 'api_key': 'free'},
+            timeout=10
+        )
+        print(f'[LTH] Glassnode response: {r.status_code}')
         if r.ok:
-            data = r.json().get('data', [])
-            if data:
-                latest    = data[-1]
-                cap_lth   = float(latest.get('CapLTHRealUSD') or 0)
-                sply_lth  = float(latest.get('SplyLTHCur') or 0)
-                if cap_lth > 0 and sply_lth > 0:
-                    lth_rp = cap_lth / sply_lth
-                    if 20000 < lth_rp < 300000:
-                        _lth_cache = {'value': round(lth_rp, 0), 'ts': time.time()}
-                        print(f'[LTH] TRUE LTH Realized Price (CapLTHRealUSD/SplyLTHCur): ${lth_rp:,.0f}')
-                        return _lth_cache['value']
+            data = r.json()
+            if data and isinstance(data, list) and len(data) > 0:
+                val = data[-1].get('v')
+                if val and 20000 < float(val) < 300000:
+                    _lth_cache = {'value': round(float(val), 0), 'ts': time.time()}
+                    print(f'[LTH] TRUE LTH Realized Price (Glassnode): ${float(val):,.0f}')
+                    return _lth_cache['value']
+        else:
+            print(f'[LTH] Glassnode error body: {r.text[:200]}')
     except Exception as e:
-        print(f'[LTH] Method 1 (CapLTHRealUSD) failed: {e}')
+        print(f'[LTH] Method 1 (Glassnode) failed: {e}')
 
-    # Method 2: All-holder realized price fallback
+    # Method 2: CoinGlass on-chain BTC data
     try:
-        r2 = requests.get(base_url, params={
-            'assets': 'btc',
-            'metrics': 'CapRealUSD,SplyCur',
-            'frequency': '1d',
-            'limit': 3,
-        }, timeout=10)
+        r2 = requests.get(
+            'https://open-api.coinglass.com/public/v2/indicator/btc_long_term_holder_realized_price',
+            headers={'coinglassSecret': '', 'Content-Type': 'application/json'},
+            timeout=10
+        )
+        print(f'[LTH] CoinGlass response: {r2.status_code}')
         if r2.ok:
-            data = r2.json().get('data', [])
+            d = r2.json()
+            val = d.get('data', {}).get('lthRealizedPrice') or d.get('data')
+            if val and isinstance(val, (int, float)) and 20000 < float(val) < 300000:
+                _lth_cache = {'value': round(float(val), 0), 'ts': time.time()}
+                print(f'[LTH] TRUE LTH Realized Price (CoinGlass): ${float(val):,.0f}')
+                return _lth_cache['value']
+    except Exception as e:
+        print(f'[LTH] Method 2 (CoinGlass) failed: {e}')
+
+    # Method 3: Coinmetrics community — all-holder realized price (NOT LTH-specific, ~$40-50k)
+    # This is the MARKET realized price, not LTH. Labelled clearly.
+    try:
+        r3 = requests.get(
+            'https://community-api.coinmetrics.io/v4/timeseries/asset-metrics',
+            params={'assets': 'btc', 'metrics': 'CapRealUSD,SplyCur', 'frequency': '1d', 'limit': 3},
+            timeout=10
+        )
+        if r3.ok:
+            data = r3.json().get('data', [])
             if data:
                 latest   = data[-1]
                 cap_real = float(latest.get('CapRealUSD') or 0)
@@ -520,29 +563,29 @@ def fetch_lth_realized_price():
                     rp = cap_real / sply_cur
                     if 20000 < rp < 300000:
                         _lth_cache = {'value': round(rp, 0), 'ts': time.time()}
-                        print(f'[LTH] Fallback realized price (all holders, CapRealUSD/SplyCur): ${rp:,.0f}')
+                        print(f'[LTH] Market Realized Price (Coinmetrics, all holders, NOT LTH-specific): ${rp:,.0f}')
                         return _lth_cache['value']
     except Exception as e:
-        print(f'[LTH] Method 2 (CapRealUSD) failed: {e}')
+        print(f'[LTH] Method 3 (Coinmetrics CapRealUSD) failed: {e}')
 
-    # Method 3: 155-day VWAP via Binance (better proxy than 2yr MA)
+    # Method 4: 155-day VWAP via Binance — last resort
     try:
-        r3 = requests.get(
+        r4 = requests.get(
             'https://api.binance.com/api/v3/klines',
             params={'symbol': 'BTCUSDT', 'interval': '1d', 'limit': 155},
             headers=HEADERS, timeout=10
         )
-        if r3.ok:
-            klines     = r3.json()
+        if r4.ok:
+            klines     = r4.json()
             total_vol  = sum(float(k[5]) for k in klines)
-            total_vwap = sum(float(k[4]) * float(k[5]) for k in klines)  # close * volume
+            total_vwap = sum(float(k[4]) * float(k[5]) for k in klines)
             if total_vol > 0:
                 vwap_155 = total_vwap / total_vol
                 _lth_cache = {'value': round(vwap_155, 0), 'ts': time.time()}
-                print(f'[LTH] Fallback 155-day VWAP: ${vwap_155:,.0f}')
+                print(f'[LTH] Fallback 155-day VWAP (last resort): ${vwap_155:,.0f}')
                 return _lth_cache['value']
     except Exception as e:
-        print(f'[LTH] Method 3 (155d VWAP) failed: {e}')
+        print(f'[LTH] Method 4 (155d VWAP) failed: {e}')
 
     print('[LTH] All methods failed — returning None')
     return None
@@ -644,9 +687,9 @@ def fetch_monitor_coins():
 
 def gemini_spike_commentary(alert):
     """
-    Ask Gemini to interpret a volume spike alert using ONLY the live data we provide.
-    Never asks Gemini to invent or recall prices — all data is passed in explicitly.
-    Returns a 2-3 line commentary string or None if Gemini unavailable.
+    Two-part Gemini response for each volume spike:
+    1. Plain-English explanation of what MavilimW/CVROC/MFI readings mean RIGHT NOW
+    2. Real trade setup using ONLY provided price + ATR — no invented levels
     """
     gemini_key = os.environ.get('GEMINI_API_KEY', '')
     if not gemini_key:
@@ -656,43 +699,97 @@ def gemini_spike_commentary(alert):
     price      = alert.get('price', 0)
     spike      = alert.get('spike', 0)
     usd_vol    = alert.get('usd_vol', 0)
-    mfi        = alert.get('mfi', 'N/A')
-    cvroc      = alert.get('cvroc', 'N/A')
+    mfi        = alert.get('mfi', None)
+    cvroc      = alert.get('cvroc', None)
     score      = alert.get('score', 0)
     pct_low    = alert.get('pct_from_low', 0)
-    funding    = alert.get('funding', 'N/A')
+    funding    = alert.get('funding', None)
     oi_rising  = alert.get('oi_rising', None)
-    labels     = ', '.join(alert.get('labels', []))
+    labels     = alert.get('labels', [])
+    vs_ema200  = alert.get('vs_ema200', None)
+    atr        = alert.get('atr', None)
+    spike_green= alert.get('spike_green', None)
 
-    oi_str = 'rising' if oi_rising else ('flat/falling' if oi_rising is False else 'unknown')
+    # Build indicator explanation context
+    kivanc_lines = []
+    if mfi is not None:
+        mfi_interp = (
+            f"MFI {mfi} — strong money inflow, buyers are in control" if mfi >= 60 else
+            f"MFI {mfi} — moderate buying pressure, money flowing in" if mfi >= 50 else
+            f"MFI {mfi} — weak inflow, watch for confirmation"
+        )
+        kivanc_lines.append(mfi_interp)
 
-    prompt = f"""You are a professional crypto market analyst. Interpret this LIVE volume spike alert. 
-Use ONLY the data provided below — do not assume or invent any other information.
+    if cvroc is not None:
+        cvroc_interp = (
+            f"CVROC +{cvroc}% — volume is accelerating fast, momentum building" if cvroc > 20 else
+            f"CVROC +{cvroc}% — volume momentum positive and rising" if cvroc > 0 else
+            f"CVROC {cvroc}% — volume momentum decelerating"
+        )
+        kivanc_lines.append(cvroc_interp)
 
-LIVE DATA FOR {sym}/USDT:
-- Current price: ${price:,.6g}
-- Volume spike: {spike}x above 20-bar Fibonacci-weighted average
-- USD volume this candle: ${usd_vol:,}
-- Money Flow Index (MFI): {mfi} (above 50 = money flowing in)
-- CVROC (volume momentum): {cvroc}% (positive = accelerating)
-- Open Interest: {oi_str}
-- Funding rate: {funding}% per hour
-- Price position: {pct_low}% above 30-bar low (near lows = potential accumulation)
-- Confirmed signals: {labels}
-- Overall conviction score: {score}/7
+    mav_up   = any('MavilimW' in l and '↑' in l for l in labels)
+    cvroc_up = any('CVROC' in l and '↑' in l for l in labels)
+    if mav_up:
+        kivanc_lines.append("MavilimW trending up — Fibonacci-weighted MA confirms upward momentum, not a fake spike")
 
-Based ONLY on this live data, provide a 3-line interpretation:
-Line 1: What this spike most likely represents (accumulation / distribution / squeeze setup / stop hunt / organic buying)
-Line 2: The single most important signal from this data and what it implies
-Line 3: One specific thing to watch that would confirm or invalidate this signal
+    oi_str   = 'rising' if oi_rising else ('flat/falling' if oi_rising is False else 'unknown')
+    fund_str = f"{funding}%" if funding is not None else "N/A"
+    ema_str  = f"{vs_ema200:+.1f}% vs EMA200" if vs_ema200 is not None else "EMA200 N/A"
+    candle_str = "green (bullish close)" if spike_green else ("red (bearish close)" if spike_green is False else "unknown")
 
-Be direct. No disclaimers. No invented data. Max 60 words total."""
+    # ATR-based setup levels
+    if atr and price:
+        entry  = price
+        stop   = round(price - 1.5 * atr, 8)
+        target = round(price + 3.0 * atr, 8)
+        rr     = "2:1"
+        setup_block = f"""
+SETUP (calculated from live ATR={atr:.6g}):
+- Entry:  ${entry:,.6g} (current price)
+- Stop:   ${stop:,.6g}  (price - 1.5x ATR)
+- Target: ${target:,.6g} (price + 3x ATR)
+- R:R: {rr}
+"""
+    else:
+        setup_block = "
+SETUP: ATR not available — cannot calculate levels.
+"
+
+    kivanc_block = "
+".join(f"- {l}" for l in kivanc_lines) if kivanc_lines else "- Indicator readings not available"
+
+    prompt = f"""You are a crypto trading analyst. A real-time volume spike has been detected. 
+ALL numbers below are live data — use ONLY these. Do not invent or recall any other prices.
+
+═══ LIVE SIGNAL: {sym}/USDT ═══
+Price:          ${price:,.6g}
+Spike:          {spike}x above baseline  ({candle_str} candle)
+USD Volume:     ${usd_vol:,}
+Position:       {pct_low}% above 30-bar low
+EMA200 (1H):    {ema_str}
+OI:             {oi_str}
+Funding:        {fund_str}/hr
+Conviction:     {score}/7
+
+KIVANÇ INDICATOR READINGS (explain these in plain English):
+{kivanc_block}
+
+{setup_block}
+
+YOUR RESPONSE — two sections, max 80 words total:
+
+WHAT THIS MEANS:
+[2-3 sentences explaining in plain English what MavilimW up + CVROC accelerating + MFI reading means for THIS specific spike — what is the market telling us right now]
+
+TRADE SETUP:
+[Use ONLY the entry/stop/target from the SETUP block above. State them clearly. Add ONE sentence on what would invalidate this — e.g. price closing below stop on next candle.]"""
 
     try:
         url  = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}'
         resp = requests.post(url, json={
             'contents': [{'parts': [{'text': prompt}]}],
-            'generationConfig': {'maxOutputTokens': 150, 'temperature': 0.3}
+            'generationConfig': {'maxOutputTokens': 250, 'temperature': 0.3}
         }, timeout=15)
         if resp.ok:
             return resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
@@ -1078,6 +1175,15 @@ def run_monitor_scan():
             if liq_data and liq_data.get('pct_to_above') and liq_data['pct_to_above'] < 8:
                 liq_target = f'+{liq_data["pct_to_above"]}% (${liq_data["liq_above_usd"]/1000:.0f}k shorts)'
 
+            # ── EMA200 proximity (1H closes) ──
+            closes_1h = [k[4] for k in (klines_ref or [])]
+            ema200_val = calc_ema(closes_1h, 200) if len(closes_1h) >= 200 else None
+            vs_ema200  = round((price / ema200_val - 1) * 100, 2) if ema200_val else None
+
+            # ── Spike candle color: green = close > open ──
+            trigger_kline = (klines_ref or [None])[-1] if spike.get('candle') != 'previous' else (klines_ref or [None, None])[-2]
+            spike_green = (trigger_kline[4] > trigger_kline[1]) if trigger_kline else None  # close > open
+
             return {
                 'sym':         sym,
                 'spike':       spike['ratio'],
@@ -1098,6 +1204,9 @@ def run_monitor_scan():
                 'cvd_bull_div':cvd_data.get('bullish_div') if cvd_data else None,
                 'liq_target':  liq_target,
                 'basis':       basis['basis'] if basis else None,
+                'vs_ema200':   vs_ema200,
+                'spike_green': spike_green,
+                'atr':         _calc_atr_1h(klines_ref or []),
             }
         except Exception as e:
             print(f'[MONITOR] {sym} error: {e}')
@@ -1133,32 +1242,49 @@ def run_monitor_scan():
             lines.append(f'📊 Market: {nupl_str}')
         lines.append('')
         for a in alerts[:10]:
-            score      = a.get('score', 1)
-            stars      = '⭐' * min(score, 10)
-            usd_vol    = a.get('usd_vol', 0)
-            vol_str    = f'${usd_vol/1000:.0f}k' if usd_vol < 1_000_000 else f'${usd_vol/1_000_000:.1f}M'
-            candle_tag = '[prev]' if a.get('candle') == 'previous' else ''
-            verdict    = a.get('verdict', '')
-            labels     = a.get('labels', [])
-            liq_target = a.get('liq_target')
-            basis      = a.get('basis')
-            cvd_bull   = a.get('cvd_bull_div')
+            score       = a.get('score', 1)
+            stars       = '⭐' * min(score, 10)
+            usd_vol     = a.get('usd_vol', 0)
+            vol_str     = f'${usd_vol/1000:.0f}k' if usd_vol < 1_000_000 else f'${usd_vol/1_000_000:.1f}M'
+            candle_tag  = '[prev]' if a.get('candle') == 'previous' else ''
+            verdict     = a.get('verdict', '')
+            labels      = a.get('labels', [])
+            liq_target  = a.get('liq_target')
+            basis       = a.get('basis')
+            cvd_bull    = a.get('cvd_bull_div')
+            vs_ema200   = a.get('vs_ema200')
+            spike_green = a.get('spike_green')
+            sym         = a['sym']
 
             # Header line
-            lines.append(f'{stars} <b>{a["sym"]}</b>  {a["spike"]}x vol  {candle_tag}  {verdict}'.strip())
-            lines.append(f'   💰 ${a["price"]:,.6g}  |  Vol: {vol_str}  |  {a["pct_from_low"]}% from low')
+            lines.append(f'{stars} <b>{sym}</b>  {candle_tag}  {verdict}'.strip())
+
+            # Price + EMA200 proximity
+            price_line = f'   💰 ${a["price"]:,.6g}  |  {a["pct_from_low"]}% from 30d low'
+            if vs_ema200 is not None:
+                ema_arrow = '📈' if vs_ema200 >= 0 else '📉'
+                price_line += f'  |  {ema_arrow} EMA200: {vs_ema200:+.1f}%'
+            lines.append(price_line)
+
+            # Volume spike line — only show if spike candle is green (bullish), always show for BTC
+            show_vol = (sym == 'BTC') or (spike_green is True) or (spike_green is None)
+            if show_vol:
+                candle_color = '🟢' if spike_green else ('⚪' if spike_green is None else '🔴')
+                lines.append(f'   📊 Vol spike: {a["spike"]}x  {candle_color}')
+
+            # Liquidation proximity
+            if liq_target:
+                lines.append(f'   🎯 Liq target: {liq_target}')
 
             # Key signals
             key_signals = [l for l in labels if any(x in l for x in ['CVD','Stealth','Liq','Spot','crowded','FOMO','⚠','🔵','🎯'])]
             normal_signals = [l for l in labels if l not in key_signals]
 
             if normal_signals:
-                lines.append(f'   📊 {" · ".join(normal_signals)}')
+                lines.append(f'   📡 {" · ".join(normal_signals)}')
             if key_signals:
                 for ks in key_signals:
                     lines.append(f'   {ks}')
-            if liq_target:
-                lines.append(f'   🎯 Next target: {liq_target}')
             if basis is not None:
                 basis_str = f'Spot premium {abs(basis):.3f}%' if basis < 0 else f'Futures premium {basis:.3f}%'
                 lines.append(f'   📐 Basis: {basis_str}')
@@ -1207,29 +1333,44 @@ def citadel_report():
         if not gemini_key:
             return jsonify({'error': 'GEMINI_API_KEY not set'}), 500
 
-        prompt = f"""You are a senior quantitative trader at Citadel who combines technical analysis with statistical models to time entries and exits.
+        prompt = f"""You are a senior quantitative trader. Analyze this scan data and produce a technical research memo.
 
-I have scanned {count} crypto/stock assets on the {timeframe} timeframe and ranked them by signal strength. Here is the full data:
+CRITICAL RULES — STRICT ENFORCEMENT:
+- You ONLY use numbers explicitly provided in the data below. NEVER invent, estimate, or infer price levels.
+- Entry zone = the exact Price provided. Nothing else.
+- Stop-loss = Price minus 1x ATR (if ATR provided). If ATR is N/A, write "Stop: N/A — ATR not available".
+- Profit target = Price plus 2x ATR for longs, Price minus 2x ATR for shorts (if ATR provided). If ATR is N/A, write "Target: N/A — ATR not available".
+- VWAP deviation = use the VWAP value provided to describe premium/discount. Do NOT invent a VWAP level.
+- If a field says N/A, you must write N/A in your output. Never substitute a guess.
+- Do NOT reference price levels from memory or training data. You have no knowledge of historical prices.
+
+SCAN DATA ({count} assets, {timeframe} timeframe):
 
 {coins_data}
 
-Provide a comprehensive Citadel-style technical analysis report covering:
+REPORT FORMAT:
 
-1. MARKET OVERVIEW — Overall market condition based on this scan. What does the breadth of signals tell us?
+1. MARKET OVERVIEW
+   What does the breadth of RSI/WT signals tell us about current market condition?
 
-2. TIER 1 — TOP CONVICTION (top 5 assets)
-For each: trend direction, key levels, RSI/WT reading interpretation, entry zone, stop-loss, profit target, risk-reward ratio, confidence rating (Strong Buy / Buy / Neutral / Sell / Strong Sell)
+2. TIER 1 — TOP 5 CONVICTION
+   For each asset:
+   - Signal strength and what indicators triggered
+   - Entry: [exact Price from data]
+   - Stop: [Price - 1x ATR, or N/A]
+   - Target: [Price + 2x ATR for longs / Price - 2x ATR for shorts, or N/A]
+   - R:R: [calculated from above, or N/A]
+   - VWAP context: [above/below VWAP by X%, or N/A]
+   - Bias: Strong Buy / Buy / Neutral / Sell / Strong Sell
 
-3. TIER 2 — WATCHLIST (next 10 assets)
-Brief technical setup for each — one line per asset with the key signal and what to watch
+3. TIER 2 — WATCHLIST (next 10)
+   One line each: symbol | key signal | what to watch for entry
 
-4. SECTOR/THEME PATTERNS — Are there recurring patterns? (e.g. DeFi tokens all showing oversold, L2s showing momentum)
+4. SECTOR PATTERNS
+   Any recurring themes across the scan?
 
-5. RISK FACTORS — What could invalidate these setups? Key macro or on-chain risks to monitor
-
-6. EXECUTION SUMMARY — Prioritized action plan: what to act on now vs. what to monitor
-
-Format as a professional quantitative research memo. Be direct and specific. Use actual numbers from the data."""
+5. EXECUTION SUMMARY
+   What to act on now vs. monitor. No price levels unless directly from the data."""
 
         gemini_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}'
         gemini_resp = requests.post(gemini_url, json={
