@@ -336,6 +336,127 @@ def fetch_oi_and_funding(sym):
         return None
 
 
+
+
+def fetch_taker_ratio(sym, spike_candle_ts_ms):
+    """
+    Fetch taker buy ratio for the spike candle only.
+    Uses Binance aggTrades to count buyer vs seller initiated volume.
+    Returns dict: {ratio: float, label: str, color: str} or None
+    """
+    try:
+        # spike_candle_ts_ms is the open time of the spike candle
+        start_ms = int(spike_candle_ts_ms)
+        end_ms   = start_ms + 3600_000  # 1 hour later
+        url = (
+            f'https://api.binance.com/api/v3/aggTrades'
+            f'?symbol={sym}USDT&startTime={start_ms}&endTime={end_ms}&limit=1000'
+        )
+        r = requests.get(url, headers=HEADERS, timeout=8)
+        if not r.ok:
+            return None
+        trades = r.json()
+        if not trades or not isinstance(trades, list):
+            return None
+
+        buy_vol  = 0.0
+        sell_vol = 0.0
+        for t in trades:
+            qty = float(t.get('q', 0))
+            price = float(t.get('p', 0))
+            usd = qty * price
+            if t.get('m') is False:  # m=False means buyer is taker
+                buy_vol += usd
+            else:
+                sell_vol += usd
+
+        total = buy_vol + sell_vol
+        if total == 0:
+            return None
+
+        buy_pct = (buy_vol / total) * 100
+
+        if buy_pct >= 55:
+            label = f'🟢 Buyers {buy_pct:.0f}%'
+            color = 'green'
+        elif buy_pct <= 45:
+            label = f'🔴 Sellers {100-buy_pct:.0f}%'
+            color = 'red'
+        else:
+            label = f'🟡 Mixed {buy_pct:.0f}% buy'
+            color = 'neutral'
+
+        return {'buy_pct': round(buy_pct, 1), 'label': label, 'color': color}
+    except Exception as e:
+        print(f'[MONITOR] taker_ratio {sym} error: {e}')
+        return None
+
+
+# ── NUPL cache (fetched once per scan, BTC-wide) ─────────────
+_nupl_cache = {'value': None, 'ts': 0}
+
+def fetch_nupl():
+    """
+    Fetch Bitcoin NUPL from Glassnode (free tier) or CryptoQuant.
+    Falls back to approximation using BTC market cap vs realized cap estimate.
+    Cached for 1 hour.
+    """
+    global _nupl_cache
+    if time.time() - _nupl_cache['ts'] < 3600 and _nupl_cache['value'] is not None:
+        return _nupl_cache['value']
+
+    try:
+        # Use CoinGecko for market cap + approximate realized cap
+        # NUPL approximation: (price - 200d avg) / price as simplified proxy
+        # For actual NUPL we use Glassnode free endpoint
+        url = 'https://api.glassnode.com/v1/metrics/indicators/nupl?a=BTC&i=24h&api_key=free'
+        r = requests.get(url, timeout=8)
+        if r.ok:
+            data = r.json()
+            if data and isinstance(data, list) and len(data) > 0:
+                nupl = data[-1].get('v', None)
+                if nupl is not None:
+                    _nupl_cache = {'value': float(nupl), 'ts': time.time()}
+                    return float(nupl)
+    except Exception:
+        pass
+
+    # Fallback: approximate NUPL using BTC 200d MA vs current price
+    try:
+        klines_url = 'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=210'
+        r2 = requests.get(klines_url, headers=HEADERS, timeout=8)
+        if r2.ok:
+            klines = r2.json()
+            closes = [float(k[4]) for k in klines]
+            if len(closes) >= 200:
+                current = closes[-1]
+                ma200   = sum(closes[-200:]) / 200
+                # Simplified NUPL proxy: (current - ma200) / current
+                nupl_approx = (current - ma200) / current
+                _nupl_cache = {'value': round(nupl_approx, 4), 'ts': time.time()}
+                print(f'[MONITOR] NUPL approx (200d MA proxy): {nupl_approx:.4f}')
+                return nupl_approx
+    except Exception as e:
+        print(f'[MONITOR] NUPL fallback error: {e}')
+
+    return None
+
+
+def nupl_label(nupl):
+    """Return emoji + zone label for NUPL value."""
+    if nupl is None:
+        return None
+    if nupl >= 0.75:
+        return f'🔴 NUPL:{nupl:.2f} (Euphoria — distribution risk)'
+    elif nupl >= 0.5:
+        return f'🟠 NUPL:{nupl:.2f} (Belief — trending up)'
+    elif nupl >= 0.25:
+        return f'🟡 NUPL:{nupl:.2f} (Optimism)'
+    elif nupl >= 0:
+        return f'🟢 NUPL:{nupl:.2f} (Hope/Fear — accumulation zone)'
+    else:
+        return f'💙 NUPL:{nupl:.2f} (Capitulation — long-term holders selling at loss)'
+
 # ── Background monitor scan ───────────────────────────────────
 # MONITOR_COINS is populated dynamically on startup from KuCoin/OKX
 # Falls back to this built-in list if exchange APIs are unreachable
@@ -488,6 +609,294 @@ Be direct. No disclaimers. No invented data. Max 60 words total."""
         print(f'[MONITOR] Gemini commentary error for {sym}: {e}')
     return None
 
+
+# ════════════════════════════════════════════════════════════════
+# CITADEL-GRADE SIGNAL SUITE
+# CVD divergence · Liquidation clusters · Spot/futures basis
+# OI stealth accumulation · Combined conviction engine
+# ════════════════════════════════════════════════════════════════
+
+def calc_cvd(klines, lookback=20):
+    """
+    Cumulative Volume Delta — difference between buy and sell volume per candle.
+    Uses candle body direction as proxy (close > open = buy pressure).
+    Returns: cvd_list, divergence signal
+    Divergence = price making higher high but CVD making lower high = distribution
+                 price making lower low but CVD making higher low = accumulation
+    """
+    if len(klines) < lookback + 2:
+        return None, None
+    try:
+        cvd = []
+        for k in klines:
+            o, h, l, c, v = float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])
+            candle_range = h - l
+            if candle_range == 0:
+                delta = 0
+            else:
+                # Estimate buy vs sell volume using candle close position
+                buy_frac  = (c - l) / candle_range
+                sell_frac = (h - c) / candle_range
+                delta = (buy_frac - sell_frac) * v
+            cvd.append(delta)
+
+        # Cumulative sum
+        cum_cvd = []
+        running = 0
+        for d in cvd:
+            running += d
+            cum_cvd.append(running)
+
+        # Check divergence over last lookback bars
+        recent_cvd    = cum_cvd[-lookback:]
+        recent_closes = [float(k[4]) for k in klines[-lookback:]]
+
+        # Find local highs and lows
+        price_high = max(recent_closes[-5:])
+        price_low  = min(recent_closes[-5:])
+        cvd_high   = max(recent_cvd[-5:])
+        cvd_low    = min(recent_cvd[-5:])
+
+        price_high_prev = max(recent_closes[-10:-5])
+        price_low_prev  = min(recent_closes[-10:-5])
+        cvd_high_prev   = max(recent_cvd[-10:-5])
+        cvd_low_prev    = min(recent_cvd[-10:-5])
+
+        # Bullish divergence: price lower low but CVD higher low = hidden accumulation
+        bullish_div = (price_low < price_low_prev * 0.999) and (cvd_low > cvd_low_prev * 0.999)
+        # Bearish divergence: price higher high but CVD lower high = hidden distribution
+        bearish_div = (price_high > price_high_prev * 1.001) and (cvd_high < cvd_high_prev * 1.001)
+
+        # Current CVD trend — is delta positive (buying) or negative (selling)?
+        recent_delta = sum(cvd[-3:])  # last 3 candles net delta
+        cvd_trend = 'buying' if recent_delta > 0 else 'selling'
+
+        return {
+            'bullish_div':  bullish_div,
+            'bearish_div':  bearish_div,
+            'cvd_trend':    cvd_trend,
+            'recent_delta': round(recent_delta, 2),
+            'cum_cvd_last': round(cum_cvd[-1], 2),
+        }
+    except Exception as e:
+        return None
+
+
+def fetch_liquidation_clusters(sym):
+    """
+    Fetch recent liquidation data from Binance futures.
+    Identifies price levels with heavy liquidation clusters above/below.
+    These act as magnets — price tends to sweep these levels.
+    Returns: {liq_above: price, liq_below: price, recent_liq_usd: float}
+    """
+    try:
+        url = f'https://fapi.binance.com/fapi/v1/allForceOrders?symbol={sym}USDT&limit=200'
+        r = requests.get(url, headers=HEADERS, timeout=6)
+        if not r.ok:
+            return None
+        orders = r.json()
+        if not orders or not isinstance(orders, list):
+            return None
+
+        # Get current price
+        ticker_url = f'https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}USDT'
+        rt = requests.get(ticker_url, headers=HEADERS, timeout=5)
+        if not rt.ok:
+            return None
+        current_price = float(rt.json()['price'])
+
+        liq_above = []  # liquidations above current price (short liquidations)
+        liq_below = []  # liquidations below current price (long liquidations)
+        total_liq_usd = 0
+
+        for o in orders:
+            price    = float(o.get('price', 0))
+            qty      = float(o.get('origQty', 0))
+            side     = o.get('side', '')  # BUY = short liquidated, SELL = long liquidated
+            usd_val  = price * qty
+            total_liq_usd += usd_val
+
+            if side == 'BUY' and price > current_price:
+                liq_above.append({'price': price, 'usd': usd_val})
+            elif side == 'SELL' and price < current_price:
+                liq_below.append({'price': price, 'usd': usd_val})
+
+        # Find biggest cluster above and below
+        def biggest_cluster(liqs, n_bins=10):
+            if not liqs:
+                return None, 0
+            prices = [l['price'] for l in liqs]
+            p_min, p_max = min(prices), max(prices)
+            if p_min == p_max:
+                return p_min, sum(l['usd'] for l in liqs)
+            bin_size = (p_max - p_min) / n_bins
+            bins = {}
+            for l in liqs:
+                b = int((l['price'] - p_min) / bin_size)
+                bins[b] = bins.get(b, 0) + l['usd']
+            best_bin = max(bins, key=bins.get)
+            cluster_price = p_min + best_bin * bin_size + bin_size / 2
+            return round(cluster_price, 6), round(bins[best_bin])
+
+        cluster_above_price, cluster_above_usd = biggest_cluster(liq_above)
+        cluster_below_price, cluster_below_usd = biggest_cluster(liq_below)
+
+        pct_to_above = ((cluster_above_price - current_price) / current_price * 100) if cluster_above_price else None
+        pct_to_below = ((current_price - cluster_below_price) / current_price * 100) if cluster_below_price else None
+
+        return {
+            'current_price':       current_price,
+            'liq_above_price':     cluster_above_price,
+            'liq_above_usd':       cluster_above_usd,
+            'pct_to_above':        round(pct_to_above, 2) if pct_to_above else None,
+            'liq_below_price':     cluster_below_price,
+            'liq_below_usd':       cluster_below_usd,
+            'pct_to_below':        round(pct_to_below, 2) if pct_to_below else None,
+            'total_liq_24h_usd':   round(total_liq_usd),
+        }
+    except Exception as e:
+        return None
+
+
+def fetch_spot_futures_basis(sym):
+    """
+    Spot vs perpetual futures price spread.
+    Positive basis (futures > spot) = normal contango = leveraged longs
+    Negative basis (spot > futures) = backwardation = real spot buying > speculation
+    Strong negative basis during upward price move = very bullish (real demand)
+    """
+    try:
+        spot_url    = f'https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT'
+        futures_url = f'https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}USDT'
+        rs = requests.get(spot_url,    headers=HEADERS, timeout=5)
+        rf = requests.get(futures_url, headers=HEADERS, timeout=5)
+        if not rs.ok or not rf.ok:
+            return None
+        spot    = float(rs.json()['price'])
+        futures = float(rf.json()['price'])
+        basis   = (futures - spot) / spot * 100  # positive = futures premium
+        return {
+            'spot':    spot,
+            'futures': futures,
+            'basis':   round(basis, 4),  # % premium of futures over spot
+        }
+    except Exception:
+        return None
+
+
+def detect_oi_stealth_accumulation(sym, oi_info, klines):
+    """
+    OI rising while price is flat or slightly down = stealth accumulation.
+    This is the most reliable pre-move signal — institutions building position
+    without moving price yet.
+    """
+    if not oi_info or not klines:
+        return False
+    try:
+        # Check if OI is rising
+        if not oi_info.get('oi_rising'):
+            return False
+        # Check if price is flat (within 1.5% of 5-bar average)
+        recent_closes = [float(k[4]) for k in klines[-6:-1]]
+        avg_price = sum(recent_closes) / len(recent_closes)
+        current   = float(klines[-1][4])
+        pct_move  = abs(current - avg_price) / avg_price * 100
+        # OI rising + price flat/slightly down = stealth accumulation
+        price_flat_or_down = pct_move < 1.5 or current < avg_price
+        return price_flat_or_down
+    except Exception:
+        return False
+
+
+def citadel_score(sym, spike, oi_info, klines, cvd_data, liq_data, basis_data):
+    """
+    Master conviction engine combining all Citadel-grade signals.
+    Returns (score, tags, verdict)
+    Score: 0-10
+    Verdict: STRONG_LONG / WATCH_LONG / NEUTRAL / WATCH_SHORT / AVOID
+    """
+    score = 0
+    tags  = []
+
+    # ── Base: Kıvanç spike already passed all gates (required) ──
+    score += spike.get('kivanc_score', 0)
+    tags  += spike.get('kivanc_tags', [])
+
+    # ── OI signals ──
+    if oi_info:
+        if oi_info.get('oi_rising'):
+            score += 1
+            tags.append('OI↑')
+        funding = oi_info.get('funding', 0)
+        if funding < 0:
+            score += 2  # shorts crowded = squeeze fuel
+            tags.append(f'Shorts crowded ({funding}%)')
+        elif funding <= 0.005:
+            score += 1
+            tags.append(f'Funding neutral')
+        elif funding > 0.02:
+            score -= 2  # overleveraged longs = danger
+            tags.append(f'⚠ FOMO longs ({funding}%)')
+
+    # ── CVD signals ──
+    if cvd_data:
+        if cvd_data.get('bullish_div'):
+            score += 2  # hidden accumulation — strongest signal
+            tags.append('🔵 CVD bullish divergence (hidden accumulation)')
+        if cvd_data.get('cvd_trend') == 'buying':
+            score += 1
+            tags.append('CVD buying pressure')
+        if cvd_data.get('bearish_div'):
+            score -= 2
+            tags.append('⚠ CVD bearish divergence (distribution)')
+
+    # ── Stealth accumulation (OI up, price flat) ──
+    if detect_oi_stealth_accumulation(sym, oi_info, klines):
+        score += 2
+        tags.append('🔵 Stealth accumulation (OI↑ price flat)')
+
+    # ── Liquidation cluster signals ──
+    if liq_data:
+        pct_above = liq_data.get('pct_to_above')
+        pct_below = liq_data.get('pct_to_below')
+        above_usd = liq_data.get('liq_above_usd', 0)
+        below_usd = liq_data.get('liq_below_usd', 0)
+
+        if pct_above and pct_above < 3 and above_usd > 100_000:
+            score += 2  # large short liquidation cluster within 3% = price magnet
+            tags.append(f'🎯 Liq target +{pct_above}% (${above_usd/1000:.0f}k shorts)')
+        elif pct_above and pct_above < 6 and above_usd > 50_000:
+            score += 1
+            tags.append(f'Liq zone +{pct_above}% (${above_usd/1000:.0f}k)')
+
+        if pct_below and pct_below < 2 and below_usd > 200_000:
+            score -= 1  # large long liq cluster just below = trap risk
+            tags.append(f'⚠ Long liq trap -{pct_below}%')
+
+    # ── Spot/futures basis ──
+    if basis_data:
+        basis = basis_data.get('basis', 0)
+        if basis < -0.05:
+            score += 2  # spot > futures = real demand, not just leverage
+            tags.append(f'🔵 Spot premium (basis {basis}%) — real buying')
+        elif basis > 0.3:
+            score -= 1  # heavily leveraged = fragile
+            tags.append(f'⚠ Futures premium ({basis}%) — leverage heavy')
+
+    # ── Verdict ──
+    if score >= 8:
+        verdict = '🔥 STRONG LONG'
+    elif score >= 6:
+        verdict = '✅ WATCH LONG'
+    elif score >= 4:
+        verdict = '👀 MONITOR'
+    elif score <= 1:
+        verdict = '🚫 AVOID'
+    else:
+        verdict = '⚪ NEUTRAL'
+
+    return max(0, min(score, 10)), tags, verdict
+
 def run_monitor_scan():
     """Scan all monitored coins and send Telegram alerts for volume spikes."""
     print(f'[MONITOR] Starting volume scan for {len(MONITOR_COINS)} coins...')
@@ -533,38 +942,50 @@ def run_monitor_scan():
             if not spike:
                 return None
 
-            # ── 3. Fetch OI + Funding from Binance futures ──
-            oi_info = fetch_oi_and_funding(sym)
+            # ── 3. Fetch all Citadel-grade data in parallel ──
+            oi_info  = fetch_oi_and_funding(sym)
+            cvd_data = calc_cvd(klines_ref or [], lookback=20)
+            liq_data = fetch_liquidation_clusters(sym)
+            basis    = fetch_spot_futures_basis(sym)
 
-            # ── 4. Score the signal (1–6 conviction) ──
-            # Base score from Kıvanç indicators (0–4)
-            score  = spike.get('kivanc_score', 0) + 1  # +1 base for passing all gates
-            labels = list(spike.get('kivanc_tags', []))
+            # ── 4. Taker buy ratio for spike candle ──
+            taker = None
+            try:
+                spike_ts = klines_ref[-1][0] if klines_ref else None
+                if spike_ts:
+                    taker = fetch_taker_ratio(sym, spike_ts)
+            except Exception:
+                pass
 
-            if oi_info:
-                funding  = oi_info['funding']
-                oi_rising = oi_info['oi_rising']
+            # Hard filter: non-BTC seller-driven spikes skipped
+            if taker and taker['color'] == 'red' and sym != 'BTC':
+                print(f'[MONITOR] {sym} skipped — seller-driven ({taker["buy_pct"]}% buyers)')
+                return None
 
-                # OI rising = real money entering
-                if oi_rising:
+            # Hard filter: FOMO funding (overleveraged longs)
+            if oi_info and oi_info.get('funding', 0) > 0.02:
+                print(f'[MONITOR] {sym} skipped — FOMO funding {oi_info["funding"]}%')
+                return None
+
+            # ── 5. Citadel conviction engine ──
+            score, labels, verdict = citadel_score(
+                sym, spike, oi_info, klines_ref or [], cvd_data, liq_data, basis
+            )
+
+            # Add taker label
+            if taker:
+                labels.append(taker['label'])
+                if taker['color'] == 'green':
                     score += 1
-                    labels.append('OI↑')
 
-                # Funding neutral or negative = not overleveraged longs
-                if funding <= 0.005:
-                    score += 1
-                    if funding < 0:
-                        labels.append(f'Funding {oi_info["funding"]}% (shorts crowded)')
-                    else:
-                        labels.append(f'Funding {oi_info["funding"]}% (neutral)')
-                elif funding > 0.02:
-                    # High positive funding = leveraged FOMO = skip
-                    return None
-
-            # ── 5. Only alert if conviction score >= 3 ──
-            # Requires at least: raw spike + 2 Kıvanç confirmations
+            # Minimum conviction gate
             if score < 3:
                 return None
+
+            # Build liquidation target string
+            liq_target = None
+            if liq_data and liq_data.get('pct_to_above') and liq_data['pct_to_above'] < 8:
+                liq_target = f'+{liq_data["pct_to_above"]}% (${liq_data["liq_above_usd"]/1000:.0f}k shorts)'
 
             return {
                 'sym':         sym,
@@ -578,8 +999,14 @@ def run_monitor_scan():
                 'cvroc':       spike.get('cvroc'),
                 'score':       score,
                 'labels':      labels,
+                'verdict':     verdict,
                 'funding':     oi_info['funding'] if oi_info else None,
                 'oi_rising':   oi_info['oi_rising'] if oi_info else None,
+                'taker_color': taker['color'] if taker else None,
+                'taker_pct':   taker['buy_pct'] if taker else None,
+                'cvd_bull_div':cvd_data.get('bullish_div') if cvd_data else None,
+                'liq_target':  liq_target,
+                'basis':       basis['basis'] if basis else None,
             }
         except Exception as e:
             print(f'[MONITOR] {sym} error: {e}')
@@ -601,24 +1028,51 @@ def run_monitor_scan():
         # Store in tg_intel for Intelligence cross-reference
         if tg_intel:
             tg_intel.set_volume_spikes(alerts)
+            if nupl_val is not None:
+                tg_intel.set_nupl(nupl_val)
+
+        # Fetch NUPL once per scan batch
+        nupl_val   = fetch_nupl()
+        nupl_str   = nupl_label(nupl_val)
 
         lines = [f'🚨 <b>APEX SCANNER — UNUSUAL ACTIVITY ALERT</b>']
         lines.append(f'⏰ {time.strftime("%Y-%m-%d %H:%M UTC")} | 1H candles')
-        lines.append('✅ Filters: 2x vol spike · $50k min · body>wick · OI · funding')
+        lines.append('✅ Filters: 2x vol spike · $50k min · body>wick · OI · funding · taker ratio')
+        if nupl_str:
+            lines.append(f'📊 Market: {nupl_str}')
         lines.append('')
         for a in alerts[:10]:
             score      = a.get('score', 1)
-            stars      = '⭐' * min(score, 6)
+            stars      = '⭐' * min(score, 10)
             usd_vol    = a.get('usd_vol', 0)
             vol_str    = f'${usd_vol/1000:.0f}k' if usd_vol < 1_000_000 else f'${usd_vol/1_000_000:.1f}M'
             candle_tag = '[prev]' if a.get('candle') == 'previous' else ''
+            verdict    = a.get('verdict', '')
             labels     = a.get('labels', [])
-            tag_line   = ' · '.join(filter(None, labels))
-            lines.append(f'{stars} <b>{a["sym"]}</b>  {a["spike"]}x vol  {candle_tag}'.strip())
+            liq_target = a.get('liq_target')
+            basis      = a.get('basis')
+            cvd_bull   = a.get('cvd_bull_div')
+
+            # Header line
+            lines.append(f'{stars} <b>{a["sym"]}</b>  {a["spike"]}x vol  {candle_tag}  {verdict}'.strip())
             lines.append(f'   💰 ${a["price"]:,.6g}  |  Vol: {vol_str}  |  {a["pct_from_low"]}% from low')
-            if tag_line:
-                lines.append(f'   📊 {tag_line}')
-            # ── Gemini commentary (grounded in live data only) ──
+
+            # Key signals
+            key_signals = [l for l in labels if any(x in l for x in ['CVD','Stealth','Liq','Spot','crowded','FOMO','⚠','🔵','🎯'])]
+            normal_signals = [l for l in labels if l not in key_signals]
+
+            if normal_signals:
+                lines.append(f'   📊 {" · ".join(normal_signals)}')
+            if key_signals:
+                for ks in key_signals:
+                    lines.append(f'   {ks}')
+            if liq_target:
+                lines.append(f'   🎯 Next target: {liq_target}')
+            if basis is not None:
+                basis_str = f'Spot premium {abs(basis):.3f}%' if basis < 0 else f'Futures premium {basis:.3f}%'
+                lines.append(f'   📐 Basis: {basis_str}')
+
+            # ── Gemini commentary ──
             commentary = gemini_spike_commentary(a)
             if commentary:
                 for cl in commentary.split('\n'):
