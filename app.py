@@ -752,12 +752,9 @@ SETUP (calculated from live ATR={atr:.6g}):
 - R:R: {rr}
 """
     else:
-        setup_block = "
-SETUP: ATR not available — cannot calculate levels.
-"
+        setup_block = "\nSETUP: ATR not available — cannot calculate levels.\n"
 
-    kivanc_block = "
-".join(f"- {l}" for l in kivanc_lines) if kivanc_lines else "- Indicator readings not available"
+    kivanc_block = "\n".join(f"- {l}" for l in kivanc_lines) if kivanc_lines else "- Indicator readings not available"
 
     prompt = f"""You are a crypto trading analyst. A real-time volume spike has been detected. 
 ALL numbers below are live data — use ONLY these. Do not invent or recall any other prices.
