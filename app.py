@@ -457,6 +457,76 @@ def nupl_label(nupl):
     else:
         return f'💙 NUPL:{nupl:.2f} (Capitulation — long-term holders selling at loss)'
 
+
+# ── LTH Realized Price ────────────────────────────────────────
+_lth_cache = {'value': None, 'ts': 0}
+
+def fetch_lth_realized_price():
+    """
+    Fetch LTH Realized Price. Priority:
+    1. Coinmetrics Community API (free, no key) - CapRealUSD/SplyCur
+    2. Bitbo.io public API (free, no key)
+    3. 2-year MA proxy via Binance (tracks LTH realized price closely)
+    Cached 6 hours.
+    """
+    global _lth_cache
+    if time.time() - _lth_cache['ts'] < 21600 and _lth_cache['value'] is not None:
+        return _lth_cache['value']
+
+    # Method 1: Coinmetrics Community API
+    try:
+        url = (
+            'https://community-api.coinmetrics.io/v4/timeseries/asset-metrics'
+            '?assets=btc&metrics=CapRealUSD,SplyCur&frequency=1d&limit=2'
+        )
+        r = requests.get(url, timeout=10)
+        if r.ok:
+            data = r.json().get('data', [])
+            if data:
+                latest   = data[-1]
+                cap_real = float(latest.get('CapRealUSD', 0))
+                sply_cur = float(latest.get('SplyCur', 0))
+                if cap_real > 0 and sply_cur > 0:
+                    rp = cap_real / sply_cur
+                    _lth_cache = {'value': round(rp, 0), 'ts': time.time()}
+                    print(f'[MONITOR] Realized Price (Coinmetrics): ${rp:,.0f}')
+                    return _lth_cache['value']
+    except Exception as e:
+        print(f'[MONITOR] Coinmetrics LTH error: {e}')
+
+    # Method 2: Bitbo.io
+    try:
+        r2 = requests.get('https://bitbo.io/api/v1/stats/', timeout=8,
+                          headers={'User-Agent': 'Mozilla/5.0'})
+        if r2.ok:
+            d  = r2.json()
+            rp = d.get('realized_price') or d.get('realizedPrice')
+            if rp:
+                _lth_cache = {'value': round(float(rp), 0), 'ts': time.time()}
+                print(f'[MONITOR] Realized Price (Bitbo): ${float(rp):,.0f}')
+                return _lth_cache['value']
+    except Exception as e:
+        print(f'[MONITOR] Bitbo LTH error: {e}')
+
+    # Method 3: 2-year MA proxy (Binance)
+    try:
+        r3 = requests.get(
+            'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=730',
+            headers=HEADERS, timeout=10
+        )
+        if r3.ok:
+            closes = [float(k[4]) for k in r3.json()]
+            if len(closes) >= 730:
+                ma2y = sum(closes[-730:]) / 730
+                _lth_cache = {'value': round(ma2y, 0), 'ts': time.time()}
+                print(f'[MONITOR] Realized Price (2yr MA proxy): ${ma2y:,.0f}')
+                return _lth_cache['value']
+    except Exception as e:
+        print(f'[MONITOR] LTH 2yr MA error: {e}')
+
+    return None
+
+
 # ── Background monitor scan ───────────────────────────────────
 # MONITOR_COINS is populated dynamically on startup from KuCoin/OKX
 # Falls back to this built-in list if exchange APIs are unreachable
@@ -1838,43 +1908,50 @@ def fetch_bottom_signals():
     except Exception as e:
         signals.append({'tier':'TIER 1','name':'NUPL','value':'Unavailable','status':'red','interpretation':str(e)})
 
-    # ── TIER 2: SOPR approximation via realized price ─────────
-    # Use BTC current price vs 200d MA as LTH-SOPR proxy
+
+    # -- TIER 2: LTH Realized Price vs Current Price --------
+    # Coinmetrics (real) -> Bitbo -> 2yr MA proxy
     try:
-        klines_url = 'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=365'
+        lth_price = fetch_lth_realized_price()
+        klines_url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=365"
         r = requests.get(klines_url, headers=HEADERS, timeout=10)
-        sopr_val = None
+        current_price = None
+        vwap_365 = None
         if r.ok:
             klines = r.json()
-            closes = [float(k[4]) for k in klines]
-            current_price = closes[-1]
-            # Realized price proxy: 365-day VWAP (volume-weighted average)
+            closes  = [float(k[4]) for k in klines]
             volumes = [float(k[5]) for k in klines]
+            current_price = closes[-1]
             total_vol = sum(volumes)
-            vwap_365 = sum(c*v for c,v in zip(closes, volumes)) / total_vol if total_vol > 0 else None
-
-            if vwap_365:
-                sopr_val = current_price / vwap_365  # proxy for SOPR
-                if sopr_val < 0.85:
-                    status = 'green'; pts = 1
-                    interp = f'Price significantly below 365d VWAP ({vwap_365:,.0f}). Long-term holders in deep loss. Classic capitulation — historically resolves upward within 3-6 months.'
-                elif sopr_val < 1.0:
-                    status = 'amber'; pts = 0
-                    interp = f'Price below annual average cost ({vwap_365:,.0f}). Most annual buyers underwater. Approaching capitulation but not confirmed.'
-                else:
-                    status = 'red'; pts = 0
-                    interp = f'Price above annual average cost ({vwap_365:,.0f}). Holders still in profit — not a bottom signal.'
-                deploy_score += pts
-                signals.append({
-                    'tier':           'TIER 2',
-                    'name':           'SOPR Proxy (Price vs 365d VWAP)',
-                    'value':          f'{sopr_val:.4f}  |  BTC: ${current_price:,.0f}  |  VWAP: ${vwap_365:,.0f}',
-                    'status':         status,
-                    'interpretation': interp,
-                })
+            vwap_365 = sum(cv*v for cv,v in zip(closes, volumes)) / total_vol if total_vol > 0 else None
+        reference_price = lth_price if lth_price else vwap_365
+        ref_label = "LTH Realized Price" if lth_price else "365d VWAP (proxy)"
+        if reference_price and current_price:
+            sopr_val = current_price / reference_price
+            pct_diff = (current_price - reference_price) / reference_price * 100
+            if sopr_val < 0.85:
+                status = 'green'; pts = 1
+                interp = (f'Price {abs(pct_diff):.1f}% BELOW {ref_label} (${reference_price:,.0f}). '
+                          f'Long-term holders deeply underwater. Capitulation zone. '
+                          f'Every major BTC bottom has occurred at or below this level.')
+            elif sopr_val < 1.0:
+                status = 'amber'; pts = 0
+                interp = (f'Price {abs(pct_diff):.1f}% below {ref_label} (${reference_price:,.0f}). '
+                          f'LTH holders in loss but not full capitulation yet. Approaching accumulation zone.')
+            else:
+                status = 'red'; pts = 0
+                interp = (f'Price {pct_diff:.1f}% ABOVE {ref_label} (${reference_price:,.0f}). '
+                          f'LTH holders still profitable. Not a bottom signal yet.')
+            deploy_score += pts
+            signals.append({
+                'tier':           'TIER 2',
+                'name':           f'LTH Realized Price ({ref_label})',
+                'value':          f'Ratio: {sopr_val:.4f}  |  BTC: ${current_price:,.0f}  |  Ref: ${reference_price:,.0f}',
+                'status':         status,
+                'interpretation': interp,
+            })
     except Exception as e:
-        signals.append({'tier':'TIER 2','name':'SOPR Proxy','value':'Unavailable','status':'red','interpretation':str(e)})
-
+        signals.append({'tier':'TIER 2','name':'LTH Realized Price','value':'Unavailable','status':'red','interpretation':str(e)})
     # ── TIER 3: Exchange Reserve Flow ─────────────────────────
     # Net BTC flow to/from exchanges over 7d using Binance order book proxy
     # Real method: CryptoQuant free API for exchange reserves
@@ -2065,12 +2142,24 @@ def find_bottom():
             except Exception as e:
                 print(f'[BOTTOM] Gemini error: {e}')
 
+        # Grab LTH price + current BTC price for proximity widget
+        lth_p = _lth_cache.get('value')
+        btc_p = None
+        try:
+            rp = requests.get('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', timeout=5)
+            if rp.ok:
+                btc_p = float(rp.json()['price'])
+        except Exception:
+            pass
+
         return jsonify({
             'ok':                 True,
             'deploy_score':       deploy_score,
             'signals':            signals,
             'historical_context': historical,
             'verdict':            verdict,
+            'lth_price':          lth_p,
+            'btc_price':          btc_p,
         })
 
     except Exception as e:
