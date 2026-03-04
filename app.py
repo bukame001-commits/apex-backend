@@ -1151,8 +1151,9 @@ def run_monitor_scan():
                         klines2 = [[int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in reversed(data2)]
                         spike = detect_volume_spike(sym, klines2)
                         if spike:
-                            price  = klines2[-1][4]
-                            source = 'OKX'
+                            price     = klines2[-1][4]
+                            source    = 'OKX'
+                            klines_ref = klines2
 
             if not spike:
                 return None
@@ -1252,15 +1253,16 @@ def run_monitor_scan():
         alerts.sort(key=lambda x: x['spike'], reverse=True)
         # Sort by conviction score first, then spike ratio
         alerts.sort(key=lambda x: (x['score'], x['spike']), reverse=True)
+
+        # Fetch NUPL once per scan batch (must be before tg_intel use)
+        nupl_val   = fetch_nupl()
+        nupl_str   = nupl_label(nupl_val)
+
         # Store in tg_intel for Intelligence cross-reference
         if tg_intel:
             tg_intel.set_volume_spikes(alerts)
             if nupl_val is not None:
                 tg_intel.set_nupl(nupl_val)
-
-        # Fetch NUPL once per scan batch
-        nupl_val   = fetch_nupl()
-        nupl_str   = nupl_label(nupl_val)
 
         lines = [f'🚨 <b>APEX SCANNER — UNUSUAL ACTIVITY ALERT</b>']
         lines.append(f'⏰ {time.strftime("%Y-%m-%d %H:%M UTC")} | 1H candles')
