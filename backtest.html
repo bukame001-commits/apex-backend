@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>APEX BACKTEST</title>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #040408; color: #e0e0e0; font-family: 'Share Tech Mono', monospace; min-height: 100vh; }
+    button { cursor: pointer; font-family: 'Share Tech Mono', monospace; }
+    ::-webkit-scrollbar { width: 4px; } 
+    ::-webkit-scrollbar-track { background: #0a0a14; }
+    ::-webkit-scrollbar-thumb { background: #1a1a2e; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    const BACKEND = window.location.origin;
+    const { useState, useEffect, useCallback, useRef } = React;
+    const h = React.createElement;
+
+    const fmt = (n, sig=5) => n == null ? '—' : Number(n).toLocaleString('en-US', {maximumSignificantDigits: sig});
+    const fmtPct = n => n == null ? '—' : `${n>=0?'+':''}${n.toFixed(2)}%`;
+    const fmtDate = iso => !iso ? '—' : new Date(iso).toLocaleDateString('en-GB', {day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
+
+    const STATUS_COLOR = {'OPEN':'#00d4ff','TARGET HIT':'#00ff88','STOP HIT':'#ff4444','EXPIRED':'#555'};
+    const STATUS_ICON  = {'OPEN':'◉','TARGET HIT':'✓','STOP HIT':'✗','EXPIRED':'—'};
+    const DIR_COLOR    = {'LONG':'#00ff88','SHORT':'#ff4444'};
+
+    function calcRR(s) {
+      const e=s.entry,st=s.stop,t=s.target;
+      if(!e||!st||!t) return null;
+      const risk=Math.abs(e-st),reward=Math.abs(t-e);
+      return risk>0?(reward/risk).toFixed(2):null;
+    }
+    function calcPnl(s) {
+      const e=s.entry,st=s.stop,t=s.target;
+      if(s.status==='TARGET HIT') return Math.abs(t-e)/e*100;
+      if(s.status==='STOP HIT')   return -Math.abs(e-st)/e*100;
+      return null;
+    }
+    function calcProgress(s) {
+      const cp=s.currentPrice,e=s.entry,st=s.stop,t=s.target;
+      if(!cp||!st||!t) return null;
+      if(s.direction==='LONG')  return Math.max(0,Math.min(100,(cp-st)/(t-st)*100));
+      return Math.max(0,Math.min(100,(st-cp)/(st-t)*100));
+    }
+
+    // ── Stat Card ────────────────────────────────────────────────
+    function StatCard({label, value, color='#e0e0e0', sub}) {
+      return h('div', {style:{background:'#0a0a14',border:'1px solid #1a1a2e',padding:'12px 10px',textAlign:'center'}},
+        h('div',{style:{fontSize:'8px',color:'#444',letterSpacing:'2px',marginBottom:'5px'}}, label),
+        h('div',{style:{fontSize:'16px',color,fontFamily:"'Orbitron',monospace",fontWeight:900}}, value),
+        sub && h('div',{style:{fontSize:'9px',color:'#333',marginTop:'3px'}}, sub)
+      );
+    }
+
+    // ── Setup Row ────────────────────────────────────────────────
+    function SetupRow({s, onDelete, onExpire}) {
+      const rr=calcRR(s), pnl=calcPnl(s), prog=calcProgress(s);
+      const isOpen=s.status==='OPEN';
+      const sc=STATUS_COLOR[s.status]||'#555';
+
+      return h('div',{style:{background:'#0a0a14',borderLeft:`3px solid ${sc}`,border:`1px solid ${isOpen?'#1a1a2e':sc+'33'}`,marginBottom:'8px',padding:'12px 14px'}},
+        // Header row
+        h('div',{style:{display:'flex',alignItems:'center',gap:'8px',marginBottom:'10px',flexWrap:'wrap'}},
+          h('span',{style:{fontFamily:"'Orbitron',monospace",fontSize:'14px',fontWeight:700,color:'#fff'}}, s.symbol),
+          h('span',{style:{fontSize:'9px',color:DIR_COLOR[s.direction],border:`1px solid ${DIR_COLOR[s.direction]}44`,padding:'1px 7px'}}, s.direction),
+          h('span',{style:{fontSize:'9px',color:'#444',background:'#111',padding:'1px 7px'}}, s.source),
+          h('span',{style:{fontSize:'9px',color:'#333'}}, s.timeframe),
+          h('span',{style:{fontSize:'9px',color:'#333',flex:1}}, fmtDate(s.createdAt)),
+          h('span',{style:{fontSize:'10px',color:sc,letterSpacing:'1px'}}, `${STATUS_ICON[s.status]} ${s.status}`)
+        ),
+        // Levels
+        h('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr auto',gap:'8px',alignItems:'end'}},
+          ...[ ['ENTRY',`$${fmt(s.entry)}`,'#e0e0e0'], ['STOP',`$${fmt(s.stop)}`,'#ff4444'], ['TARGET',`$${fmt(s.target)}`,'#00ff88'], ['R:R',rr?`${rr}:1`:'—','#f0c040'] ]
+            .map(([label,val,color]) =>
+              h('div',{key:label},
+                h('div',{style:{fontSize:'8px',color:'#444',letterSpacing:'1px',marginBottom:'2px'}}, label),
+                h('div',{style:{fontSize:'12px',color}}, val)
+              )
+            ),
+          h('div',{style:{display:'flex',gap:'5px'}},
+            isOpen && h('button',{onClick:()=>onExpire(s.id),style:{background:'transparent',border:'1px solid #333',color:'#555',fontSize:'9px',padding:'3px 7px'}}, 'EXPIRE'),
+            h('button',{onClick:()=>onDelete(s.id),style:{background:'transparent',border:'1px solid #ff444433',color:'#ff444488',fontSize:'9px',padding:'3px 7px'}}, 'DEL')
+          )
+        ),
+        // Progress bar
+        isOpen && s.currentPrice && h('div',{style:{marginTop:'10px'}},
+          h('div',{style:{display:'flex',justifyContent:'space-between',fontSize:'10px',marginBottom:'4px'}},
+            h('span',{style:{color:'#555'}}, `NOW: `, h('span',{style:{color:'#00d4ff'}}, `$${fmt(s.currentPrice)}`)),
+            prog!=null && h('span',{style:{color:prog>66?'#00ff88':prog>33?'#f0c040':'#ff4444'}}, `${prog.toFixed(0)}% to target`)
+          ),
+          prog!=null && h('div',{style:{height:'3px',background:'#1a1a2e',borderRadius:'2px'}},
+            h('div',{style:{height:'100%',width:`${prog}%`,background:prog>66?'#00ff88':prog>33?'#f0c040':'#ff4444',borderRadius:'2px',transition:'width 0.4s'}})
+          )
+        ),
+        // Closed result
+        !isOpen && pnl!=null && h('div',{style:{marginTop:'8px',fontSize:'11px',color:pnl>=0?'#00ff88':'#ff4444'}},
+          `${pnl>=0?'▲':'▼'} ${fmtPct(pnl)}${s.closePrice?` @ $${fmt(s.closePrice)}`:''}${s.closedAt?` · ${fmtDate(s.closedAt)}`:''}`
+        ),
+        // Notes
+        s.notes && h('div',{style:{marginTop:'6px',fontSize:'9px',color:'#333',fontStyle:'italic',wordBreak:'break-word'}}, s.notes)
+      );
+    }
+
+    // ── Main App ─────────────────────────────────────────────────
+    function App() {
+      const [setups,setSetups]       = useState([]);
+      const [loading,setLoading]     = useState(true);
+      const [error,setError]         = useState(null);
+      const [tab,setTab]             = useState('tracker');
+      const [filter,setFilter]       = useState('ALL');
+      const [lastRefresh,setLast]    = useState(null);
+      const [refreshing,setRefreshing] = useState(false);
+      const timer = useRef(null);
+
+      const load = useCallback(async (silent=false) => {
+        if(!silent) setLoading(true); else setRefreshing(true);
+        setError(null);
+        try {
+          const r = await fetch(`${BACKEND}/backtest/setups`);
+          if(!r.ok) throw new Error(`HTTP ${r.status}`);
+          const d = await r.json();
+          setSetups(d.setups||[]);
+          setLast(new Date());
+        } catch(e) { setError(e.message); }
+        finally { setLoading(false); setRefreshing(false); }
+      }, []);
+
+      useEffect(() => {
+        load();
+        timer.current = setInterval(()=>load(true), 60000);
+        return ()=>clearInterval(timer.current);
+      }, [load]);
+
+      const handleDelete = async id => {
+        try { await fetch(`${BACKEND}/backtest/delete`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); } catch{}
+        setSetups(p=>p.filter(s=>s.id!==id));
+      };
+      const handleExpire = async id => {
+        try { await fetch(`${BACKEND}/backtest/expire`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); } catch{}
+        setSetups(p=>p.map(s=>s.id===id?{...s,status:'EXPIRED'}:s));
+      };
+
+      const closed  = setups.filter(s=>s.status!=='OPEN'&&s.status!=='EXPIRED');
+      const wins    = setups.filter(s=>s.status==='TARGET HIT');
+      const losses  = setups.filter(s=>s.status==='STOP HIT');
+      const open    = setups.filter(s=>s.status==='OPEN');
+      const winRate = closed.length ? wins.length/closed.length*100 : null;
+      const pnls    = setups.map(calcPnl).filter(p=>p!=null);
+      const totalPnl= pnls.reduce((a,b)=>a+b,0);
+      const allRR   = setups.map(calcRR).filter(Boolean).map(Number);
+      const avgRR   = allRR.length?(allRR.reduce((a,b)=>a+b)/allRR.length).toFixed(2):null;
+
+      const bySource = ['Citadel Report','Volume Spike','Manual'].map(src=>{
+        const ss=setups.filter(x=>x.source===src);
+        const w=ss.filter(x=>x.status==='TARGET HIT').length;
+        const l=ss.filter(x=>x.status==='STOP HIT').length;
+        return {src,total:ss.length,w,l,wr:(w+l)>0?w/(w+l)*100:null};
+      }).filter(x=>x.total>0);
+
+      const filtered = filter==='ALL'?setups:setups.filter(s=>s.status===filter);
+
+      const P = (style,...children) => h('div',{style},...children);
+
+      return P({padding:'16px',maxWidth:'920px',margin:'0 auto'},
+        // Header
+        P({display:'flex',alignItems:'flex-start',justifyContent:'space-between',borderBottom:'1px solid #1a1a2e',paddingBottom:'14px',marginBottom:'20px'},
+          P({},
+            P({fontFamily:"'Orbitron',monospace",fontSize:'18px',fontWeight:900,color:'#00d4ff',letterSpacing:'4px'}, '⚔ APEX BACKTEST'),
+            P({fontSize:'9px',color:'#333',letterSpacing:'2px',marginTop:'3px'}, 'AUTO-LOADED · LIVE PRICE EVALUATION · 60s REFRESH')
+          ),
+          P({textAlign:'right'},
+            h('button',{onClick:()=>load(true),disabled:refreshing,style:{background:'transparent',border:'1px solid #1a1a2e',color:refreshing?'#333':'#555',fontSize:'9px',padding:'5px 12px',letterSpacing:'1px'}},
+              refreshing?'REFRESHING...':'↻ REFRESH'),
+            lastRefresh && P({fontSize:'8px',color:'#333',marginTop:'4px'}, `last: ${lastRefresh.toLocaleTimeString()}`)
+          )
+        ),
+
+        // Stats bar
+        P({display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:'8px',marginBottom:'20px'},
+          h(StatCard,{label:'TOTAL',    value:setups.length, color:'#00d4ff'}),
+          h(StatCard,{label:'OPEN',     value:open.length,   color:'#00d4ff'}),
+          h(StatCard,{label:'WIN RATE', value:winRate!=null?`${winRate.toFixed(0)}%`:'—', color:winRate>=50?'#00ff88':winRate!=null?'#ff4444':'#888'}),
+          h(StatCard,{label:'AVG R:R',  value:avgRR?`${avgRR}:1`:'—', color:'#f0c040'}),
+          h(StatCard,{label:'TOTAL P&L',value:pnls.length?fmtPct(totalPnl):'—', color:totalPnl>=0?'#00ff88':'#ff4444'})
+        ),
+
+        // Tabs + filters
+        P({display:'flex',gap:'6px',marginBottom:'16px',flexWrap:'wrap'},
+          ...['tracker','stats'].map(t=>
+            h('button',{key:t,onClick:()=>setTab(t),style:{background:tab===t?'rgba(0,212,255,0.08)':'transparent',border:`1px solid ${tab===t?'#00d4ff':'#1a1a2e'}`,color:tab===t?'#00d4ff':'#555',fontSize:'9px',padding:'5px 14px',letterSpacing:'2px'}}, t.toUpperCase())
+          ),
+          tab==='tracker' && P({display:'contents'},
+            P({width:'1px',background:'#1a1a2e',margin:'0 4px'}),
+            ...['ALL','OPEN','TARGET HIT','STOP HIT'].map(f=>
+              h('button',{key:f,onClick:()=>setFilter(f),style:{background:filter===f?`${STATUS_COLOR[f]||'#00d4ff'}11`:'transparent',border:`1px solid ${filter===f?(STATUS_COLOR[f]||'#00d4ff'):'#1a1a2e'}`,color:filter===f?(STATUS_COLOR[f]||'#00d4ff'):'#444',fontSize:'9px',padding:'5px 10px'}}, f)
+            )
+          )
+        ),
+
+        // Error banner
+        error && P({background:'#1a0a0a',border:'1px solid #ff444433',padding:'12px',marginBottom:'16px',fontSize:'10px'},
+          P({color:'#ff4444',marginBottom:'4px'}, `⚠ BACKEND ERROR: ${error}`),
+          P({color:'#444'}, 'Run ⚡ SCAN NOW or ⚔ CITADEL REPORT — setups log automatically.')
+        ),
+
+        // Loading
+        loading && P({textAlign:'center',color:'#333',padding:'60px 0',fontSize:'11px',letterSpacing:'2px'}, 'LOADING FROM BACKEND...'),
+
+        // TRACKER TAB
+        !loading && tab==='tracker' && P({},
+          filtered.length===0 && !error && P({textAlign:'center',padding:'60px 0'},
+            P({color:'#222',fontSize:'11px',letterSpacing:'2px',marginBottom:'16px'}, setups.length===0?'NO SETUPS LOGGED YET':`NO ${filter} SETUPS`),
+            setups.length===0 && P({color:'#1a1a1a',fontSize:'10px',lineHeight:'2.2'},
+              'Run ⚡ SCAN NOW → Volume spike setups auto-logged\nRun ⚔ CITADEL REPORT → Top 10 setups auto-logged\nThis page refreshes every 60 seconds'
+            )
+          ),
+          ...filtered.map(s=>h(SetupRow,{key:s.id,s,onDelete:handleDelete,onExpire:handleExpire}))
+        ),
+
+        // STATS TAB
+        !loading && tab==='stats' && P({},
+          // W/L/Open
+          P({display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:'8px',marginBottom:'14px'},
+            ...[ ['WINS',wins.length,'#00ff88'], ['LOSSES',losses.length,'#ff4444'], ['OPEN',open.length,'#00d4ff'] ]
+              .map(([label,value,color])=>
+                P({key:label,background:'#0a0a14',border:`1px solid ${color}22`,padding:'16px',textAlign:'center'},
+                  P({fontSize:'9px',color:'#444',letterSpacing:'2px',marginBottom:'8px'}, label),
+                  P({fontSize:'32px',color,fontFamily:"'Orbitron',monospace",fontWeight:900}, value)
+                )
+              )
+          ),
+          // Win rate bar
+          closed.length>0 && P({background:'#0a0a14',border:'1px solid #1a1a2e',padding:'14px',marginBottom:'12px'},
+            P({display:'flex',justifyContent:'space-between',fontSize:'10px',color:'#555',marginBottom:'8px'},
+              'WIN RATE', P({color:winRate>=50?'#00ff88':'#ff4444'}, `${winRate?.toFixed(1)}%`)
+            ),
+            P({height:'6px',background:'#1a1a2e',borderRadius:'3px'},
+              P({height:'100%',width:`${winRate||0}%`,background:winRate>=50?'#00ff88':'#ff4444',borderRadius:'3px',transition:'width 0.5s'})
+            )
+          ),
+          // By source
+          bySource.length>0 && P({background:'#0a0a14',border:'1px solid #1a1a2e',padding:'14px',marginBottom:'12px'},
+            P({fontSize:'9px',color:'#444',letterSpacing:'2px',marginBottom:'14px'}, 'BY SOURCE'),
+            ...bySource.map(({src,total,w,l,wr})=>
+              P({key:src,display:'flex',alignItems:'center',gap:'10px',marginBottom:'12px'},
+                P({flex:1,fontSize:'11px',color:'#e0e0e0'}, src),
+                P({fontSize:'9px',color:'#444'}, `${total}`),
+                P({fontSize:'10px',color:'#00ff88'}, `${w}W`),
+                P({fontSize:'10px',color:'#ff4444'}, `${l}L`),
+                P({width:'80px',height:'4px',background:'#1a1a2e',borderRadius:'2px'},
+                  wr && P({height:'100%',width:`${wr}%`,background:wr>=50?'#00ff88':'#ff4444',borderRadius:'2px'})
+                ),
+                P({fontSize:'11px',color:wr>=50?'#00ff88':wr!=null?'#ff4444':'#555',width:'40px',textAlign:'right'},
+                  wr?`${wr.toFixed(0)}%`:'—')
+              )
+            )
+          ),
+          // Closed trades log
+          closed.length>0 && P({background:'#0a0a14',border:'1px solid #1a1a2e',padding:'14px'},
+            P({fontSize:'9px',color:'#444',letterSpacing:'2px',marginBottom:'12px'}, 'CLOSED TRADES'),
+            ...[...wins,...losses].map(s=>{
+              const pnl=calcPnl(s);
+              return P({key:s.id,display:'flex',alignItems:'center',gap:'10px',padding:'7px 0',borderBottom:'1px solid #0f0f1a'},
+                P({fontFamily:"'Orbitron',monospace",fontSize:'11px',color:'#fff',minWidth:'55px'}, s.symbol),
+                P({fontSize:'9px',color:DIR_COLOR[s.direction],minWidth:'40px'}, s.direction),
+                P({fontSize:'10px',color:STATUS_COLOR[s.status],flex:1}, `${STATUS_ICON[s.status]} ${s.status}`),
+                P({fontSize:'9px',color:'#444'}, s.source),
+                P({fontSize:'9px',color:'#333'}, fmtDate(s.closedAt)),
+                P({fontSize:'11px',color:pnl>=0?'#00ff88':'#ff4444',minWidth:'60px',textAlign:'right'},
+                  pnl!=null?fmtPct(pnl):'—')
+              );
+            })
+          ),
+          setups.length===0 && P({textAlign:'center',color:'#222',fontSize:'11px',padding:'40px 0'}, 'NO DATA YET — RUN A SCAN FIRST')
+        )
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(h(App));
+  </script>
+</body>
+</html>
