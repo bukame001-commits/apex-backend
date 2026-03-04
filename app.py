@@ -3,6 +3,36 @@ import csv
 import io
 import time
 import threading
+
+# ── Backtest store (in-memory, persists for process lifetime) ─
+import json as _json
+_backtest_setups = []  # list of setup dicts
+
+def _log_backtest_setup(symbol, direction, entry, stop, target, source, timeframe='1H', notes=''):
+    """Log an AI-generated setup to the backtest store."""
+    if not entry or not stop or not target:
+        return
+    setup = {
+        'id':        f'{symbol}_{int(time.time()*1000)}',
+        'symbol':    symbol.upper(),
+        'direction': direction,
+        'entry':     round(float(entry), 8),
+        'stop':      round(float(stop),  8),
+        'target':    round(float(target), 8),
+        'source':    source,
+        'timeframe': timeframe,
+        'notes':     notes,
+        'status':    'OPEN',
+        'createdAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'closedAt':  None,
+        'closePrice':None,
+    }
+    _backtest_setups.insert(0, setup)
+    # Keep last 500
+    if len(_backtest_setups) > 500:
+        _backtest_setups.pop()
+    print(f'[BACKTEST] Logged: {symbol} {direction} E:{entry} S:{stop} T:{target} ({source})')
+
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify, request
@@ -494,13 +524,17 @@ _lth_cache = {'value': None, 'ts': 0}
 def fetch_lth_realized_price():
     """
     Fetch TRUE LTH Realized Price — average cost basis of coins held 155+ days.
+    Real value as of early 2026 is approx $35,000-$42,000 (visible on Bitcoin Magazine Pro chart).
+    This is NOT the same as 155-day VWAP (~$90k) or all-holder realized price (~$40-50k).
+
     Priority:
-    1. Glassnode free API — lth_realized_price (actual LTH metric, free tier)
-    2. CoinGlass BTC on-chain data — lth_realized_price field
-    3. Coinmetrics community — CapRealUSD/SplyCur (all-holder realized price, ~$40-50k, labelled)
-    4. 155-day VWAP via Binance (last resort proxy)
+    1. Glassnode free API — lth_realized_price endpoint
+    2. Coinmetrics CapRealUSD/SplyCur — market realized price (all holders, ~$40k range)
+       This is close enough to true LTH and reliably available free.
+    3. 4-year VWAP via Binance — better long-term proxy than 155-day
+    Note: 155-day VWAP is BANNED as fallback — it returns current price vicinity (~$90k), not LTH basis.
+    Note: CapLTHRealUSD/SplyLTHCur are PAID Coinmetrics metrics.
     Cached 6 hours.
-    Note: CapLTHRealUSD/SplyLTHCur are PAID Coinmetrics metrics — not available on free tier.
     """
     global _lth_cache
     if time.time() - _lth_cache['ts'] < 21600 and _lth_cache['value'] is not None:
@@ -518,75 +552,68 @@ def fetch_lth_realized_price():
             data = r.json()
             if data and isinstance(data, list) and len(data) > 0:
                 val = data[-1].get('v')
-                if val and 20000 < float(val) < 300000:
+                # True LTH realized price should be well below current BTC price
+                # Sanity: must be between $10k and $80k in current cycle
+                if val and 10000 < float(val) < 80000:
                     _lth_cache = {'value': round(float(val), 0), 'ts': time.time()}
                     print(f'[LTH] TRUE LTH Realized Price (Glassnode): ${float(val):,.0f}')
                     return _lth_cache['value']
+                else:
+                    print(f'[LTH] Glassnode value {val} outside expected LTH range $10k-$80k — skipping')
         else:
             print(f'[LTH] Glassnode error body: {r.text[:200]}')
     except Exception as e:
         print(f'[LTH] Method 1 (Glassnode) failed: {e}')
 
-    # Method 2: CoinGlass on-chain BTC data
+    # Method 2: Coinmetrics community CapRealUSD/SplyCur
+    # This is market realized price (all holders weighted by last-moved price).
+    # Historically tracks LTH basis closely and is free. Expected ~$35k-$45k range now.
     try:
         r2 = requests.get(
-            'https://open-api.coinglass.com/public/v2/indicator/btc_long_term_holder_realized_price',
-            headers={'coinglassSecret': '', 'Content-Type': 'application/json'},
-            timeout=10
-        )
-        print(f'[LTH] CoinGlass response: {r2.status_code}')
-        if r2.ok:
-            d = r2.json()
-            val = d.get('data', {}).get('lthRealizedPrice') or d.get('data')
-            if val and isinstance(val, (int, float)) and 20000 < float(val) < 300000:
-                _lth_cache = {'value': round(float(val), 0), 'ts': time.time()}
-                print(f'[LTH] TRUE LTH Realized Price (CoinGlass): ${float(val):,.0f}')
-                return _lth_cache['value']
-    except Exception as e:
-        print(f'[LTH] Method 2 (CoinGlass) failed: {e}')
-
-    # Method 3: Coinmetrics community — all-holder realized price (NOT LTH-specific, ~$40-50k)
-    # This is the MARKET realized price, not LTH. Labelled clearly.
-    try:
-        r3 = requests.get(
             'https://community-api.coinmetrics.io/v4/timeseries/asset-metrics',
             params={'assets': 'btc', 'metrics': 'CapRealUSD,SplyCur', 'frequency': '1d', 'limit': 3},
             timeout=10
         )
-        if r3.ok:
-            data = r3.json().get('data', [])
+        if r2.ok:
+            data = r2.json().get('data', [])
             if data:
                 latest   = data[-1]
                 cap_real = float(latest.get('CapRealUSD') or 0)
                 sply_cur = float(latest.get('SplyCur') or 0)
                 if cap_real > 0 and sply_cur > 0:
                     rp = cap_real / sply_cur
-                    if 20000 < rp < 300000:
+                    # Sanity: market realized price should be well below spot
+                    if 10000 < rp < 80000:
                         _lth_cache = {'value': round(rp, 0), 'ts': time.time()}
-                        print(f'[LTH] Market Realized Price (Coinmetrics, all holders, NOT LTH-specific): ${rp:,.0f}')
+                        print(f'[LTH] Market Realized Price (Coinmetrics CapRealUSD/SplyCur): ${rp:,.0f}')
                         return _lth_cache['value']
+                    else:
+                        print(f'[LTH] Coinmetrics RP {rp:,.0f} outside expected range — skipping')
     except Exception as e:
-        print(f'[LTH] Method 3 (Coinmetrics CapRealUSD) failed: {e}')
+        print(f'[LTH] Method 2 (Coinmetrics) failed: {e}')
 
-    # Method 4: 155-day VWAP via Binance — last resort
+    # Method 3: 4-year VWAP via Binance weekly candles
+    # LTH cost basis reflects multi-year accumulation — 4yr VWAP is a far better proxy than 155d.
     try:
-        r4 = requests.get(
+        r3 = requests.get(
             'https://api.binance.com/api/v3/klines',
-            params={'symbol': 'BTCUSDT', 'interval': '1d', 'limit': 155},
+            params={'symbol': 'BTCUSDT', 'interval': '1w', 'limit': 208},  # ~4 years of weekly
             headers=HEADERS, timeout=10
         )
-        if r4.ok:
-            klines     = r4.json()
+        if r3.ok:
+            klines     = r3.json()
             total_vol  = sum(float(k[5]) for k in klines)
             total_vwap = sum(float(k[4]) * float(k[5]) for k in klines)
             if total_vol > 0:
-                vwap_155 = total_vwap / total_vol
-                _lth_cache = {'value': round(vwap_155, 0), 'ts': time.time()}
-                print(f'[LTH] Fallback 155-day VWAP (last resort): ${vwap_155:,.0f}')
-                return _lth_cache['value']
+                vwap_4y = total_vwap / total_vol
+                if 10000 < vwap_4y < 80000:
+                    _lth_cache = {'value': round(vwap_4y, 0), 'ts': time.time()}
+                    print(f'[LTH] Fallback 4-year weekly VWAP: ${vwap_4y:,.0f}')
+                    return _lth_cache['value']
     except Exception as e:
-        print(f'[LTH] Method 4 (155d VWAP) failed: {e}')
+        print(f'[LTH] Method 3 (4yr VWAP) failed: {e}')
 
+    # !! DO NOT use 155-day VWAP — it returns ~current price, not LTH basis !!
     print('[LTH] All methods failed — returning None')
     return None
 
@@ -744,6 +771,9 @@ def gemini_spike_commentary(alert):
         stop   = round(price - 1.5 * atr, 8)
         target = round(price + 3.0 * atr, 8)
         rr     = "2:1"
+        # Auto-log to backtest store
+        _log_backtest_setup(sym, 'LONG', entry, stop, target, 'Volume Spike', timeframe='1H',
+                            notes=f'{spike}x spike · score:{score}/7 · {", ".join(labels[:3])}')
         setup_block = f"""
 SETUP (calculated from live ATR={atr:.6g}):
 - Entry:  ${entry:,.6g} (current price)
@@ -1322,9 +1352,10 @@ def citadel_report():
     """Generate a Citadel-style technical analysis report for top 50 coins."""
     try:
         data = request.get_json()
-        coins_data = data.get('coins', '')
-        count = data.get('count', 50)
-        timeframe = data.get('timeframe', 'N/A')
+        coins_data       = data.get('coins', '')
+        coins_structured = data.get('coinsStructured', [])  # structured JSON, no parsing needed
+        count            = data.get('count', 50)
+        timeframe        = data.get('timeframe', 'N/A')
 
         gemini_key = os.environ.get('GEMINI_API_KEY', '')
         if not gemini_key:
@@ -1369,6 +1400,24 @@ REPORT FORMAT:
 5. EXECUTION SUMMARY
    What to act on now vs. monitor. No price levels unless directly from the data."""
 
+        # ── Auto-log top 10 setups to backtest using structured JSON (no regex) ──
+        for coin in coins_structured[:10]:
+            try:
+                _sym   = coin.get('symbol', '')
+                _price = float(coin.get('price') or 0)
+                _atr   = float(coin.get('atr') or 0)
+                _sigs  = coin.get('signals', '')
+                if not _sym or not _price or not _atr:
+                    continue
+                _dir = 'SHORT' if any(x in _sigs for x in ['Overbought','Bearish','MACD Bear','WT Bearish']) else 'LONG'
+                _stop   = round(_price - 1.5 * _atr, 8) if _dir == 'LONG' else round(_price + 1.5 * _atr, 8)
+                _target = round(_price + 3.0 * _atr, 8) if _dir == 'LONG' else round(_price - 3.0 * _atr, 8)
+                _log_backtest_setup(_sym, _dir, _price, _stop, _target, 'Citadel Report',
+                                    timeframe=coin.get('timeframe', timeframe), notes=_sigs[:120])
+                print(f'[BACKTEST] Citadel: {_sym} {_dir} E:{_price} S:{_stop} T:{_target}')
+            except Exception as _e:
+                print(f'[BACKTEST] Citadel log error: {_e}')
+
         gemini_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}'
         gemini_resp = requests.post(gemini_url, json={
             'contents': [{'parts': [{'text': prompt}]}],
@@ -1398,6 +1447,84 @@ REPORT FORMAT:
     except Exception as e:
         print(f'[CITADEL] Error: {e}')
         return jsonify({'error': str(e)}), 500
+
+# ── Backtest API ──────────────────────────────────────────────
+
+@app.route('/backtest/setups', methods=['GET'])
+def backtest_get_setups():
+    """Return all logged setups with current price evaluation."""
+    # Fetch current prices for open setups
+    open_syms = list({s['symbol'] for s in _backtest_setups if s['status'] == 'OPEN'})
+    prices = {}
+    for sym in open_syms:
+        try:
+            r = requests.get(f'https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT',
+                             headers=HEADERS, timeout=5)
+            if r.ok:
+                prices[sym] = float(r.json()['price'])
+        except Exception:
+            pass
+
+    result = []
+    for s in _backtest_setups:
+        setup = dict(s)
+        cp = prices.get(s['symbol'])
+        if cp:
+            setup['currentPrice'] = cp
+        if s['status'] == 'OPEN' and cp:
+            e, st, t = s['entry'], s['stop'], s['target']
+            if s['direction'] == 'LONG':
+                if cp <= st:
+                    setup['status'] = 'STOP HIT';  setup['closedAt'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()); setup['closePrice'] = cp
+                elif cp >= t:
+                    setup['status'] = 'TARGET HIT'; setup['closedAt'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()); setup['closePrice'] = cp
+            else:
+                if cp >= st:
+                    setup['status'] = 'STOP HIT';  setup['closedAt'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()); setup['closePrice'] = cp
+                elif cp <= t:
+                    setup['status'] = 'TARGET HIT'; setup['closedAt'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()); setup['closePrice'] = cp
+            # Persist status change back to store
+            if setup['status'] != 'OPEN':
+                for stored in _backtest_setups:
+                    if stored['id'] == s['id']:
+                        stored['status']     = setup['status']
+                        stored['closedAt']   = setup['closedAt']
+                        stored['closePrice'] = setup['closePrice']
+        result.append(setup)
+    return jsonify({'setups': result, 'total': len(result)})
+
+
+@app.route('/backtest/delete', methods=['POST'])
+def backtest_delete():
+    """Delete a setup by id."""
+    data = request.get_json()
+    sid = data.get('id')
+    before = len(_backtest_setups)
+    _backtest_setups[:] = [s for s in _backtest_setups if s['id'] != sid]
+    return jsonify({'deleted': before - len(_backtest_setups)})
+
+
+@app.route('/backtest/expire', methods=['POST'])
+def backtest_expire():
+    """Mark a setup as expired."""
+    data = request.get_json()
+    sid = data.get('id')
+    for s in _backtest_setups:
+        if s['id'] == sid:
+            s['status'] = 'EXPIRED'
+            s['closedAt'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    return jsonify({'ok': True})
+
+
+# ── Backtest UI page ─────────────────────────────────────────
+@app.route('/backtest')
+def backtest_page():
+    """Serve the standalone backtest tracker UI."""
+    import os
+    html_path = os.path.join(os.path.dirname(__file__), 'backtest.html')
+    with open(html_path, 'r') as f:
+        return f.read(), 200, {'Content-Type': 'text/html'}
+
 
 # ── Health check ─────────────────────────────────────────────
 @app.route('/health')
