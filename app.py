@@ -1338,85 +1338,165 @@ _monitor_thread.start()
 
 @app.route('/citadel-report', methods=['POST'])
 def citadel_report():
-    """Generate a Citadel-style technical analysis report for top 50 coins."""
+    """Citadel report: Python calculates setups, Gemini fills signal explanations."""
     try:
-        data = request.get_json()
-        coins_data       = data.get('coins', '')
-        coins_structured = data.get('coinsStructured', [])  # structured JSON, no parsing needed
-        count            = data.get('count', 50)
+        data             = request.get_json()
+        coins_structured = data.get('coinsStructured', [])
+        count            = data.get('count', 10)
         timeframe        = data.get('timeframe', 'N/A')
 
         gemini_key = os.environ.get('GEMINI_API_KEY', '')
         if not gemini_key:
             return jsonify({'error': 'GEMINI_API_KEY not set'}), 500
 
-        prompt = f"""Quant trader. Analyze scan data. Use ONLY numbers from the data — never invent prices.
-Rules: Entry=exact price shown. Stop=Price-1xATR. Target=Price+2xATR (longs) or Price-2xATR (shorts). N/A if ATR missing.
-
-DATA ({count} assets, {timeframe}):
-{coins_data}
-
-OUTPUT FORMAT — be concise, max 120 words total:
-
-MARKET: [1 sentence on overall RSI/WT breadth]
-
-TOP SETUPS:
-[For each of top 5 — one line: SYMBOL | Entry $X | Stop $X | Target $X | R:R X:1 | bias]
-
-WATCH: [3 symbols with one trigger word each]
-
-ACT NOW: [1 sentence max]"""
-
-        # ── Auto-log top 10 setups to backtest using structured JSON (no regex) ──
+        # Step 1: Calculate setups in Python, log all to backtest
+        setups = []
         for coin in coins_structured[:10]:
             try:
-                _sym   = coin.get('symbol', '')
-                _price = float(coin.get('price') or 0)
-                _atr   = float(coin.get('atr') or 0)
-                _sigs  = coin.get('signals', '')
-                if not _sym or not _price or not _atr:
+                sym   = coin.get('symbol', '')
+                price = float(coin.get('price') or 0)
+                atr   = float(coin.get('atr') or 0)
+                sigs  = coin.get('signals', '')
+                score = coin.get('score', 0)
+                ema   = coin.get('vsEma200')
+                tf    = coin.get('timeframe', timeframe)
+                if not sym or not price:
                     continue
-                _dir = 'SHORT' if any(x in _sigs for x in ['Overbought','Bearish','MACD Bear','WT Bearish']) else 'LONG'
-                _stop   = round(_price - 1.5 * _atr, 8) if _dir == 'LONG' else round(_price + 1.5 * _atr, 8)
-                _target = round(_price + 3.0 * _atr, 8) if _dir == 'LONG' else round(_price - 3.0 * _atr, 8)
-                _log_backtest_setup(_sym, _dir, _price, _stop, _target, 'Citadel Report',
-                                    timeframe=coin.get('timeframe', timeframe), notes=_sigs[:120])
-                print(f'[BACKTEST] Citadel: {_sym} {_dir} E:{_price} S:{_stop} T:{_target}')
-            except Exception as _e:
-                print(f'[BACKTEST] Citadel log error: {_e}')
+                bearish_words = ['Overbought', 'Bearish', 'MACD Bear', 'WT Bearish']
+                direction = 'SHORT' if any(w in sigs for w in bearish_words) else 'LONG'
+                if atr:
+                    if direction == 'LONG':
+                        stop   = round(price - 1.5 * atr, 8)
+                        target = round(price + 3.0 * atr, 8)
+                    else:
+                        stop   = round(price + 1.5 * atr, 8)
+                        target = round(price - 3.0 * atr, 8)
+                    _log_backtest_setup(sym, direction, price, stop, target,
+                                        'Citadel Report', timeframe=tf, notes=sigs[:120])
+                    print(f'[CITADEL] Logged {sym} {direction} E:{price} S:{stop} T:{target}')
+                else:
+                    stop = target = None
+                vol_ratio = coin.get('volSpike')  # actual ratio e.g. 2.87 or null
+                setups.append({'sym': sym, 'price': price, 'atr': atr, 'stop': stop,
+                               'target': target, 'direction': direction, 'sigs': sigs,
+                               'score': score, 'ema': ema, 'tf': tf, 'vol': vol_ratio})
+            except Exception as e:
+                print(f'[CITADEL] Setup error: {e}')
 
-        gemini_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}'
+        if not setups:
+            return jsonify({'error': 'No valid setups'}), 400
+
+        # Step 2: Build template — Gemini only fills [EXPLAIN] and [FILL] slots
+        nl = chr(10)
+        sep = chr(9473) * 3
+
+        def make_sig_slot(sig_name):
+            line1 = '  ' + sig_name + ':'
+            line2 = '  [EXPLAIN: 2-3 sentences — what is ' + sig_name + ', what does it signal,'
+            line3 = '  and what should a trader do about it? Max 60 words, no markdown.]'
+            return line1 + nl + line2 + nl + line3 + nl
+
+        def fmt_price(p):
+            return '$' + '{:,.6g}'.format(p) if p else 'N/A'
+
+        template_blocks = []
+        for i, s in enumerate(setups, 1):
+            stop_s   = fmt_price(s['stop'])
+            target_s = fmt_price(s['target'])
+            rr_s     = '2:1' if s['stop'] else 'N/A'
+            price_s  = fmt_price(s['price'])
+            ema_s    = ('{:+.1f}% vs 200 EMA'.format(s['ema'])) if s['ema'] is not None else 'EMA200: N/A'
+            sig_list = [sg.strip() for sg in s['sigs'].split(',') if sg.strip()]
+            sig_section = nl.join(make_sig_slot(sg) for sg in sig_list[:6])
+
+            header_line = sep + ' ' + str(i) + '. ' + s['sym'] + ' ' + sep
+            vol_str     = (' | Vol: ' + '{:.2f}x'.format(s['vol'])) if s.get('vol') else ''
+            meta_line   = 'Price: ' + price_s + ' | ' + s['direction'] + ' | Score: ' + str(s['score']) + ' | ' + ema_s + vol_str
+            levels      = ('ENTRY:  ' + price_s + nl +
+                           'STOP:   ' + stop_s  + '  (1.5x ATR — cushion for normal volatility)' + nl +
+                           'TARGET: ' + target_s + '  (3x ATR — minimum 2:1 reward to risk)' + nl +
+                           'R:R:    ' + rr_s)
+            verdict     = 'VERDICT: [FILL: TAKE IT / WATCH IT / SKIP IT — then one sentence reason]'
+
+            block = nl.join([header_line, meta_line, levels, '', 'SIGNALS:', sig_section, verdict, ''])
+            template_blocks.append(block)
+
+        market_slot = ('[EXPLAIN: 2-3 sentences — what does it mean when ' + str(count) +
+                       ' assets show these signals simultaneously? What is the market telling us?'
+                       ' Max 60 words, no markdown.]')
+
+        rules = nl.join([
+            'STRICT RULES — you are a template filler, not a free writer:',
+            '- Replace ONLY [EXPLAIN] and [FILL] tags. Touch nothing else.',
+            '- Each [EXPLAIN]: plain English, 2-3 sentences, max 60 words, no markdown.',
+            '- Each [FILL]: TAKE IT / WATCH IT / SKIP IT + one sentence reason.',
+            '- No asterisks, no bold, no headers, no bullet points.',
+            '- Never invent or change any number in the template.',
+        ])
+
+        prompt = nl.join([
+            rules, '',
+            'MARKET OVERVIEW (' + str(count) + ' assets, ' + timeframe + '):', market_slot, '',
+            'SETUPS:', nl.join(template_blocks),
+            'END OF REPORT'
+        ])
+
+        # Step 3: Gemini fills the template
+        gemini_url = ('https://generativelanguage.googleapis.com/v1beta/'
+                      'models/gemini-2.5-flash:generateContent?key=' + gemini_key)
         gemini_resp = requests.post(gemini_url, json={
             'contents': [{'parts': [{'text': prompt}]}],
-            'generationConfig': {'maxOutputTokens': 1500, 'temperature': 0.6}
+            'generationConfig': {'maxOutputTokens': 3000, 'temperature': 0.4}
         }, timeout=60)
-        if not gemini_resp.ok:
-            return jsonify({'error': f'Gemini error: {gemini_resp.text[:200]}'}), 500
-        report = gemini_resp.json()['candidates'][0]['content']['parts'][0]['text']
 
-        # Send to Telegram (existing scan bot)
+        if not gemini_resp.ok:
+            return jsonify({'error': 'Gemini error: ' + gemini_resp.text[:200]}), 500
+
+        filled = gemini_resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+        # Strip markdown that leaked through
+        for md in ['**', '##', '###', '* ', '*']:
+            filled = filled.replace(md, '')
+
+        # Step 4: Prepend quick-reference table
+        green  = chr(128994)
+        red    = chr(128308)
+        sword  = chr(9876)
+        star   = chr(10022)
+        ref_lines = [sword + ' CITADEL REPORT — TOP ' + str(count) + ' ASSETS (' + timeframe + ')',
+                     '=' * 36,
+                     'QUICK REF (all setups logged to backtest):']
+        for s in setups:
+            dot = green if s['direction'] == 'LONG' else red
+            vol_tag = ('  ' + '{:.1f}x'.format(s['vol'])) if s.get('vol') else ''
+            ref_lines.append(dot + ' ' + s['sym'] +
+                             '  ' + fmt_price(s['price']) + vol_tag +
+                             '  S:' + fmt_price(s['stop']) +
+                             '  T:' + fmt_price(s['target']) +
+                             '  ' + str(s['score']) + star)
+        ref_lines += ['=' * 36, '']
+        report = nl.join(ref_lines) + nl + filled
+
+        # Step 5: Send to Telegram in chunks
         tg_token = os.environ.get('TELEGRAM_BOT_TOKEN', '') or TELEGRAM_BOT_TOKEN
         tg_chat  = os.environ.get('TELEGRAM_CHAT_ID', '') or TELEGRAM_CHAT_ID
         if tg_token and tg_chat:
-            header = f'⚔ <b>CITADEL REPORT — TOP {count} ASSETS ({timeframe})</b>\n\n'
-            full_msg = header + report
-            # Split into chunks at newline boundaries (max 3800 chars)
-            chunks = []
-            while len(full_msg) > 3800:
-                split_at = full_msg.rfind('\n', 0, 3800)
-                if split_at == -1: split_at = 3800
-                chunks.append(full_msg[:split_at])
-                full_msg = full_msg[split_at:].lstrip('\n')
-            if full_msg:
-                chunks.append(full_msg)
-            tg_url = f'https://api.telegram.org/bot{tg_token}/sendMessage'
-            for chunk in chunks:
-                requests.post(tg_url, json={'chat_id': tg_chat, 'text': chunk, 'parse_mode': 'HTML'}, timeout=10)
+            tg_url = 'https://api.telegram.org/bot' + tg_token + '/sendMessage'
+            msg = report
+            while msg:
+                if len(msg) <= 4000:
+                    requests.post(tg_url, json={'chat_id': tg_chat, 'text': msg}, timeout=10)
+                    break
+                split_at = msg.rfind(nl, 0, 4000)
+                if split_at == -1:
+                    split_at = 4000
+                requests.post(tg_url, json={'chat_id': tg_chat, 'text': msg[:split_at]}, timeout=10)
+                msg = msg[split_at:].lstrip(nl)
 
         return jsonify({'report': report})
     except Exception as e:
         print(f'[CITADEL] Error: {e}')
         return jsonify({'error': str(e)}), 500
+
 
 # ── Backtest API ──────────────────────────────────────────────
 
