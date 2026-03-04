@@ -1350,44 +1350,22 @@ def citadel_report():
         if not gemini_key:
             return jsonify({'error': 'GEMINI_API_KEY not set'}), 500
 
-        prompt = f"""You are a senior quantitative trader. Analyze this scan data and produce a technical research memo.
+        prompt = f"""Quant trader. Analyze scan data. Use ONLY numbers from the data — never invent prices.
+Rules: Entry=exact price shown. Stop=Price-1xATR. Target=Price+2xATR (longs) or Price-2xATR (shorts). N/A if ATR missing.
 
-CRITICAL RULES — STRICT ENFORCEMENT:
-- You ONLY use numbers explicitly provided in the data below. NEVER invent, estimate, or infer price levels.
-- Entry zone = the exact Price provided. Nothing else.
-- Stop-loss = Price minus 1x ATR (if ATR provided). If ATR is N/A, write "Stop: N/A — ATR not available".
-- Profit target = Price plus 2x ATR for longs, Price minus 2x ATR for shorts (if ATR provided). If ATR is N/A, write "Target: N/A — ATR not available".
-- VWAP deviation = use the VWAP value provided to describe premium/discount. Do NOT invent a VWAP level.
-- If a field says N/A, you must write N/A in your output. Never substitute a guess.
-- Do NOT reference price levels from memory or training data. You have no knowledge of historical prices.
-
-SCAN DATA ({count} assets, {timeframe} timeframe):
-
+DATA ({count} assets, {timeframe}):
 {coins_data}
 
-REPORT FORMAT:
+OUTPUT FORMAT — be concise, max 120 words total:
 
-1. MARKET OVERVIEW
-   What does the breadth of RSI/WT signals tell us about current market condition?
+MARKET: [1 sentence on overall RSI/WT breadth]
 
-2. TIER 1 — TOP 5 CONVICTION
-   For each asset:
-   - Signal strength and what indicators triggered
-   - Entry: [exact Price from data]
-   - Stop: [Price - 1x ATR, or N/A]
-   - Target: [Price + 2x ATR for longs / Price - 2x ATR for shorts, or N/A]
-   - R:R: [calculated from above, or N/A]
-   - VWAP context: [above/below VWAP by X%, or N/A]
-   - Bias: Strong Buy / Buy / Neutral / Sell / Strong Sell
+TOP SETUPS:
+[For each of top 5 — one line: SYMBOL | Entry $X | Stop $X | Target $X | R:R X:1 | bias]
 
-3. TIER 2 — WATCHLIST (next 10)
-   One line each: symbol | key signal | what to watch for entry
+WATCH: [3 symbols with one trigger word each]
 
-4. SECTOR PATTERNS
-   Any recurring themes across the scan?
-
-5. EXECUTION SUMMARY
-   What to act on now vs. monitor. No price levels unless directly from the data."""
+ACT NOW: [1 sentence max]"""
 
         # ── Auto-log top 10 setups to backtest using structured JSON (no regex) ──
         for coin in coins_structured[:10]:
@@ -1410,7 +1388,7 @@ REPORT FORMAT:
         gemini_url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}'
         gemini_resp = requests.post(gemini_url, json={
             'contents': [{'parts': [{'text': prompt}]}],
-            'generationConfig': {'maxOutputTokens': 4000, 'temperature': 0.7}
+            'generationConfig': {'maxOutputTokens': 1500, 'temperature': 0.6}
         }, timeout=60)
         if not gemini_resp.ok:
             return jsonify({'error': f'Gemini error: {gemini_resp.text[:200]}'}), 500
@@ -1422,12 +1400,15 @@ REPORT FORMAT:
         if tg_token and tg_chat:
             header = f'⚔ <b>CITADEL REPORT — TOP {count} ASSETS ({timeframe})</b>\n\n'
             full_msg = header + report
-            # Split into chunks of 4000 chars
+            # Split into chunks at newline boundaries (max 3800 chars)
             chunks = []
-            while len(full_msg) > 4000:
-                chunks.append(full_msg[:4000])
-                full_msg = full_msg[4000:]
-            chunks.append(full_msg)
+            while len(full_msg) > 3800:
+                split_at = full_msg.rfind('\n', 0, 3800)
+                if split_at == -1: split_at = 3800
+                chunks.append(full_msg[:split_at])
+                full_msg = full_msg[split_at:].lstrip('\n')
+            if full_msg:
+                chunks.append(full_msg)
             tg_url = f'https://api.telegram.org/bot{tg_token}/sendMessage'
             for chunk in chunks:
                 requests.post(tg_url, json={'chat_id': tg_chat, 'text': chunk, 'parse_mode': 'HTML'}, timeout=10)
