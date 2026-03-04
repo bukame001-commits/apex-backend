@@ -5,7 +5,6 @@ import time
 import threading
 
 # ── Backtest store (in-memory, persists for process lifetime) ─
-import json as _json
 _backtest_setups = []  # list of setup dicts
 
 def _log_backtest_setup(symbol, direction, entry, stop, target, source, timeframe='1H', notes=''):
@@ -62,7 +61,6 @@ HEADERS = {
     'Accept': 'application/json'
 }
 
-
 # ── Send Telegram message ────────────────────────────────────
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -85,7 +83,6 @@ def send_telegram(message):
     except Exception as e:
         print(f'[ALERT] Telegram exception: {e}')
         return False
-
 
 # ── Kıvanç-inspired helper indicators ────────────────────────
 
@@ -134,7 +131,6 @@ def calc_mfi(highs, lows, closes, vols, period=14):
 
     return mfi_now, mfi_prev
 
-
 def calc_cvroc(vols, period=21):
     """
     CVROC — Close Volume Rate of Change (Kıvanç's crypto indicator).
@@ -147,7 +143,6 @@ def calc_cvroc(vols, period=21):
     cvroc_now  = (vols[-1] - vols[-(period + 1)]) / vols[-(period + 1)] * 100 if vols[-(period + 1)] > 0 else None
     cvroc_prev = (vols[-2] - vols[-(period + 2)]) / vols[-(period + 2)] * 100 if vols[-(period + 2)] > 0 else None
     return cvroc_now, cvroc_prev
-
 
 def calc_mavilimw(closes, f1=3, f2=5):
     """
@@ -195,8 +190,6 @@ def calc_mavilimw(closes, f1=3, f2=5):
     direction = 1 if mav_now > mav_prev else -1
     return mav_now, direction
 
-
-
 def calc_ema(closes, period):
     """Exponential Moving Average."""
     if len(closes) < period:
@@ -206,7 +199,6 @@ def calc_ema(closes, period):
     for price in closes[period:]:
         ema = price * k + ema * (1 - k)
     return ema
-
 
 def _calc_atr_1h(klines, period=14):
     """ATR from 1H klines — used for setup calculations in spike alerts."""
@@ -349,7 +341,6 @@ def detect_volume_spike(symbol, klines):
         pass
     return None
 
-
 def fetch_oi_and_funding(sym):
     """
     Fetch open interest and funding rate from Binance futures.
@@ -391,9 +382,6 @@ def fetch_oi_and_funding(sym):
         }
     except Exception:
         return None
-
-
-
 
 def fetch_taker_ratio(sym, spike_candle_ts_ms):
     """
@@ -448,7 +436,6 @@ def fetch_taker_ratio(sym, spike_candle_ts_ms):
         print(f'[MONITOR] taker_ratio {sym} error: {e}')
         return None
 
-
 # ── NUPL cache (fetched once per scan, BTC-wide) ─────────────
 _nupl_cache = {'value': None, 'ts': 0}
 
@@ -501,7 +488,6 @@ def fetch_nupl():
 
     return None
 
-
 def nupl_label(nupl):
     """Return emoji + zone label for NUPL value."""
     if nupl is None:
@@ -516,7 +502,6 @@ def nupl_label(nupl):
         return f'🟢 NUPL:{nupl:.2f} (Hope/Fear — accumulation zone)'
     else:
         return f'💙 NUPL:{nupl:.2f} (Capitulation — long-term holders selling at loss)'
-
 
 # ── LTH Realized Price ────────────────────────────────────────
 _lth_cache = {'value': None, 'ts': 0}
@@ -617,7 +602,6 @@ def fetch_lth_realized_price():
     print('[LTH] All methods failed — returning None')
     return None
 
-
 # ── Background monitor scan ───────────────────────────────────
 # MONITOR_COINS is populated dynamically on startup from KuCoin/OKX
 # Falls back to this built-in list if exchange APIs are unreachable
@@ -635,11 +619,9 @@ MONITOR_COINS_BUILTIN = [
     'MANTA','ALT','PIXEL','PORTAL','ZETA','DYM','TNSR','REZ','BB','NOT',
     'IO','ZK','WLD','ETHFI','EIGEN','HMSTR','CATI','NEIRO','SCR','DOGS',
     'PNUT','ACT','GOAT','MOODENG','TURBO','BRETT','ENA','SAGA','BOME','MEW',
-    'NEAR','AVAX','LINK','UNI','MKR','AAVE','SNX','CRV','YFI','SUSHI',
-    'BAL','UMA','GRT','LDO','CVX','DYDX','PERP','GNS','JOE','PENDLE',
+    'MKR','YFI','SUSHI','BAL','UMA','CVX','PERP','JOE',
 ]
 MONITOR_COINS = list(MONITOR_COINS_BUILTIN)  # will be replaced on startup
-
 
 def fetch_monitor_coins():
     """Fetch full coin list from KuCoin or OKX for monitoring."""
@@ -710,8 +692,6 @@ def fetch_monitor_coins():
 
     print(f'[MONITOR] All exchanges failed — using built-in list of {len(MONITOR_COINS)} coins')
 
-
-
 def gemini_spike_commentary(alert):
     """
     Two-part Gemini response for each volume spike:
@@ -756,7 +736,6 @@ def gemini_spike_commentary(alert):
         kivanc_lines.append(cvroc_interp)
 
     mav_up   = any('MavilimW' in l and '↑' in l for l in labels)
-    cvroc_up = any('CVROC' in l and '↑' in l for l in labels)
     if mav_up:
         kivanc_lines.append("MavilimW trending up — Fibonacci-weighted MA confirms upward momentum, not a fake spike")
 
@@ -770,19 +749,13 @@ def gemini_spike_commentary(alert):
         entry  = price
         stop   = round(price - 1.5 * atr, 8)
         target = round(price + 3.0 * atr, 8)
-        rr     = "2:1"
         # Auto-log to backtest store
         _log_backtest_setup(sym, 'LONG', entry, stop, target, 'Volume Spike', timeframe='1H',
                             notes=f'{spike}x spike · score:{score}/7 · {", ".join(labels[:3])}')
-        setup_block = f"""
-SETUP (calculated from live ATR={atr:.6g}):
-- Entry:  ${entry:,.6g} (current price)
-- Stop:   ${stop:,.6g}  (price - 1.5x ATR)
-- Target: ${target:,.6g} (price + 3x ATR)
-- R:R: {rr}
-"""
     else:
-        setup_block = "\nSETUP: ATR not available — cannot calculate levels.\n"
+        entry = price
+        stop  = None
+        target = None
 
     kivanc_block = "\n".join(f"- {l}" for l in kivanc_lines) if kivanc_lines else "- Indicator readings not available"
 
@@ -812,7 +785,6 @@ TRADE SETUP: Entry {price:,.6g} | Stop {_stop_str} | Target {_target_str} | R:R 
     except Exception as e:
         print(f'[MONITOR] Gemini commentary error for {sym}: {e}')
     return None
-
 
 # ════════════════════════════════════════════════════════════════
 # CITADEL-GRADE SIGNAL SUITE
@@ -884,7 +856,6 @@ def calc_cvd(klines, lookback=20):
         }
     except Exception as e:
         return None
-
 
 def fetch_liquidation_clusters(sym):
     """
@@ -961,7 +932,6 @@ def fetch_liquidation_clusters(sym):
     except Exception as e:
         return None
 
-
 def fetch_spot_futures_basis(sym):
     """
     Spot vs perpetual futures price spread.
@@ -987,7 +957,6 @@ def fetch_spot_futures_basis(sym):
     except Exception:
         return None
 
-
 def detect_oi_stealth_accumulation(sym, oi_info, klines):
     """
     OI rising while price is flat or slightly down = stealth accumulation.
@@ -1010,7 +979,6 @@ def detect_oi_stealth_accumulation(sym, oi_info, klines):
         return price_flat_or_down
     except Exception:
         return False
-
 
 def citadel_score(sym, spike, oi_info, klines, cvd_data, liq_data, basis_data):
     """
@@ -1318,7 +1286,6 @@ def run_monitor_scan():
     else:
         print(f'[MONITOR] Scan complete — no volume spikes detected')
 
-
 def monitor_loop():
     """Startup thread — fetches coin list once, no auto-scanning (on-demand only)."""
     global _monitor_running
@@ -1328,13 +1295,9 @@ def monitor_loop():
     fetch_monitor_coins()
     print('[MONITOR] Ready. Volume scan is on-demand only.')
 
-
 # Start background thread just to initialise coin list
 _monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
 _monitor_thread.start()
-
-
-
 
 @app.route('/citadel-report', methods=['POST'])
 def citadel_report():
@@ -1376,7 +1339,6 @@ def citadel_report():
                     print(f'[CITADEL] Logged {sym} {direction} E:{price} S:{stop} T:{target} ATR:{atr}')
                 else:
                     stop = target = None
-                    print(f'[CITADEL] {sym}: no ATR — raw atr field={coin.get("atr")}')
                 vol_ratio = coin.get('volSpike')  # actual ratio e.g. 2.87 or null
                 setups.append({'sym': sym, 'price': price, 'atr': atr, 'stop': stop,
                                'target': target, 'direction': direction, 'sigs': sigs,
@@ -1483,7 +1445,7 @@ def citadel_report():
         if tg_token and tg_chat:
             tg_url = 'https://api.telegram.org/bot' + tg_token + '/sendMessage'
             # Message 1: quick-ref table (always fits — max ~500 chars)
-            requests.post(tg_url, json={'chat_id': tg_chat, 'text': header.strip()}, timeout=10)
+            requests.post(tg_url, json={'chat_id': tg_chat, 'text': nl.join(ref_lines).strip()}, timeout=10)
             # Message 2+: Gemini analysis in chunks
             msg = filled
             while msg:
@@ -1500,7 +1462,6 @@ def citadel_report():
     except Exception as e:
         print(f'[CITADEL] Error: {e}')
         return jsonify({'error': str(e)}), 500
-
 
 # ── Backtest API ──────────────────────────────────────────────
 
@@ -1547,7 +1508,6 @@ def backtest_get_setups():
         result.append(setup)
     return jsonify({'setups': result, 'total': len(result)})
 
-
 @app.route('/backtest/delete', methods=['POST'])
 def backtest_delete():
     """Delete a setup by id."""
@@ -1556,7 +1516,6 @@ def backtest_delete():
     before = len(_backtest_setups)
     _backtest_setups[:] = [s for s in _backtest_setups if s['id'] != sid]
     return jsonify({'deleted': before - len(_backtest_setups)})
-
 
 @app.route('/backtest/expire', methods=['POST'])
 def backtest_expire():
@@ -1569,22 +1528,18 @@ def backtest_expire():
             s['closedAt'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     return jsonify({'ok': True})
 
-
 # ── Backtest UI page ─────────────────────────────────────────
 @app.route('/backtest')
 def backtest_page():
     """Serve the standalone backtest tracker UI."""
-    import os
     html_path = os.path.join(os.path.dirname(__file__), 'backtest.html')
     with open(html_path, 'r') as f:
         return f.read(), 200, {'Content-Type': 'text/html'}
-
 
 # ── Health check ─────────────────────────────────────────────
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok', 'monitor': _monitor_running})
-
 
 # ── Fetch single stock from Yahoo Finance ─────────────────────
 def parse_klines_from_rows(rows, interval):
@@ -1615,7 +1570,6 @@ def parse_klines_from_rows(rows, interval):
         except Exception:
             continue
     return klines
-
 
 def fetch_stooq(sym, interval='1wk'):
     """Fetch OHLCV from Stooq as fallback. Returns klines list or None."""
@@ -1650,7 +1604,6 @@ def fetch_stooq(sym, interval='1wk'):
     except Exception as e:
         print(f'Stooq {sym} error: {e}')
         return None
-
 
 def fetch_one_stock(sym, interval='1wk'):
     try:
@@ -1704,7 +1657,6 @@ def fetch_one_stock(sym, interval='1wk'):
     except Exception as e:
         print(f'{sym} error: {e}')
         return sym, None
-
 
 # ── Crypto pairs — fetch real list from multiple exchanges ───
 @app.route('/binance-pairs')
@@ -1769,7 +1721,6 @@ def binance_pairs():
         print(f'OKX instruments error: {e}')
 
     return jsonify({'symbols': [], 'count': 0, 'source': 'none'})
-
 
 # ── Crypto OHLCV data — fetch from multiple exchanges server-side ──────
 @app.route('/crypto')
@@ -1880,7 +1831,6 @@ def crypto():
     print(f'[CRYPTO] Done: {len(results)}/{len(symbols)} fetched. Sources: {sources}')
     return jsonify(results)
 
-
 # ── Stock OHLCV data — parallel fetch via thread pool ────────
 @app.route('/stocks')
 def stocks():
@@ -1899,7 +1849,6 @@ def stocks():
                 results[sym] = data
 
     return jsonify(results)
-
 
 # ── Russell 2000 constituents via iShares IWM ETF ────────────
 @app.route('/russell2000')
@@ -1985,7 +1934,6 @@ def russell2000():
         print(f'Russell 2000 fetch failed: {e}')
         return jsonify({'error': str(e)}), 503
 
-
 # ── S&P 500 constituents via iShares IVV ETF ─────────────────
 @app.route('/sp500')
 def sp500():
@@ -2021,7 +1969,6 @@ def sp500():
     except Exception as e:
         return jsonify({'error': str(e)}), 503
 
-
 # ── Monitor control routes ───────────────────────────────────
 @app.route('/monitor/config', methods=['POST'])
 def monitor_config():
@@ -2037,7 +1984,6 @@ def monitor_config():
         return jsonify({'ok': True, 'message': 'Telegram configured for this session'})
     return jsonify({'ok': False, 'message': 'Missing token or chat_id'}), 400
 
-
 @app.route('/monitor/status')
 def monitor_status():
     now = time.time()
@@ -2051,7 +1997,6 @@ def monitor_status():
         'recent_alerts': len(recent),
         'telegram_configured': bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
     })
-
 
 @app.route('/monitor/test')
 def monitor_test():
@@ -2073,7 +2018,6 @@ def monitor_test():
         return jsonify({'sent': ok})
     return jsonify({'sent': False, 'error': 'No Telegram token configured'})
 
-
 @app.route('/monitor/scan-now')
 def monitor_scan_now():
     """Trigger an immediate scan. Accepts token/chat_id to set config first."""
@@ -2086,7 +2030,6 @@ def monitor_scan_now():
     threading.Thread(target=run_monitor_scan, daemon=True).start()
     return jsonify({'status': 'scan started', 'coins': len(MONITOR_COINS)})
 
-
 # ── Telegram Intelligence — import module ────────────────────
 try:
     import telegram_intel as tg_intel
@@ -2094,7 +2037,6 @@ try:
 except Exception as e:
     tg_intel = None
     print(f'[TG-INTEL] Module load failed: {e}')
-
 
 @app.route('/tg-intel/status')
 def tg_intel_status():
@@ -2109,7 +2051,6 @@ def tg_intel_status():
         'vol_count':      len(tg_intel._last_volume_spikes),
     })
 
-
 @app.route('/tg-intel/send-code', methods=['POST'])
 def tg_intel_send_code():
     if not tg_intel:
@@ -2122,7 +2063,6 @@ def tg_intel_send_code():
         return jsonify({'ok': False, 'error': 'api_id, api_hash and phone required'})
     result = tg_intel.auth_send_code(api_id, api_hash, phone)
     return jsonify(result)
-
 
 @app.route('/tg-intel/verify-code', methods=['POST'])
 def tg_intel_verify_code():
@@ -2138,7 +2078,6 @@ def tg_intel_verify_code():
     result = tg_intel.auth_verify_code(phone, code, api_id, api_hash)
     return jsonify(result)
 
-
 @app.route('/tg-intel/verify-2fa', methods=['POST'])
 def tg_intel_verify_2fa():
     if not tg_intel:
@@ -2151,7 +2090,6 @@ def tg_intel_verify_2fa():
         return jsonify({'ok': False, 'error': 'password required'})
     result = tg_intel.auth_verify_2fa(password, api_id, api_hash)
     return jsonify(result)
-
 
 _app_start_time = time.time()
 
@@ -2178,7 +2116,6 @@ def tg_intel_run():
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({'ok': True, 'status': 'Analysis started — report will arrive on Telegram'})
 
-
 @app.route('/apex-results', methods=['POST'])
 def apex_results():
     """Receive APEX scan results from frontend and store for Intelligence analysis."""
@@ -2193,7 +2130,6 @@ def apex_results():
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
 
-
 @app.route('/volume-results', methods=['POST'])
 def volume_results():
     """Receive volume spike results from frontend and store for Intelligence analysis."""
@@ -2207,8 +2143,6 @@ def volume_results():
         return jsonify({'ok': True, 'count': len(spikes)})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
-
-
 
 # ════════════════════════════════════════════════════════════════
 # FIND THE BOTTOM — On-chain accumulation intelligence endpoint
@@ -2247,7 +2181,6 @@ def fetch_bottom_signals():
             })
     except Exception as e:
         signals.append({'tier':'TIER 1','name':'NUPL','value':'Unavailable','status':'red','interpretation':str(e)})
-
 
     # -- TIER 2: LTH Realized Price vs Current Price --------
     # Coinmetrics (real) -> Bitbo -> 2yr MA proxy
@@ -2433,7 +2366,6 @@ def fetch_bottom_signals():
 
     return signals, deploy_score
 
-
 @app.route('/find-bottom', methods=['POST'])
 def find_bottom():
     """On-chain bottom detection — all 5 signal tiers."""
@@ -2504,7 +2436,6 @@ def find_bottom():
 
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
-
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 3000))
