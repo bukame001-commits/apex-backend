@@ -786,37 +786,26 @@ SETUP (calculated from live ATR={atr:.6g}):
 
     kivanc_block = "\n".join(f"- {l}" for l in kivanc_lines) if kivanc_lines else "- Indicator readings not available"
 
-    prompt = f"""You are a crypto trading analyst. A real-time volume spike has been detected. 
-ALL numbers below are live data — use ONLY these. Do not invent or recall any other prices.
+    # Pre-extract stop/target for clean prompt injection
+    _stop_str   = f'${stop:,.6g}'   if atr and price else 'N/A'
+    _target_str = f'${target:,.6g}' if atr and price else 'N/A'
 
-═══ LIVE SIGNAL: {sym}/USDT ═══
-Price:          ${price:,.6g}
-Spike:          {spike}x above baseline  ({candle_str} candle)
-USD Volume:     ${usd_vol:,}
-Position:       {pct_low}% above 30-bar low
-EMA200 (1H):    {ema_str}
-OI:             {oi_str}
-Funding:        {fund_str}/hr
-Conviction:     {score}/7
+    prompt = f"""Crypto spike alert. Use ONLY data below — never invent prices.
 
-KIVANÇ INDICATOR READINGS (explain these in plain English):
+{sym}/USDT | ${price:,.6g} | {spike}x spike ({candle_str} candle) | Vol ${usd_vol:,}
+MFI:{mfi} | OI:{oi_str} | Funding:{fund_str} | Score:{score}/7 | {pct_low}% above 30d low
 {kivanc_block}
 
-{setup_block}
+Respond in EXACTLY this format, nothing else:
 
-YOUR RESPONSE — two sections, max 80 words total:
-
-WHAT THIS MEANS:
-[2-3 sentences explaining in plain English what MavilimW up + CVROC accelerating + MFI reading means for THIS specific spike — what is the market telling us right now]
-
-TRADE SETUP:
-[Use ONLY the entry/stop/target from the SETUP block above. State them clearly. Add ONE sentence on what would invalidate this — e.g. price closing below stop on next candle.]"""
+WHAT THIS MEANS: [2 sentences max — what do MFI/MavilimW/CVROC readings mean for this spike]
+TRADE SETUP: Entry {price:,.6g} | Stop {_stop_str} | Target {_target_str} | R:R 2:1 | Invalid if close below stop"""
 
     try:
         url  = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}'
         resp = requests.post(url, json={
             'contents': [{'parts': [{'text': prompt}]}],
-            'generationConfig': {'maxOutputTokens': 600, 'temperature': 0.3}
+            'generationConfig': {'maxOutputTokens': 1000, 'temperature': 0.3}
         }, timeout=25)
         if resp.ok:
             return resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
