@@ -816,8 +816,8 @@ TRADE SETUP:
         url  = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}'
         resp = requests.post(url, json={
             'contents': [{'parts': [{'text': prompt}]}],
-            'generationConfig': {'maxOutputTokens': 250, 'temperature': 0.3}
-        }, timeout=15)
+            'generationConfig': {'maxOutputTokens': 600, 'temperature': 0.3}
+        }, timeout=25)
         if resp.ok:
             return resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
     except Exception as e:
@@ -1314,9 +1314,7 @@ def run_monitor_scan():
             if key_signals:
                 for ks in key_signals:
                     lines.append(f'   {ks}')
-            if basis is not None:
-                basis_str = f'Spot premium {abs(basis):.3f}%' if basis < 0 else f'Futures premium {basis:.3f}%'
-                lines.append(f'   📐 Basis: {basis_str}')
+            # Basis already included in labels via citadel_score — no duplicate needed
 
             # ── Gemini commentary ──
             commentary = gemini_spike_commentary(a)
