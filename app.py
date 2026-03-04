@@ -1373,9 +1373,10 @@ def citadel_report():
                         target = round(price - 3.0 * atr, 8)
                     _log_backtest_setup(sym, direction, price, stop, target,
                                         'Citadel Report', timeframe=tf, notes=sigs[:120])
-                    print(f'[CITADEL] Logged {sym} {direction} E:{price} S:{stop} T:{target}')
+                    print(f'[CITADEL] Logged {sym} {direction} E:{price} S:{stop} T:{target} ATR:{atr}')
                 else:
                     stop = target = None
+                    print(f'[CITADEL] {sym}: no ATR — raw atr field={coin.get("atr")}')
                 vol_ratio = coin.get('volSpike')  # actual ratio e.g. 2.87 or null
                 setups.append({'sym': sym, 'price': price, 'atr': atr, 'stop': stop,
                                'target': target, 'direction': direction, 'sigs': sigs,
@@ -1476,12 +1477,15 @@ def citadel_report():
         ref_lines += ['=' * 36, '']
         report = nl.join(ref_lines) + nl + filled
 
-        # Step 5: Send to Telegram in chunks
+        # Step 5: Send to Telegram — table first, then analysis in chunks
         tg_token = os.environ.get('TELEGRAM_BOT_TOKEN', '') or TELEGRAM_BOT_TOKEN
         tg_chat  = os.environ.get('TELEGRAM_CHAT_ID', '') or TELEGRAM_CHAT_ID
         if tg_token and tg_chat:
             tg_url = 'https://api.telegram.org/bot' + tg_token + '/sendMessage'
-            msg = report
+            # Message 1: quick-ref table (always fits — max ~500 chars)
+            requests.post(tg_url, json={'chat_id': tg_chat, 'text': header.strip()}, timeout=10)
+            # Message 2+: Gemini analysis in chunks
+            msg = filled
             while msg:
                 if len(msg) <= 4000:
                     requests.post(tg_url, json={'chat_id': tg_chat, 'text': msg}, timeout=10)
