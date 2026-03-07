@@ -1355,9 +1355,24 @@ def citadel_report():
 
         def make_sig_slot(sig_name):
             line1 = '  ' + sig_name + ':'
-            line2 = '  [EXPLAIN: 2-3 sentences — what is ' + sig_name + ', what does it signal,'
-            line3 = '  and what should a trader do about it? Max 60 words, no markdown.]'
-            return line1 + nl + line2 + nl + line3 + nl
+            lname = sig_name.lower()
+            if 'oversold' in lname:
+                direction = 'OVERSOLD (bearish exhaustion — potential reversal UP). NEVER say "not yet overbought".'
+            elif 'overbought' in lname:
+                direction = 'OVERBOUGHT (bullish exhaustion — potential reversal DOWN).'
+            elif 'below 200 ema' in lname:
+                direction = 'price is BELOW the 200 EMA — bearish structural context.'
+            elif 'extended above' in lname or 'above 200 ema' in lname:
+                direction = 'price is ABOVE the 200 EMA — bullish structural context.'
+            elif 'bullish' in lname or 'green dot' in lname:
+                direction = 'BULLISH momentum signal.'
+            elif 'bearish' in lname or 'red dot' in lname:
+                direction = 'BEARISH momentum signal.'
+            else:
+                direction = 'neutral context signal.'
+            line2 = ('  [EXPLAIN: This is a ' + direction +
+                     ' 2 sentences max 40 words. Sentence 1: what it means now. Sentence 2: what trader does. No markdown.]')
+            return line1 + nl + line2 + nl
 
         def fmt_price(p):
             return '$' + '{:,.6g}'.format(p) if p else 'N/A'
@@ -1386,17 +1401,15 @@ def citadel_report():
                 block = nl.join([header_line, meta_line, levels, 'Signals: ' + sigs_inline, verdict, ''])
             template_blocks.append(block)
 
-        market_slot = ('[EXPLAIN: 2-3 sentences — what does it mean when ' + str(count) +
-                       ' assets show these signals simultaneously? What is the market telling us?'
-                       ' Max 60 words, no markdown.]')
+        market_slot = ('[EXPLAIN: 2 sentences max, 40 words total — what do these signals across ' + str(count) + ' assets tell us about the current market? No markdown.]')
 
         rules = nl.join([
             'STRICT RULES — you are a template filler, not a free writer:',
-            '- Replace ONLY [EXPLAIN] and [FILL] tags. Touch nothing else.',
-            '- Each [EXPLAIN]: plain English, 2-3 sentences, max 60 words, no markdown.',
-            '- Each [FILL]: TAKE IT / WATCH IT / SKIP IT + one sentence reason.',
-            '- No asterisks, no bold, no headers, no bullet points.',
-            '- Never invent or change any number in the template.',
+            '- Replace ONLY [EXPLAIN] tags with exactly 2 sentences, max 40 words.',
+            '- Replace ONLY [FILL] tags with: TAKE IT / WATCH IT / SKIP IT + one short sentence.',
+            '- HARD LIMIT: every [EXPLAIN] must be under 40 words. Count carefully.',
+            '- Never say "not yet overbought" for RSI below 50 — say "oversold" if RSI < 40.',
+            '- No asterisks, no bold, no markdown. Never change any number.',
         ])
 
         prompt = nl.join([
