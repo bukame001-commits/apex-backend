@@ -4,8 +4,32 @@ import io
 import time
 import threading
 
-# ── Backtest store (in-memory, persists for process lifetime) ─
-_backtest_setups = []  # list of setup dicts
+# ── Backtest store — persistent JSON file + in-memory cache ──
+import json as _json
+
+_BACKTEST_FILE = os.path.join(os.path.dirname(__file__), 'backtest_data.json')
+_backtest_lock = threading.Lock()
+
+def _load_backtest():
+    """Load setups from disk into memory."""
+    try:
+        if os.path.exists(_BACKTEST_FILE):
+            with open(_BACKTEST_FILE, 'r') as f:
+                return _json.load(f)
+    except Exception as e:
+        print(f'[BACKTEST] Load error: {e}')
+    return []
+
+def _save_backtest(setups):
+    """Persist setups to disk."""
+    try:
+        with open(_BACKTEST_FILE, 'w') as f:
+            _json.dump(setups, f)
+    except Exception as e:
+        print(f'[BACKTEST] Save error: {e}')
+
+_backtest_setups = _load_backtest()
+print(f'[BACKTEST] Loaded {len(_backtest_setups)} setups from disk')
 
 def _log_backtest_setup(symbol, direction, entry, stop, target, source, timeframe='1H', notes=''):
     """Log an AI-generated setup to the backtest store."""
@@ -26,10 +50,11 @@ def _log_backtest_setup(symbol, direction, entry, stop, target, source, timefram
         'closedAt':  None,
         'closePrice':None,
     }
-    _backtest_setups.insert(0, setup)
-    # Keep last 500
-    if len(_backtest_setups) > 500:
-        _backtest_setups.pop()
+    with _backtest_lock:
+        _backtest_setups.insert(0, setup)
+        if len(_backtest_setups) > 500:
+            _backtest_setups.pop()
+        _save_backtest(_backtest_setups)
     print(f'[BACKTEST] Logged: {symbol} {direction} E:{entry} S:{stop} T:{target} ({source})')
 
 import requests
@@ -1515,11 +1540,13 @@ def backtest_get_setups():
                     setup['status'] = 'TARGET HIT'; setup['closedAt'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()); setup['closePrice'] = cp
             # Persist status change back to store
             if setup['status'] != 'OPEN':
-                for stored in _backtest_setups:
-                    if stored['id'] == s['id']:
-                        stored['status']     = setup['status']
-                        stored['closedAt']   = setup['closedAt']
-                        stored['closePrice'] = setup['closePrice']
+                with _backtest_lock:
+                    for stored in _backtest_setups:
+                        if stored['id'] == s['id']:
+                            stored['status']     = setup['status']
+                            stored['closedAt']   = setup['closedAt']
+                            stored['closePrice'] = setup['closePrice']
+                    _save_backtest(_backtest_setups)
         result.append(setup)
     return jsonify({'setups': result, 'total': len(result)})
 
@@ -1530,6 +1557,7 @@ def backtest_delete():
     sid = data.get('id')
     before = len(_backtest_setups)
     _backtest_setups[:] = [s for s in _backtest_setups if s['id'] != sid]
+    _save_backtest(_backtest_setups)
     return jsonify({'deleted': before - len(_backtest_setups)})
 
 @app.route('/backtest/expire', methods=['POST'])
@@ -1541,6 +1569,7 @@ def backtest_expire():
         if s['id'] == sid:
             s['status'] = 'EXPIRED'
             s['closedAt'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    _save_backtest(_backtest_setups)
     return jsonify({'ok': True})
 
 # ── Backtest UI page ─────────────────────────────────────────
