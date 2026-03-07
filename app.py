@@ -4,32 +4,47 @@ import io
 import time
 import threading
 
-# ── Backtest store — persistent JSON file + in-memory cache ──
+# ── Backtest store — JSONBin.io persistent storage + in-memory cache ──
 import json as _json
 
-_BACKTEST_FILE = os.path.join(os.path.dirname(__file__), 'backtest_data.json')
 _backtest_lock = threading.Lock()
 
+# JSONBin config — set JSONBIN_BIN_ID and JSONBIN_API_KEY in Railway env vars
+_JSONBIN_BIN_ID  = os.environ.get('JSONBIN_BIN_ID', '')
+_JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY', '')
+_JSONBIN_URL     = f'https://api.jsonbin.io/v3/b/{_JSONBIN_BIN_ID}'
+
 def _load_backtest():
-    """Load setups from disk into memory."""
+    """Load setups from JSONBin."""
+    if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
+        print('[BACKTEST] No JSONBin config — using in-memory only')
+        return []
     try:
-        if os.path.exists(_BACKTEST_FILE):
-            with open(_BACKTEST_FILE, 'r') as f:
-                return _json.load(f)
+        r = requests.get(_JSONBIN_URL + '/latest',
+            headers={'X-Master-Key': _JSONBIN_API_KEY}, timeout=10)
+        if r.ok:
+            data = r.json().get('record', {})
+            setups = data.get('setups', [])
+            print(f'[BACKTEST] Loaded {len(setups)} setups from JSONBin')
+            return setups
+        else:
+            print(f'[BACKTEST] JSONBin load error: {r.status_code}')
     except Exception as e:
-        print(f'[BACKTEST] Load error: {e}')
+        print(f'[BACKTEST] JSONBin load error: {e}')
     return []
 
 def _save_backtest(setups):
-    """Persist setups to disk."""
+    """Persist setups to JSONBin."""
+    if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
+        return
     try:
-        with open(_BACKTEST_FILE, 'w') as f:
-            _json.dump(setups, f)
+        requests.put(_JSONBIN_URL,
+            headers={'X-Master-Key': _JSONBIN_API_KEY, 'Content-Type': 'application/json'},
+            json={'setups': setups}, timeout=10)
     except Exception as e:
-        print(f'[BACKTEST] Save error: {e}')
+        print(f'[BACKTEST] JSONBin save error: {e}')
 
 _backtest_setups = _load_backtest()
-print(f'[BACKTEST] Loaded {len(_backtest_setups)} setups from disk')
 
 def _log_backtest_setup(symbol, direction, entry, stop, target, source, timeframe='1H', notes=''):
     """Log an AI-generated setup to the backtest store."""
