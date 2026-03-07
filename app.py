@@ -1261,13 +1261,17 @@ def run_monitor_scan():
             if nupl_val is not None:
                 tg_intel.set_nupl(nupl_val)
 
-        lines = [f'🚨 <b>APEX SCANNER — UNUSUAL ACTIVITY ALERT</b>']
-        lines.append(f'⏰ {time.strftime("%Y-%m-%d %H:%M UTC")} | 1H candles')
-        lines.append('✅ Filters: 2x vol spike · $50k min · body>wick · OI · funding · taker ratio')
+        # Send header message first
+        header_lines = [f'🚨 <b>APEX SCANNER — UNUSUAL ACTIVITY ALERT</b>']
+        header_lines.append(f'⏰ {time.strftime("%Y-%m-%d %H:%M UTC")} | 1H candles')
+        header_lines.append('✅ Filters: 2x vol spike · $50k min · body>wick · OI · funding · taker ratio')
         if nupl_str:
-            lines.append(f'📊 Market: {nupl_str}')
-        lines.append('')
-        for a in alerts[:10]:
+            header_lines.append(f'📊 Market: {nupl_str}')
+        header_lines.append(f'📋 {len(alerts[:10])} assets detected')
+        send_telegram('\n'.join(header_lines))
+
+        # Send each asset as its own message to avoid 4096 char Telegram limit
+        for idx, a in enumerate(alerts[:10]):
             score       = a.get('score', 1)
             stars       = '⭐' * min(score, 10)
             usd_vol     = a.get('usd_vol', 0)
@@ -1282,6 +1286,7 @@ def run_monitor_scan():
             spike_green = a.get('spike_green')
             sym         = a['sym']
 
+            lines = []
             # Header line
             lines.append(f'{stars} <b>{sym}</b>  {candle_tag}  {verdict}'.strip())
 
@@ -1311,7 +1316,6 @@ def run_monitor_scan():
             if key_signals:
                 for ks in key_signals:
                     lines.append(f'   {ks}')
-            # Basis already included in labels via citadel_score — no duplicate needed
 
             # ── Gemini commentary ──
             commentary = gemini_spike_commentary(a)
@@ -1320,8 +1324,9 @@ def run_monitor_scan():
                     cl = cl.strip()
                     if cl:
                         lines.append(f'   🤖 {cl}')
-            lines.append('')
-        send_telegram('\n'.join(lines))
+
+            send_telegram('\n'.join(lines))
+
         print(f'[MONITOR] Sent alert for {len(alerts)} coins: {[a["sym"] for a in alerts]}')
     else:
         print(f'[MONITOR] Scan complete — no volume spikes detected')

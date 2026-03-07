@@ -143,6 +143,35 @@
       );
     }
 
+    // Group setups into scan batches — setups within 3 min of each other = same batch
+    function groupByBatch(setups) {
+      if(!setups.length) return [];
+      // Sort by createdAt ascending for grouping
+      const sorted = [...setups].sort((a,b)=>new Date(a.createdAt)-new Date(b.createdAt));
+      const batches = [];
+      let current = null;
+
+      sorted.forEach(s => {
+        const t = new Date(s.createdAt).getTime();
+        if(!current || t - current.lastT > 3*60*1000) {
+          // New batch
+          const d = new Date(s.createdAt);
+          const label = `${s.source.toUpperCase()} · ${d.toLocaleDateString('en-GB',{day:'2-digit',month:'short'})} ${d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}`;
+          current = {label, items:[], lastT:t};
+          batches.push(current);
+        }
+        current.items.push(s);
+        current.lastT = t;
+      });
+
+      // Add batch P&L summary
+      return batches.reverse().map(b => {
+        const pnls = b.items.map(s=>s.status==='OPEN'?calcLivePnl(s):calcFinalPnl(s)).filter(p=>p!=null);
+        const pnl  = pnls.length ? pnls.reduce((a,c)=>a+c,0)/pnls.length : null;
+        return {...b, pnl};
+      });
+    }
+
     function App() {
       const [setups,setSetups]         = useState([]);
       const [loading,setLoading]       = useState(true);
@@ -257,7 +286,24 @@
               'Run ⚡ SCAN NOW → Volume spike setups auto-logged\nRun ⚔ CITADEL REPORT → Top 10 setups auto-logged'
             )
           ),
-          ...filtered.map(s=>h(SetupRow,{key:s.id,s,onDelete:handleDelete,onExpire:handleExpire}))
+          ...groupByBatch(filtered).flatMap(({label,pnl,items})=>[
+            // Batch header
+            P({
+              display:'flex',alignItems:'center',gap:'10px',
+              margin:'16px 0 8px',padding:'8px 12px',
+              background:'#0a0a14',borderLeft:'3px solid #1a1a2e',
+              border:'1px solid #1a1a2e'
+            },
+              P({fontFamily:"'Orbitron',monospace",fontSize:'11px',color:'#00d4ff',letterSpacing:'2px',flex:1}, label),
+              P({fontSize:'9px',color:'#444'}, `${items.length} SETUP${items.length!==1?'S':''}`),
+              pnl!=null && P({
+                fontSize:'11px',fontWeight:700,
+                color:pnl>=0?'#00ff88':'#ff4444',
+                marginLeft:'8px'
+              }, `${pnl>=0?'▲':'▼'} ${fmtPct(pnl)} batch`)
+            ),
+            ...items.map(s=>h(SetupRow,{key:s.id,s,onDelete:handleDelete,onExpire:handleExpire}))
+          ])
         ),
 
         !loading && tab==='stats' && P({},
