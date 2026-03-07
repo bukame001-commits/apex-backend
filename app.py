@@ -747,7 +747,7 @@ def gemini_spike_commentary(alert):
     # ATR-based setup levels
     if atr and price:
         entry  = price
-        stop   = round(price - 1.5 * atr, 8)
+        stop   = max(round(price - 1.5 * atr, 8), 0.000001)
         target = round(price + 3.0 * atr, 8)
         # Auto-log to backtest store
         _log_backtest_setup(sym, 'LONG', entry, stop, target, 'Volume Spike', timeframe='1H',
@@ -1329,11 +1329,11 @@ def citadel_report():
                 direction = 'SHORT' if any(w in sigs for w in bearish_words) else 'LONG'
                 if atr:
                     if direction == 'LONG':
-                        stop   = round(price - 1.5 * atr, 8)
+                        stop   = max(round(price - 1.5 * atr, 8), 0.000001)
                         target = round(price + 3.0 * atr, 8)
                     else:
                         stop   = round(price + 1.5 * atr, 8)
-                        target = round(price - 3.0 * atr, 8)
+                        target = max(round(price - 3.0 * atr, 8), 0.000001)
                     _log_backtest_setup(sym, direction, price, stop, target,
                                         'Citadel Report', timeframe=tf, notes=sigs[:120])
                     print(f'[CITADEL] Logged {sym} {direction} E:{price} S:{stop} T:{target} ATR:{atr}')
@@ -1370,18 +1370,20 @@ def citadel_report():
             price_s  = fmt_price(s['price'])
             ema_s    = ('{:+.1f}% vs 200 EMA'.format(s['ema'])) if s['ema'] is not None else 'EMA200: N/A'
             sig_list = [sg.strip() for sg in s['sigs'].split(',') if sg.strip()]
-            sig_section = nl.join(make_sig_slot(sg) for sg in sig_list[:6])
-
+            vol_str  = (' | Vol: ' + '{:.2f}x'.format(s['vol'])) if s.get('vol') else ''
             header_line = sep + ' ' + str(i) + '. ' + s['sym'] + ' ' + sep
-            vol_str     = (' | Vol: ' + '{:.2f}x'.format(s['vol'])) if s.get('vol') else ''
             meta_line   = 'Price: ' + price_s + ' | ' + s['direction'] + ' | Score: ' + str(s['score']) + ' | ' + ema_s + vol_str
             levels      = ('ENTRY:  ' + price_s + nl +
-                           'STOP:   ' + stop_s  + '  (1.5x ATR — cushion for normal volatility)' + nl +
-                           'TARGET: ' + target_s + '  (3x ATR — minimum 2:1 reward to risk)' + nl +
+                           'STOP:   ' + stop_s  + '  (1.5x ATR)' + nl +
+                           'TARGET: ' + target_s + '  (3x ATR, 2:1 R:R)' + nl +
                            'R:R:    ' + rr_s)
-            verdict     = 'VERDICT: [FILL: TAKE IT / WATCH IT / SKIP IT — then one sentence reason]'
-
-            block = nl.join([header_line, meta_line, levels, '', 'SIGNALS:', sig_section, verdict, ''])
+            verdict = 'VERDICT: [FILL: TAKE IT / WATCH IT / SKIP IT — one sentence reason]'
+            if i <= 5:
+                sig_section = nl.join(make_sig_slot(sg) for sg in sig_list[:4])
+                block = nl.join([header_line, meta_line, levels, '', 'SIGNALS:', sig_section, verdict, ''])
+            else:
+                sigs_inline = ', '.join(sig_list[:4])
+                block = nl.join([header_line, meta_line, levels, 'Signals: ' + sigs_inline, verdict, ''])
             template_blocks.append(block)
 
         market_slot = ('[EXPLAIN: 2-3 sentences — what does it mean when ' + str(count) +
@@ -1409,8 +1411,8 @@ def citadel_report():
                       'models/gemini-2.5-flash:generateContent?key=' + gemini_key)
         gemini_resp = requests.post(gemini_url, json={
             'contents': [{'parts': [{'text': prompt}]}],
-            'generationConfig': {'maxOutputTokens': 3000, 'temperature': 0.4}
-        }, timeout=60)
+            'generationConfig': {'maxOutputTokens': 8000, 'temperature': 0.4}
+        }, timeout=90)
 
         if not gemini_resp.ok:
             return jsonify({'error': 'Gemini error: ' + gemini_resp.text[:200]}), 500
