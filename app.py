@@ -1746,7 +1746,7 @@ def crypto():
         return jsonify({})
 
     interval = request.args.get('interval', '1d')
-    limit = int(request.args.get('limit', '210'))
+    limit = int(request.args.get('limit', '300'))
 
     # Normalize intervals per exchange
     kucoin_interval = {'1w': '1week', '4h': '4hour', '1d': '1day'}.get(interval, '1day')
@@ -1756,7 +1756,26 @@ def crypto():
     print(f'[CRYPTO] {len(symbols)} symbols | interval={interval} kucoin={kucoin_interval} binance={binance_interval} okx={okx_bar}')
 
     def fetch_one_crypto(sym):
-        # ── 1. KuCoin FIRST — most reliable from Railway/cloud IPs ──
+        # ── For weekly: try OKX first (returns 300 bars in one call) ──
+        if interval == '1w':
+            try:
+                url_okx_w = f'https://www.okx.com/api/v5/market/history-candles?instId={sym}-USDT&bar=1W&limit=300'
+                r_okx = requests.get(url_okx_w, headers=HEADERS, timeout=10)
+                if r_okx.ok:
+                    raw = r_okx.json().get('data', [])
+                    if raw and len(raw) >= 50:
+                        klines = []
+                        for c in reversed(raw):
+                            try:
+                                klines.append([int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])])
+                            except Exception:
+                                continue
+                        if len(klines) >= 50:
+                            return sym, {'klines': klines, 'type': 'crypto', 'source': 'okx_weekly'}
+            except Exception as e:
+                print(f'[CRYPTO] OKX weekly {sym} error: {e}')
+
+        # ── 1. KuCoin — reliable from Railway/cloud IPs ──
         try:
             end_ts = int(time.time())
             secs = {'1week': 604800, '1day': 86400, '4hour': 14400}.get(kucoin_interval, 86400)
