@@ -26,6 +26,11 @@ def _store_load():
             rec = r.json().get('record', {})
             setups  = rec.get('setups', [])
             reports = rec.get('reports', {})
+            # JSONBin may return [] if bin was init'd wrong — force to dict
+            if not isinstance(reports, dict):
+                reports = {}
+            if not isinstance(setups, list):
+                setups = []
             print(f'[STORE] Loaded: {len(setups)} setups, {len(reports)} reports')
             return reports, setups
         print(f'[STORE] Load failed: {r.status_code} {r.text[:80]}')
@@ -44,21 +49,23 @@ def _store_save():
     except Exception as e:
         print(f'[STORE] Save error: {e}')
 
-# ── In-memory stores — populated from JSONBin on startup ─────
+# ── In-memory stores — loaded lazily on first request ────────
 import uuid as _uuid
 _reports         = {}
 _backtest_setups = []
 
 def _sync_from_jsonbin():
-    """Load JSONBin data into in-memory stores."""
-    rpts, setups = _store_load()
-    _reports.update(rpts)
-    with _backtest_lock:
-        if setups:
-            _backtest_setups.clear()
-            _backtest_setups.extend(setups)
-
-_sync_from_jsonbin()
+    """Load JSONBin data into in-memory stores (safe to call multiple times)."""
+    try:
+        rpts, setups = _store_load()
+        _reports.update(rpts)
+        with _backtest_lock:
+            if setups:
+                _backtest_setups.clear()
+                _backtest_setups.extend(setups)
+        print(f'[STORE] Sync complete: {len(_backtest_setups)} setups, {len(_reports)} reports')
+    except Exception as e:
+        print(f'[STORE] Sync error (non-fatal): {e}')
 
 def _log_backtest_setup(symbol, direction, entry, stop, target, source, timeframe='1H', notes=''):
     """Log an AI-generated setup to the backtest store."""
@@ -108,22 +115,28 @@ def _sync_store_once():
 @app.route('/debug/store')
 def debug_store():
     """Show current state of in-memory store and JSONBin."""
-    # Also try a fresh load from JSONBin
     rpts, setups = _store_load()
     return jsonify({
-        'memory': {
-            'setups': len(_backtest_setups),
-            'reports': list(_reports.keys()),
-        },
-        'jsonbin_live': {
-            'setups': len(setups),
-            'reports': list(rpts.keys()),
-        },
+        'memory': {'setups': len(_backtest_setups), 'reports': list(_reports.keys())},
+        'jsonbin_live': {'setups': len(setups), 'reports': list(rpts.keys())},
         'config': {
-            'bin_id': _JSONBIN_BIN_ID[:8] + '...' if _JSONBIN_BIN_ID else 'NOT SET',
+            'bin_id':  _JSONBIN_BIN_ID[:8]  + '...' if _JSONBIN_BIN_ID  else 'NOT SET',
             'api_key': _JSONBIN_API_KEY[:8] + '...' if _JSONBIN_API_KEY else 'NOT SET',
         }
     })
+
+@app.route('/debug/reset-bin')
+def debug_reset_bin():
+    """Write correct empty structure to JSONBin to fix corrupted bin."""
+    if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
+        return jsonify({'error': 'No JSONBin config'}), 500
+    try:
+        import requests as req
+        r = req.put(_JSONBIN_URL, headers=_JSONBIN_HEADERS,
+                    json={'setups': [], 'reports': {}}, timeout=15)
+        return jsonify({'status': 'OK' if r.ok else 'FAILED', 'code': r.status_code, 'body': r.text[:200]})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # ── Telegram config (set via environment variables on Render) ─
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
