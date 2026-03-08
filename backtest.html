@@ -73,9 +73,9 @@
 
     function StatCard({label, value, color='#e0e0e0', sub}) {
       return h('div',{style:{background:'#0a0a14',border:'1px solid #1a1a2e',padding:'12px 10px',textAlign:'center'}},
-        h('div',{style:{fontSize:'8px',color:'#444',letterSpacing:'2px',marginBottom:'5px'}}, label),
+        h('div',{style:{fontSize:'8px',color:'#aaa',letterSpacing:'2px',marginBottom:'5px'}}, label),
         h('div',{style:{fontSize:'16px',color,fontFamily:"'Orbitron',monospace",fontWeight:900}}, value),
-        sub && h('div',{style:{fontSize:'9px',color:'#444',marginTop:'3px'}}, sub)
+        sub && h('div',{style:{fontSize:'9px',color:'#aaa',marginTop:'3px'}}, sub)
       );
     }
 
@@ -91,9 +91,9 @@
         h('div',{style:{display:'flex',alignItems:'center',gap:'8px',marginBottom:'10px',flexWrap:'wrap'}},
           h('span',{style:{fontFamily:"'Orbitron',monospace",fontSize:'14px',fontWeight:700,color:'#fff'}}, s.symbol),
           h('span',{style:{fontSize:'9px',color:DIR_COLOR[s.direction],border:`1px solid ${DIR_COLOR[s.direction]}44`,padding:'1px 7px'}}, s.direction),
-          h('span',{style:{fontSize:'9px',color:'#444',background:'#111',padding:'1px 7px'}}, s.source),
-          h('span',{style:{fontSize:'9px',color:'#555',padding:'1px 5px',border:'1px solid #1a1a2e'}}, s.timeframe),
-          h('span',{style:{fontSize:'9px',color:'#333',flex:1}}, fmtDate(s.createdAt)),
+          h('span',{style:{fontSize:'9px',color:'#bbb',background:'#111',padding:'1px 7px'}}, s.source),
+          h('span',{style:{fontSize:'9px',color:'#aaa',padding:'1px 5px',border:'1px solid #2a2a3e'}}, s.timeframe),
+          h('span',{style:{fontSize:'9px',color:'#888',flex:1}}, fmtDate(s.createdAt)),
           // P&L badge — always shown (live for open, final for closed)
           pnl!=null && h('span',{style:{
             fontSize:'12px',fontWeight:700,color:pnlColor,
@@ -112,12 +112,12 @@
                ['NOW',    s.currentPrice?`$${fmt(s.currentPrice)}`:'…', '#00d4ff'],
           ].map(([label,val,color])=>
             h('div',{key:label},
-              h('div',{style:{fontSize:'8px',color:'#444',letterSpacing:'1px',marginBottom:'2px'}}, label),
+              h('div',{style:{fontSize:'8px',color:'#aaa',letterSpacing:'1px',marginBottom:'2px'}}, label),
               h('div',{style:{fontSize:'12px',color}}, val)
             )
           ),
           h('div',{style:{display:'flex',gap:'5px'}},
-            isOpen && h('button',{onClick:()=>onExpire(s.id),style:{background:'transparent',border:'1px solid #333',color:'#555',fontSize:'9px',padding:'3px 7px'}}, 'EXPIRE'),
+            isOpen && h('button',{onClick:()=>onExpire(s.id),style:{background:'transparent',border:'1px solid #444',color:'#aaa',fontSize:'9px',padding:'3px 7px'}}, 'EXPIRE'),
             h('button',{onClick:()=>onDelete(s.id),style:{background:'transparent',border:'1px solid #ff444433',color:'#ff444488',fontSize:'9px',padding:'3px 7px'}}, 'DEL')
           )
         ),
@@ -125,9 +125,9 @@
         // Progress bar (open only)
         isOpen && prog!=null && h('div',{style:{marginTop:'10px'}},
           h('div',{style:{display:'flex',justifyContent:'space-between',fontSize:'9px',marginBottom:'4px'}},
-            h('span',{style:{color:'#555'}}, `STOP $${fmt(s.stop)}`),
+            h('span',{style:{color:'#aaa'}}, `STOP $${fmt(s.stop)}`),
             h('span',{style:{color:prog>66?'#00ff88':prog>33?'#f0c040':'#ff4444',fontWeight:700}}, `${prog.toFixed(0)}% toward target`),
-            h('span',{style:{color:'#555'}}, `TARGET $${fmt(s.target)}`)
+            h('span',{style:{color:'#aaa'}}, `TARGET $${fmt(s.target)}`)
           ),
           h('div',{style:{height:'4px',background:'#1a1a2e',borderRadius:'2px'}},
             h('div',{style:{height:'100%',width:`${prog}%`,background:prog>66?'#00ff88':prog>33?'#f0c040':'#ff4444',borderRadius:'2px',transition:'width 0.5s'}})
@@ -139,7 +139,7 @@
           `${calcFinalPnl(s)>=0?'▲':'▼'} ${fmtPct(calcFinalPnl(s))}${s.closePrice?` @ $${fmt(s.closePrice)}`:''}${s.closedAt?` · ${fmtDate(s.closedAt)}`:''}`
         ),
 
-        s.notes && h('div',{style:{marginTop:'6px',fontSize:'9px',color:'#333',fontStyle:'italic',wordBreak:'break-word'}}, s.notes)
+        s.notes && h('div',{style:{marginTop:'6px',fontSize:'9px',color:'#888',fontStyle:'italic',wordBreak:'break-word'}}, s.notes)
       );
     }
 
@@ -219,9 +219,9 @@
       const winRate = closed.length ? wins.length/closed.length*100 : null;
 
       const allPnls    = setups.map(calcPnl).filter(p=>p!=null);
-      const totalPnl   = allPnls.reduce((a,b)=>a+b,0);
+      const totalPnl   = allPnls.length ? allPnls.reduce((a,b)=>a+b,0)/allPnls.length : 0;
       const openPnls   = open.map(calcLivePnl).filter(p=>p!=null);
-      const openPnlSum = openPnls.reduce((a,b)=>a+b,0);
+      const openPnlSum = openPnls.length ? openPnls.reduce((a,b)=>a+b,0)/openPnls.length : 0;
       const allRR      = setups.map(calcRR).filter(Boolean).map(Number);
       const avgRR      = allRR.length?(allRR.reduce((a,b)=>a+b)/allRR.length).toFixed(2):null;
 
