@@ -1773,7 +1773,11 @@ def view_report(report_id):
 </head>
 <body>
   <div style="max-width:860px;margin:0 auto">
-    <a href="/reports" class="back-link">← ALL REPORTS</a>
+    <div style="display:flex;gap:8px;margin-bottom:24px;flex-wrap:wrap">
+      <a href="/reports" class="back-link">← ALL REPORTS</a>
+      <a href="/backtest" class="back-link">📊 BACKTEST</a>
+      <a href="https://bukame001-commits.github.io/apex-scanner/" class="back-link">⚡ SCANNER</a>
+    </div>
 
     <div class="report-header">
       <div class="report-title">⚔ CITADEL REPORT</div>
@@ -1841,7 +1845,11 @@ def reports_index():
 </head>
 <body>
   <div style="max-width:860px;margin:0 auto">
-    <div class="page-title">⚔ CITADEL REPORTS</div>
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:20px">
+      <div class="page-title" style="margin-bottom:0">⚔ CITADEL REPORTS</div>
+      <a href="/backtest" style="font-size:9px;color:#888;text-decoration:none;border:1px solid #2a2a3e;padding:4px 12px;letter-spacing:1px;font-family:Share Tech Mono,monospace">📊 BACKTEST</a>
+      <a href="https://bukame001-commits.github.io/apex-scanner/" style="font-size:9px;color:#888;text-decoration:none;border:1px solid #2a2a3e;padding:4px 12px;letter-spacing:1px;font-family:Share Tech Mono,monospace">⚡ SCANNER</a>
+    </div>
     {rows}
   </div>
 </body>

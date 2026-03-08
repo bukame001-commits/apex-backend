@@ -239,7 +239,11 @@
 
         P({display:'flex',alignItems:'flex-start',justifyContent:'space-between',borderBottom:'1px solid #1a1a2e',paddingBottom:'14px',marginBottom:'20px'},
           P({},
-            P({fontFamily:"'Orbitron',monospace",fontSize:'18px',fontWeight:900,color:'#00d4ff',letterSpacing:'4px'}, '⚔ APEX BACKTEST'),
+            P({display:'flex',alignItems:'center',gap:'12px'},
+              P({fontFamily:"'Orbitron',monospace",fontSize:'18px',fontWeight:900,color:'#00d4ff',letterSpacing:'4px'}, '⚔ APEX BACKTEST'),
+              h('a',{href:'/reports',style:{fontSize:'9px',color:'#888',textDecoration:'none',border:'1px solid #2a2a3e',padding:'3px 10px',letterSpacing:'1px'}},'📋 REPORTS'),
+              h('a',{href:'https://bukame001-commits.github.io/apex-scanner/',style:{fontSize:'9px',color:'#888',textDecoration:'none',border:'1px solid #2a2a3e',padding:'3px 10px',letterSpacing:'1px'}},'⚡ SCANNER')
+            ),
             P({fontSize:'9px',color:'#444',letterSpacing:'2px',marginTop:'3px'}, 'LIVE PRICE vs ENTRY · ALL TIMEFRAMES (1W / 1D / 4H) · 60s REFRESH')
           ),
           P({textAlign:'right'},
