@@ -3,8 +3,7 @@ import csv
 import io
 import time
 import threading
-
-# ── Backtest store — JSONBin.io persistent storage + in-memory cache ──
+import requests
 import json as _json
 
 _backtest_lock = threading.Lock()
@@ -76,7 +75,6 @@ def _log_backtest_setup(symbol, direction, entry, stop, target, source, timefram
         _save_backtest(_backtest_setups)
     print(f'[BACKTEST] Logged: {symbol} {direction} E:{entry} S:{stop} T:{target} ({source})')
 
-import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -1667,7 +1665,7 @@ def view_report(report_id):
 
     .market-overview{{background:rgba(0,212,255,0.04);border:1px solid rgba(0,212,255,0.15);border-left:3px solid #00d4ff;padding:20px;margin-bottom:32px;border-radius:2px}}
     .market-overview h2{{font-family:'Orbitron',monospace;font-size:11px;color:#00d4ff;letter-spacing:3px;margin-bottom:12px}}
-    .market-overview p{{font-size:13px;color:#aaa;line-height:1.8;margin-bottom:8px}}
+    .market-overview p{{font-size:14px;color:#ccc;line-height:1.9;margin-bottom:10px}}
 
     .setups-grid{{display:flex;flex-direction:column;gap:20px;max-width:860px;margin:0 auto}}
 
@@ -1675,30 +1673,30 @@ def view_report(report_id):
     .setup-card:hover{{border-color:#2a2a4e}}
 
     .card-header{{display:flex;align-items:center;gap:10px;padding:16px 18px 12px;border-bottom:1px solid #111120;flex-wrap:wrap}}
-    .card-symbol{{font-family:'Orbitron',monospace;font-size:20px;font-weight:900;color:#fff;flex:1;min-width:60px}}
-    .card-dir{{font-size:10px;font-weight:700;padding:3px 10px;border:1px solid;letter-spacing:2px;border-radius:2px}}
-    .card-score{{font-size:11px;color:#f0c040;letter-spacing:1px}}
-    .card-tf{{font-size:9px;color:#333;border:1px solid #1a1a2e;padding:2px 7px;letter-spacing:1px}}
+    .card-symbol{{font-family:'Orbitron',monospace;font-size:22px;font-weight:900;color:#fff;flex:1;min-width:60px}}
+    .card-dir{{font-size:11px;font-weight:700;padding:4px 12px;border:1px solid;letter-spacing:2px;border-radius:2px}}
+    .card-score{{font-size:13px;color:#f0c040;letter-spacing:1px}}
+    .card-tf{{font-size:10px;color:#888;border:1px solid #2a2a3e;padding:3px 9px;letter-spacing:1px}}
 
     .levels-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:#111120}}
     .level-box{{background:#0a0a14;padding:12px 14px}}
-    .level-label{{font-size:8px;color:#333;letter-spacing:2px;margin-bottom:4px}}
-    .level-val{{font-size:13px;color:#e0e0e0;font-weight:700}}
+    .level-label{{font-size:9px;color:#888;letter-spacing:2px;margin-bottom:5px;text-transform:uppercase}}
+    .level-val{{font-size:14px;color:#fff;font-weight:700}}
 
     .ctx-section{{padding:14px 18px;border-top:1px solid #111120;display:flex;flex-direction:column;gap:10px}}
     .ctx-bar-wrap{{display:flex;align-items:center;gap:10px}}
-    .ctx-bar-label{{font-size:9px;color:#444;letter-spacing:1px;min-width:80px}}
-    .ctx-bar-track{{flex:1;height:4px;background:#1a1a2e;border-radius:2px;overflow:hidden}}
-    .ctx-bar-fill{{height:100%;border-radius:2px;transition:width 0.5s}}
-    .ctx-bar-val{{font-size:10px;min-width:100px;text-align:right}}
-    .liq-row{{display:flex;gap:8px;flex-wrap:wrap}}
-    .liq-badge{{font-size:10px;padding:3px 10px;border-radius:2px;border:1px solid}}
-    .liq-long{{border-color:#ff444433;color:#ff4444;background:rgba(255,68,68,0.06)}}
-    .liq-short{{border-color:#00ff8833;color:#00ff88;background:rgba(0,255,136,0.06)}}
-    .vol-badge{{font-size:10px;padding:3px 10px;border-radius:2px;border:1px solid;display:inline-block}}
+    .ctx-bar-label{{font-size:10px;color:#aaa;letter-spacing:1px;min-width:90px}}
+    .ctx-bar-track{{flex:1;height:5px;background:#1a1a2e;border-radius:3px;overflow:hidden}}
+    .ctx-bar-fill{{height:100%;border-radius:3px;transition:width 0.5s}}
+    .ctx-bar-val{{font-size:11px;min-width:110px;text-align:right;font-weight:700}}
+    .liq-row{{display:flex;gap:8px;flex-wrap:wrap;margin-top:2px}}
+    .liq-badge{{font-size:11px;padding:4px 12px;border-radius:2px;border:1px solid}}
+    .liq-long{{border-color:#ff444455;color:#ff6666;background:rgba(255,68,68,0.08)}}
+    .liq-short{{border-color:#00ff8855;color:#00ff88;background:rgba(0,255,136,0.08)}}
+    .vol-badge{{font-size:11px;padding:4px 12px;border-radius:2px;border:1px solid;display:inline-block;margin-top:2px}}
 
     .analysis-section{{padding:18px;border-top:1px solid #111120}}
-    .analysis-p{{font-size:12px;color:#888;line-height:1.9;margin-bottom:10px}}
+    .analysis-p{{font-size:13px;color:#bbb;line-height:1.9;margin-bottom:10px}}
     .analysis-p:last-child{{margin-bottom:0}}
 
     .verdict-line{{font-size:13px;font-weight:700;padding:10px 18px;border-top:1px solid #111120}}
@@ -1706,7 +1704,7 @@ def view_report(report_id):
     .verdict-watch{{color:#f0c040;background:rgba(240,192,64,0.05)}}
     .verdict-skip{{color:#ff4444;background:rgba(255,68,68,0.05)}}
 
-    .back-link{{display:inline-block;margin-bottom:24px;font-size:11px;color:#444;text-decoration:none;letter-spacing:2px;border:1px solid #1a1a2e;padding:6px 14px}}
+    .back-link{{display:inline-block;margin-bottom:24px;font-size:11px;color:#888;text-decoration:none;letter-spacing:2px;border:1px solid #2a2a3e;padding:6px 14px}}
     .back-link:hover{{color:#00d4ff;border-color:#00d4ff}}
   </style>
 </head>
