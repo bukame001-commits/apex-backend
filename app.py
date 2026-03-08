@@ -13,41 +13,44 @@ _JSONBIN_BIN_ID  = os.environ.get('JSONBIN_BIN_ID', '')
 _JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY', '')
 _JSONBIN_URL     = f'https://api.jsonbin.io/v3/b/{_JSONBIN_BIN_ID}'
 
-def _load_backtest():
-    """Load setups from JSONBin."""
+def _jsonbin_load():
+    """Load full store {setups, reports} from JSONBin."""
     if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
-        print('[BACKTEST] No JSONBin config — using in-memory only')
-        return []
+        print('[STORE] No JSONBin config — using in-memory only')
+        return {}, []
     try:
         r = requests.get(_JSONBIN_URL + '/latest',
-            headers={'X-Master-Key': _JSONBIN_API_KEY}, timeout=10)
+            headers={'X-Master-Key': _JSONBIN_API_KEY}, timeout=15)
         if r.ok:
             data = r.json().get('record', {})
-            setups = data.get('setups', [])
-            print(f'[BACKTEST] Loaded {len(setups)} setups from JSONBin')
-            return setups
+            setups  = data.get('setups', [])
+            reports = data.get('reports', {})
+            print(f'[STORE] Loaded {len(setups)} setups, {len(reports)} reports from JSONBin')
+            return reports, setups
         else:
-            print(f'[BACKTEST] JSONBin load error: {r.status_code}')
+            print(f'[STORE] JSONBin load error: {r.status_code} {r.text[:100]}')
     except Exception as e:
-        print(f'[BACKTEST] JSONBin load error: {e}')
-    return []
+        print(f'[STORE] JSONBin load error: {e}')
+    return {}, []
 
-def _save_backtest(setups):
-    """Persist setups to JSONBin."""
+def _jsonbin_save():
+    """Persist full store to JSONBin."""
     if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
         return
     try:
-        requests.put(_JSONBIN_URL,
+        payload = {'setups': _backtest_setups, 'reports': _reports}
+        r = requests.put(_JSONBIN_URL,
             headers={'X-Master-Key': _JSONBIN_API_KEY, 'Content-Type': 'application/json'},
-            json={'setups': setups}, timeout=10)
+            json=payload, timeout=15)
+        if not r.ok:
+            print(f'[STORE] JSONBin save error: {r.status_code} {r.text[:100]}')
     except Exception as e:
-        print(f'[BACKTEST] JSONBin save error: {e}')
+        print(f'[STORE] JSONBin save error: {e}')
 
-_backtest_setups = _load_backtest()
-
-# ── Report store — in-memory (persists until redeploy) ────────
+# ── Initialise both stores from JSONBin on startup ───────────
 import uuid as _uuid
-_reports = {}   # report_id -> report dict
+_reports, _initial_setups = _jsonbin_load()
+_backtest_setups = _initial_setups
 
 def _log_backtest_setup(symbol, direction, entry, stop, target, source, timeframe='1H', notes=''):
     """Log an AI-generated setup to the backtest store."""
@@ -72,7 +75,7 @@ def _log_backtest_setup(symbol, direction, entry, stop, target, source, timefram
         _backtest_setups.insert(0, setup)
         if len(_backtest_setups) > 500:
             _backtest_setups.pop()
-        _save_backtest(_backtest_setups)
+        _jsonbin_save()
     print(f'[BACKTEST] Logged: {symbol} {direction} E:{entry} S:{stop} T:{target} ({source})')
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1495,7 +1498,8 @@ def citadel_report():
             'analysis':  filled,
             'url':       report_url,
         }
-        print(f'[CITADEL] Report saved: {report_id}')
+        _jsonbin_save()
+        print(f'[CITADEL] Report saved to JSONBin: {report_id}')
 
         # Step 5: Send short Telegram notification with link
         tg_token = os.environ.get('TELEGRAM_BOT_TOKEN', '') or TELEGRAM_BOT_TOKEN
@@ -1825,7 +1829,7 @@ def backtest_get_setups():
                             stored['status']     = setup['status']
                             stored['closedAt']   = setup['closedAt']
                             stored['closePrice'] = setup['closePrice']
-                    _save_backtest(_backtest_setups)
+                    _jsonbin_save()
         result.append(setup)
     return jsonify({'setups': result, 'total': len(result)})
 
@@ -1836,7 +1840,7 @@ def backtest_delete():
     sid = data.get('id')
     before = len(_backtest_setups)
     _backtest_setups[:] = [s for s in _backtest_setups if s['id'] != sid]
-    _save_backtest(_backtest_setups)
+    _jsonbin_save()
     return jsonify({'deleted': before - len(_backtest_setups)})
 
 @app.route('/backtest/expire', methods=['POST'])
@@ -1848,7 +1852,7 @@ def backtest_expire():
         if s['id'] == sid:
             s['status'] = 'EXPIRED'
             s['closedAt'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    _save_backtest(_backtest_setups)
+    _jsonbin_save()
     return jsonify({'ok': True})
 
 # ── Backtest UI page ─────────────────────────────────────────
