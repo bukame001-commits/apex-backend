@@ -104,6 +104,27 @@ def _sync_store_once():
         _sync_from_jsonbin()
         print(f'[WORKER] Synced: {len(_backtest_setups)} setups, {len(_reports)} reports')
 
+# ── Debug endpoint ───────────────────────────────────────────
+@app.route('/debug/store')
+def debug_store():
+    """Show current state of in-memory store and JSONBin."""
+    # Also try a fresh load from JSONBin
+    rpts, setups = _store_load()
+    return jsonify({
+        'memory': {
+            'setups': len(_backtest_setups),
+            'reports': list(_reports.keys()),
+        },
+        'jsonbin_live': {
+            'setups': len(setups),
+            'reports': list(rpts.keys()),
+        },
+        'config': {
+            'bin_id': _JSONBIN_BIN_ID[:8] + '...' if _JSONBIN_BIN_ID else 'NOT SET',
+            'api_key': _JSONBIN_API_KEY[:8] + '...' if _JSONBIN_API_KEY else 'NOT SET',
+        }
+    })
+
 # ── Telegram config (set via environment variables on Render) ─
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
