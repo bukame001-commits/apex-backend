@@ -85,6 +85,23 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
+_worker_synced = False
+
+@app.before_request
+def _sync_store_once():
+    """Each Gunicorn worker loads from JSONBin on its first request."""
+    global _worker_synced
+    if not _worker_synced:
+        _worker_synced = True
+        print('[WORKER] First request — syncing from JSONBin')
+        fresh_reports, fresh_setups = _jsonbin_load()
+        _reports.update(fresh_reports)
+        with _backtest_lock:
+            if fresh_setups:
+                _backtest_setups.clear()
+                _backtest_setups.extend(fresh_setups)
+        print(f'[WORKER] Synced: {len(_backtest_setups)} setups, {len(_reports)} reports')
+
 # ── Telegram config (set via environment variables on Render) ─
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
@@ -1807,6 +1824,15 @@ def reports_index():
 @app.route('/backtest/setups', methods=['GET'])
 def backtest_get_setups():
     """Return all logged setups with current price evaluation."""
+    # Multi-worker fix: if memory is empty, reload from JSONBin
+    if not _backtest_setups:
+        print('[BACKTEST] Memory empty — reloading from JSONBin')
+        fresh_reports, fresh_setups = _jsonbin_load()
+        _reports.update(fresh_reports)
+        with _backtest_lock:
+            if fresh_setups:
+                _backtest_setups.clear()
+                _backtest_setups.extend(fresh_setups)
     # Fetch current prices for open setups
     open_syms = list({s['symbol'] for s in _backtest_setups if s['status'] == 'OPEN'})
     prices = {}
