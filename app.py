@@ -8,44 +8,102 @@ import json as _json
 
 _backtest_lock = threading.Lock()
 
-# JSONBin config — set JSONBIN_BIN_ID and JSONBIN_API_KEY in Railway env vars
-_JSONBIN_BIN_ID  = os.environ.get('JSONBIN_BIN_ID', '')
-_JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY', '')
-_JSONBIN_URL     = f'https://api.jsonbin.io/v3/b/{_JSONBIN_BIN_ID}'
+# JSONBin config — set in Railway env vars
+# Strip non-ASCII characters that can sneak in when copy-pasting keys from browser
+def _clean(s): return ''.join(c for c in (s or '') if ord(c) < 128).strip()
+_JSONBIN_BIN_ID      = _clean(os.environ.get('JSONBIN_BIN_ID', ''))
+_JSONBIN_REPORTS_ID  = _clean(os.environ.get('JSONBIN_REPORTS_BIN_ID', ''))
+_JSONBIN_API_KEY     = _clean(os.environ.get('JSONBIN_API_KEY', ''))
+_JSONBIN_URL         = f'https://api.jsonbin.io/v3/b/{_JSONBIN_BIN_ID}'
+_JSONBIN_REPORTS_URL = f'https://api.jsonbin.io/v3/b/{_JSONBIN_REPORTS_ID}'
+print(f'[STORE] JSONBin config — BIN:{_JSONBIN_BIN_ID[:8]}... KEY:{_JSONBIN_API_KEY[:8]}...')
 
 def _jsonbin_load():
-    """Load full store {setups, reports} from JSONBin."""
-    if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
-        print('[STORE] No JSONBin config — using in-memory only')
-        return {}, []
-    try:
-        r = requests.get(_JSONBIN_URL + '/latest',
-            headers={'X-Master-Key': _JSONBIN_API_KEY}, timeout=15)
-        if r.ok:
-            data = r.json().get('record', {})
-            setups  = data.get('setups', [])
-            reports = data.get('reports', {})
-            print(f'[STORE] Loaded {len(setups)} setups, {len(reports)} reports from JSONBin')
-            return reports, setups
-        else:
-            print(f'[STORE] JSONBin load error: {r.status_code} {r.text[:100]}')
-    except Exception as e:
-        print(f'[STORE] JSONBin load error: {e}')
-    return {}, []
+    """Load setups from main bin, reports from reports bin (or main bin fallback)."""
+    setups = []
+    reports = {}
+    # Load setups
+    if _JSONBIN_BIN_ID and _JSONBIN_API_KEY:
+        try:
+            r = requests.get(_JSONBIN_URL + '/latest',
+                headers={'X-Master-Key': _JSONBIN_API_KEY}, timeout=15)
+            if r.ok:
+                data = r.json().get('record', {})
+                setups = data.get('setups', [])
+                print(f'[STORE] Loaded {len(setups)} setups from JSONBin')
+            else:
+                print(f'[STORE] Setups load error: {r.status_code}')
+        except Exception as e:
+            print(f'[STORE] Setups load error: {e}')
+    # Load reports — prefer dedicated bin, fallback to main bin
+    reports_url = _JSONBIN_REPORTS_URL if _JSONBIN_REPORTS_ID else (_JSONBIN_URL if _JSONBIN_BIN_ID else None)
+    if reports_url and _JSONBIN_API_KEY:
+        try:
+            r = requests.get(reports_url + '/latest',
+                headers={'X-Master-Key': _JSONBIN_API_KEY}, timeout=15)
+            if r.ok:
+                data = r.json().get('record', {})
+                reports = data.get('reports', data if isinstance(data, dict) and 'id' not in data else {})
+                print(f'[STORE] Loaded {len(reports)} reports from JSONBin')
+            else:
+                print(f'[STORE] Reports load error: {r.status_code}')
+        except Exception as e:
+            print(f'[STORE] Reports load error: {e}')
+    return reports, setups
 
-def _jsonbin_save():
-    """Persist full store to JSONBin."""
+def _jsonbin_save_setups():
+    """Persist backtest setups to main JSONBin bin."""
     if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
         return
     try:
-        payload = {'setups': _backtest_setups, 'reports': _reports}
+        payload = {'setups': _backtest_setups[:200]}
         r = requests.put(_JSONBIN_URL,
             headers={'X-Master-Key': _JSONBIN_API_KEY, 'Content-Type': 'application/json'},
             json=payload, timeout=15)
-        if not r.ok:
-            print(f'[STORE] JSONBin save error: {r.status_code} {r.text[:100]}')
+        print(f'[STORE] Setups save {"OK" if r.ok else "FAILED: " + str(r.status_code)}')
     except Exception as e:
-        print(f'[STORE] JSONBin save error: {e}')
+        print(f'[STORE] Setups save error: {e}')
+
+def _jsonbin_save_reports():
+    """Persist reports to reports bin (or main bin if no dedicated reports bin)."""
+    if not _JSONBIN_API_KEY:
+        return
+    save_url = _JSONBIN_REPORTS_URL if _JSONBIN_REPORTS_ID else (_JSONBIN_URL if _JSONBIN_BIN_ID else None)
+    if not save_url:
+        print('[STORE] WARN: No JSONBin config for reports!')
+        return
+    try:
+        # Keep full analysis — it's only one bin for reports
+        payload = {'reports': _reports}
+        size = len(_json.dumps(payload))
+        print(f'[STORE] Saving {len(_reports)} reports to JSONBin (~{size//1024}KB)')
+        r = requests.put(save_url,
+            headers={'X-Master-Key': _JSONBIN_API_KEY, 'Content-Type': 'application/json'},
+            json=payload, timeout=20)
+        print(f'[STORE] Reports save {"OK" if r.ok else "FAILED: " + str(r.status_code) + " " + r.text[:100]}')
+    except Exception as e:
+        print(f'[STORE] Reports save error: {e}')
+
+def _jsonbin_save():
+    """Save both setups and reports."""
+    _jsonbin_save_setups()
+    if _JSONBIN_REPORTS_ID:
+        _jsonbin_save_reports()
+    else:
+        # No separate reports bin — save reports into main bin too
+        if _JSONBIN_BIN_ID and _JSONBIN_API_KEY:
+            try:
+                reports_slim = {}
+                for rid, rpt in _reports.items():
+                    reports_slim[rid] = {k: v for k, v in rpt.items() if k != 'analysis'}
+                    reports_slim[rid]['analysis'] = rpt.get('analysis', '')[:3000]
+                payload = {'setups': _backtest_setups[:200], 'reports': reports_slim}
+                r = requests.put(_JSONBIN_URL,
+                    headers={'X-Master-Key': _JSONBIN_API_KEY, 'Content-Type': 'application/json'},
+                    json=payload, timeout=15)
+                print(f'[STORE] Combined save {"OK" if r.ok else "FAILED: " + str(r.status_code)}')
+            except Exception as e:
+                print(f'[STORE] Combined save error: {e}')
 
 # ── Initialise both stores from JSONBin on startup ───────────
 import uuid as _uuid
@@ -1515,9 +1573,10 @@ def citadel_report():
             'analysis':  filled,
             'url':       report_url,
         }
-        print(f'[CITADEL] Report in memory, _reports keys: {list(_reports.keys())}')
-        _jsonbin_save()
-        print(f'[CITADEL] Report saved to JSONBin: {report_id}')
+        print(f'[CITADEL] Report stored in memory. Total reports: {len(_reports)}')
+        # Save reports immediately — use dedicated reports bin if available
+        _jsonbin_save_reports()
+        print(f'[CITADEL] Report persisted to JSONBin: {report_id}')
 
         # Step 5: Send short Telegram notification with link
         tg_token = os.environ.get('TELEGRAM_BOT_TOKEN', '') or TELEGRAM_BOT_TOKEN
