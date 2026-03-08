@@ -1498,6 +1498,7 @@ def citadel_report():
             'analysis':  filled,
             'url':       report_url,
         }
+        print(f'[CITADEL] Report in memory, _reports keys: {list(_reports.keys())}')
         _jsonbin_save()
         print(f'[CITADEL] Report saved to JSONBin: {report_id}')
 
@@ -1537,7 +1538,18 @@ def citadel_report():
 def view_report(report_id):
     r = _reports.get(report_id)
     if not r:
-        return '<h2 style="font-family:monospace;color:#ff4444;padding:40px">Report not found or expired (reports reset on redeploy)</h2>', 404
+        # Not in memory — could be different worker process. Try loading from JSONBin.
+        print(f'[REPORT] {report_id} not in memory, fetching from JSONBin...')
+        fresh_reports, fresh_setups = _jsonbin_load()
+        # Merge into global stores
+        _reports.update(fresh_reports)
+        with _backtest_lock:
+            if fresh_setups and len(fresh_setups) > len(_backtest_setups):
+                _backtest_setups.clear()
+                _backtest_setups.extend(fresh_setups)
+        r = _reports.get(report_id)
+    if not r:
+        return '<h2 style="font-family:monospace;color:#ff4444;padding:40px">Report not found. Please run a new Citadel Report.</h2>', 404
 
     setups = r.get('setups', [])
     coins  = r.get('coins', [])
@@ -1742,6 +1754,10 @@ def view_report(report_id):
 
 @app.route('/reports')
 def reports_index():
+    if not _reports:
+        # Try reloading from JSONBin in case this is a fresh worker
+        fresh_reports, fresh_setups = _jsonbin_load()
+        _reports.update(fresh_reports)
     if not _reports:
         return """<!DOCTYPE html><html><head><meta charset="UTF-8"/>
         <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet"/>
