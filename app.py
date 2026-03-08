@@ -46,6 +46,10 @@ def _save_backtest(setups):
 
 _backtest_setups = _load_backtest()
 
+# ── Report store — in-memory (persists until redeploy) ────────
+import uuid as _uuid
+_reports = {}   # report_id -> report dict
+
 def _log_backtest_setup(symbol, direction, entry, stop, target, source, timeframe='1H', notes=''):
     """Log an AI-generated setup to the backtest store."""
     if not entry or not stop or not target:
@@ -1394,134 +1398,391 @@ def citadel_report():
         if not setups:
             return jsonify({'error': 'No valid setups'}), 400
 
-        # Step 2: Build template — Gemini only fills [EXPLAIN] and [FILL] slots
+        # Step 2: Build rich Gemini prompt — no word limits, full analysis
         nl = chr(10)
-        sep = chr(9473) * 3
-
-        def make_sig_slot(sig_name):
-            line1 = '  ' + sig_name + ':'
-            lname = sig_name.lower()
-            if 'oversold' in lname:
-                direction = 'OVERSOLD (bearish exhaustion — potential reversal UP). NEVER say "not yet overbought".'
-            elif 'overbought' in lname:
-                direction = 'OVERBOUGHT (bullish exhaustion — potential reversal DOWN).'
-            elif 'below 200 ema' in lname:
-                direction = 'price is BELOW the 200 EMA — bearish structural context.'
-            elif 'extended above' in lname or 'above 200 ema' in lname:
-                direction = 'price is ABOVE the 200 EMA — bullish structural context.'
-            elif 'bullish' in lname or 'green dot' in lname:
-                direction = 'BULLISH momentum signal.'
-            elif 'bearish' in lname or 'red dot' in lname:
-                direction = 'BEARISH momentum signal.'
-            else:
-                direction = 'neutral context signal.'
-            line2 = ('  [EXPLAIN: This is a ' + direction +
-                     ' 2 sentences max 40 words. Sentence 1: what it means now. Sentence 2: what trader does. No markdown.]')
-            return line1 + nl + line2 + nl
 
         def fmt_price(p):
             return '$' + '{:,.6g}'.format(p) if p else 'N/A'
+
+        def make_sig_explanation(sig_name):
+            lname = sig_name.lower()
+            if 'oversold' in lname:
+                ctx = 'OVERSOLD signal — bearish exhaustion, potential reversal UP. Never say "not yet overbought".'
+            elif 'overbought' in lname:
+                ctx = 'OVERBOUGHT signal — bullish exhaustion, potential reversal DOWN.'
+            elif 'below 200 ema' in lname:
+                ctx = 'Price BELOW 200 EMA — bearish structural trend context.'
+            elif 'extended above' in lname or 'above 200 ema' in lname:
+                ctx = 'Price ABOVE 200 EMA — bullish structural trend context.'
+            elif 'green dot' in lname or 'bullish' in lname:
+                ctx = 'BULLISH momentum signal.'
+            elif 'red dot' in lname or 'bearish' in lname:
+                ctx = 'BEARISH momentum signal.'
+            elif 'volume spike' in lname:
+                ctx = 'Unusual volume activity — confirms conviction behind price move.'
+            elif 'vwap' in lname:
+                ctx = 'VWAP relationship — institutional reference price.'
+            elif 'bollinger' in lname or 'bb ' in lname:
+                ctx = 'Bollinger Band touch — statistical price extreme.'
+            elif 'stoch' in lname:
+                ctx = 'Stochastic RSI signal — momentum oscillator at extreme.'
+            elif 'obv' in lname:
+                ctx = 'On-balance volume — accumulation/distribution pressure.'
+            elif 'macd' in lname:
+                ctx = 'MACD crossover — trend momentum shift.'
+            else:
+                ctx = 'Technical signal providing market context.'
+            return f'  {sig_name}:\n  [EXPLAIN_{sig_name.replace(" ","_").upper()}: {ctx} Write 3-4 sentences: (1) what the indicator is showing right now, (2) what it means for price direction, (3) what the trader should do, (4) any risk consideration. Be specific to this asset.]'
 
         template_blocks = []
         for i, s in enumerate(setups, 1):
             stop_s   = fmt_price(s['stop'])
             target_s = fmt_price(s['target'])
-            rr_s     = '2:1' if s['stop'] else 'N/A'
             price_s  = fmt_price(s['price'])
-            ema_s    = ('{:+.1f}% vs 200 EMA'.format(s['ema'])) if s['ema'] is not None else 'EMA200: N/A'
+            ema_s    = ('{:+.1f}% vs 200 EMA'.format(s['ema'])) if s['ema'] is not None else 'N/A'
             sig_list = [sg.strip() for sg in s['sigs'].split(',') if sg.strip()]
-            vol_str  = (' | Vol: ' + '{:.2f}x'.format(s['vol'])) if s.get('vol') else ''
-            header_line = sep + ' ' + str(i) + '. ' + s['sym'] + ' ' + sep
-            meta_line   = 'Price: ' + price_s + ' | ' + s['direction'] + ' | Score: ' + str(s['score']) + ' | ' + ema_s + vol_str
-            levels      = ('ENTRY:  ' + price_s + nl +
-                           'STOP:   ' + stop_s  + '  (1.5x ATR)' + nl +
-                           'TARGET: ' + target_s + '  (3x ATR, 2:1 R:R)' + nl +
-                           'R:R:    ' + rr_s)
-            verdict = 'VERDICT: [FILL: TAKE IT / WATCH IT / SKIP IT — one sentence reason]'
-            if i <= 5:
-                sig_section = nl.join(make_sig_slot(sg) for sg in sig_list[:4])
-                block = nl.join([header_line, meta_line, levels, '', 'SIGNALS:', sig_section, verdict, ''])
-            else:
-                sigs_inline = ', '.join(sig_list[:4])
-                block = nl.join([header_line, meta_line, levels, 'Signals: ' + sigs_inline, verdict, ''])
+            vol_str  = (' | Vol: {:.2f}x'.format(s['vol'])) if s.get('vol') else ''
+            meta = f"Price: {price_s} | {s['direction']} | Score: {s['score']} | {ema_s}{vol_str}"
+            levels = f"ENTRY: {price_s} | STOP: {stop_s} (1.5x ATR) | TARGET: {target_s} (3x ATR) | R:R: 2:1"
+            sig_section = nl.join(make_sig_explanation(sg) for sg in sig_list[:6])
+            verdict = 'VERDICT: [FILL_VERDICT: Choose TAKE IT / WATCH IT / SKIP IT and write 2-3 sentences explaining the overall conviction level, key risk, and ideal entry condition.]'
+            block = nl.join([f'━━━ {i}. {s["sym"]} ━━━', meta, levels, '', 'SIGNALS:', sig_section, '', verdict, ''])
             template_blocks.append(block)
 
-        market_slot = ('[EXPLAIN: 2 sentences max, 40 words total — what do these signals across ' + str(count) + ' assets tell us about the current market? No markdown.]')
+        market_overview = f'MARKET OVERVIEW ({count} assets, {timeframe}):\n[FILL_OVERVIEW: Write 3-4 sentences describing the overall market conditions shown by these {count} assets. What themes dominate? Bullish or bearish bias? What should traders watch for?]'
 
         rules = nl.join([
-            'STRICT RULES — you are a template filler, not a free writer:',
-            '- Replace ONLY [EXPLAIN] tags with exactly 2 sentences, max 40 words.',
-            '- Replace ONLY [FILL] tags with: TAKE IT / WATCH IT / SKIP IT + one short sentence.',
-            '- HARD LIMIT: every [EXPLAIN] must be under 40 words. Count carefully.',
-            '- Never say "not yet overbought" for RSI below 50 — say "oversold" if RSI < 40.',
-            '- No asterisks, no bold, no markdown. Never change any number.',
+            'You are the APEX Citadel AI analyst. Write a professional, detailed trading report.',
+            'Rules:',
+            '- Replace each [EXPLAIN_*] tag with 3-4 sentences of specific analysis for that signal.',
+            '- Replace each [FILL_*] tag with the requested content.',
+            '- Be specific to each asset — use the price levels, percentages and signals provided.',
+            '- Never say "not yet overbought" for RSI below 50.',
+            '- No markdown asterisks or hashes. Use plain text only.',
+            '- Never change any numbers provided in the template.',
+            '',
         ])
 
-        prompt = nl.join([
-            rules, '',
-            'MARKET OVERVIEW (' + str(count) + ' assets, ' + timeframe + '):', market_slot, '',
-            'SETUPS:', nl.join(template_blocks),
-            'END OF REPORT'
-        ])
+        prompt = rules + nl + market_overview + nl + nl + 'SETUPS:' + nl + nl.join(template_blocks)
 
-        # Step 3: Gemini fills the template
+        # Step 3: Gemini generates full report
         gemini_url = ('https://generativelanguage.googleapis.com/v1beta/'
                       'models/gemini-2.5-flash:generateContent?key=' + gemini_key)
         gemini_resp = requests.post(gemini_url, json={
             'contents': [{'parts': [{'text': prompt}]}],
-            'generationConfig': {'maxOutputTokens': 8000, 'temperature': 0.4}
-        }, timeout=90)
+            'generationConfig': {'maxOutputTokens': 12000, 'temperature': 0.5}
+        }, timeout=120)
 
         if not gemini_resp.ok:
             return jsonify({'error': 'Gemini error: ' + gemini_resp.text[:200]}), 500
 
         filled = gemini_resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-        # Strip markdown that leaked through
-        for md in ['**', '##', '###', '* ', '*']:
+        for md in ['**', '##', '###']:
             filled = filled.replace(md, '')
 
-        # Step 4: Prepend quick-reference table
-        green  = chr(128994)
-        red    = chr(128308)
-        sword  = chr(9876)
-        star   = chr(10022)
-        ref_lines = [sword + ' CITADEL REPORT — TOP ' + str(count) + ' ASSETS (' + timeframe + ')',
-                     '=' * 36,
-                     'QUICK REF (all setups logged to backtest):']
-        for s in setups:
-            dot = green if s['direction'] == 'LONG' else red
-            vol_tag = ('  ' + '{:.1f}x'.format(s['vol'])) if s.get('vol') else ''
-            ref_lines.append(dot + ' ' + s['sym'] +
-                             '  ' + fmt_price(s['price']) + vol_tag +
-                             '  S:' + fmt_price(s['stop']) +
-                             '  T:' + fmt_price(s['target']) +
-                             '  ' + str(s['score']) + star)
-        ref_lines += ['=' * 36, '']
-        report = nl.join(ref_lines) + nl + filled
+        # Step 4: Save report to store
+        report_id  = time.strftime('%Y%m%d-%H%M') + '-' + _uuid.uuid4().hex[:6]
+        base_url   = os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'web-production-d8201.up.railway.app')
+        if not base_url.startswith('http'):
+            base_url = 'https://' + base_url
+        report_url = base_url + '/report/' + report_id
 
-        # Step 5: Send to Telegram — table first, then analysis in chunks
+        _reports[report_id] = {
+            'id':        report_id,
+            'createdAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            'timeframe': timeframe,
+            'count':     count,
+            'setups':    setups,
+            'coins':     coins_structured,
+            'analysis':  filled,
+            'url':       report_url,
+        }
+        print(f'[CITADEL] Report saved: {report_id}')
+
+        # Step 5: Send short Telegram notification with link
         tg_token = os.environ.get('TELEGRAM_BOT_TOKEN', '') or TELEGRAM_BOT_TOKEN
         tg_chat  = os.environ.get('TELEGRAM_CHAT_ID', '') or TELEGRAM_CHAT_ID
         if tg_token and tg_chat:
             tg_url = 'https://api.telegram.org/bot' + tg_token + '/sendMessage'
-            # Message 1: quick-ref table (always fits — max ~500 chars)
-            requests.post(tg_url, json={'chat_id': tg_chat, 'text': nl.join(ref_lines).strip()}, timeout=10)
-            # Message 2+: Gemini analysis in chunks
-            msg = filled
-            while msg:
-                if len(msg) <= 4000:
-                    requests.post(tg_url, json={'chat_id': tg_chat, 'text': msg}, timeout=10)
-                    break
-                split_at = msg.rfind(nl, 0, 4000)
-                if split_at == -1:
-                    split_at = 4000
-                requests.post(tg_url, json={'chat_id': tg_chat, 'text': msg[:split_at]}, timeout=10)
-                msg = msg[split_at:].lstrip(nl)
+            # Quick ref table
+            green = chr(128994); red = chr(128308); star = chr(10022)
+            ref_lines = [
+                chr(9876) + ' <b>CITADEL REPORT — ' + str(count) + ' ASSETS (' + timeframe + ')</b>',
+                time.strftime('%d %b %Y %H:%M UTC'),
+                ''
+            ]
+            for s in setups:
+                dot = green if s['direction'] == 'LONG' else red
+                vol_tag = ' {:.1f}x'.format(s['vol']) if s.get('vol') else ''
+                ref_lines.append(dot + ' <b>' + s['sym'] + '</b>' +
+                                 '  ' + fmt_price(s['price']) + vol_tag +
+                                 '  S:' + fmt_price(s['stop']) +
+                                 '  T:' + fmt_price(s['target']))
+            ref_lines += ['', '📊 <b>Full report:</b>', report_url]
+            requests.post(tg_url, json={
+                'chat_id': tg_chat, 'text': nl.join(ref_lines),
+                'parse_mode': 'HTML', 'disable_web_page_preview': False
+            }, timeout=10)
 
-        return jsonify({'report': report})
+        return jsonify({'report': filled, 'reportUrl': report_url, 'reportId': report_id})
     except Exception as e:
         print(f'[CITADEL] Error: {e}')
         return jsonify({'error': str(e)}), 500
+
+# ── Report viewer routes ─────────────────────────────────────
+
+@app.route('/report/<report_id>')
+def view_report(report_id):
+    r = _reports.get(report_id)
+    if not r:
+        return '<h2 style="font-family:monospace;color:#ff4444;padding:40px">Report not found or expired (reports reset on redeploy)</h2>', 404
+
+    setups = r.get('setups', [])
+    coins  = r.get('coins', [])
+    coins_map = {c['symbol']: c for c in coins}
+    analysis = r.get('analysis', '')
+    tf = r.get('timeframe', 'N/A')
+    created = r.get('createdAt', '')[:16].replace('T', ' ') + ' UTC'
+
+    def fmt_p(p):
+        if not p: return 'N/A'
+        return '${:,.6g}'.format(float(p))
+
+    def ema_bar(pct):
+        if pct is None: return ''
+        color = '#00ff88' if pct >= 0 else '#ff4444'
+        label = f'{pct:+.1f}%'
+        w = min(abs(pct) * 2, 100)
+        return f'<div class="ctx-bar-wrap"><div class="ctx-bar-label">200 EMA</div><div class="ctx-bar-track"><div class="ctx-bar-fill" style="width:{w}%;background:{color}"></div></div><div class="ctx-bar-val" style="color:{color}">{label}</div></div>'
+
+    def bb_bar(pct_in_band):
+        if pct_in_band is None: return ''
+        pct = max(0, min(100, pct_in_band))
+        if pct < 20:
+            color = '#00ff88'; zone = 'Near Lower'
+        elif pct > 80:
+            color = '#ff4444'; zone = 'Near Upper'
+        else:
+            color = '#f0c040'; zone = 'Mid-Band'
+        return f'<div class="ctx-bar-wrap"><div class="ctx-bar-label">BB Position</div><div class="ctx-bar-track"><div class="ctx-bar-fill" style="width:{pct}%;background:{color}"></div></div><div class="ctx-bar-val" style="color:{color}">{pct}% · {zone}</div></div>'
+
+    def liq_section(liq):
+        if not liq: return ''
+        long_d  = liq.get('distLong')
+        short_d = liq.get('distShort')
+        parts = []
+        if long_d:  parts.append(f'<span class="liq-badge liq-long">🔴 Long Liq {long_d}% below</span>')
+        if short_d: parts.append(f'<span class="liq-badge liq-short">🟢 Short Liq {short_d}% above</span>')
+        return '<div class="liq-row">' + ' '.join(parts) + '</div>' if parts else ''
+
+    def vol_badge(vol, green):
+        if not vol: return ''
+        if green is True:
+            color = '#00ff88'; label = '🟢 Positive Spike'
+        elif green is False:
+            color = '#ff4444'; label = '🔴 Negative Spike'
+        else:
+            color = '#f0c040'; label = '⚪ Neutral Spike'
+        return f'<span class="vol-badge" style="border-color:{color};color:{color}">{label} {vol:.2f}x</span>'
+
+    # Build setup cards HTML
+    cards_html = ''
+    for i, s in enumerate(setups, 1):
+        c = coins_map.get(s['sym'], {})
+        dir_color = '#00ff88' if s['direction'] == 'LONG' else '#ff4444'
+        dir_bg    = 'rgba(0,255,136,0.07)' if s['direction'] == 'LONG' else 'rgba(255,51,102,0.07)'
+
+        # Extract this asset's analysis section
+        marker = f'{i}. {s["sym"]}'
+        next_marker = f'{i+1}. {setups[i]["sym"]}' if i < len(setups) else 'END OF REPORT'
+        idx_start = analysis.find(marker)
+        idx_end   = analysis.find(next_marker, idx_start) if idx_start >= 0 else -1
+        asset_analysis = analysis[idx_start:idx_end].strip() if idx_start >= 0 else ''
+
+        # Format analysis as paragraphs
+        analysis_html = ''
+        if asset_analysis:
+            lines = [l.strip() for l in asset_analysis.split('\n') if l.strip()]
+            analysis_html = ''.join(f'<p class="analysis-p">{l}</p>' for l in lines)
+
+        bb   = c.get('bb') or {}
+        liq  = c.get('liq')
+        vol  = c.get('volSpike')
+        vgreen = c.get('volSpikeGreen')
+        ema  = c.get('vsEma200')
+
+        cards_html += f"""
+        <div class="setup-card" id="setup-{i}">
+          <div class="card-header">
+            <div class="card-symbol">{s['sym']}</div>
+            <div class="card-dir" style="color:{dir_color};background:{dir_bg};border-color:{dir_color}44">{s['direction']}</div>
+            <div class="card-score">{'★' * min(s['score'],10)}</div>
+            <div class="card-tf">{s['tf']}</div>
+          </div>
+
+          <div class="levels-grid">
+            <div class="level-box"><div class="level-label">ENTRY</div><div class="level-val">{fmt_p(s['price'])}</div></div>
+            <div class="level-box"><div class="level-label">STOP</div><div class="level-val" style="color:#ff4444">{fmt_p(s['stop'])}</div></div>
+            <div class="level-box"><div class="level-label">TARGET</div><div class="level-val" style="color:#00ff88">{fmt_p(s['target'])}</div></div>
+            <div class="level-box"><div class="level-label">R:R</div><div class="level-val" style="color:#f0c040">2:1</div></div>
+          </div>
+
+          <div class="ctx-section">
+            {ema_bar(ema)}
+            {bb_bar(bb.get('pctInBand'))}
+            {liq_section(liq)}
+            {vol_badge(vol, vgreen)}
+          </div>
+
+          <div class="analysis-section">
+            {analysis_html}
+          </div>
+        </div>"""
+
+    # Extract market overview
+    overview_end = analysis.find('━━━')
+    market_overview_html = ''
+    if overview_end > 0:
+        overview_text = analysis[:overview_end].strip()
+        market_overview_html = ''.join(f'<p>{l}</p>' for l in overview_text.split('\n') if l.strip())
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>APEX Citadel Report — {created}</title>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet"/>
+  <style>
+    *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+    body{{background:#040408;color:#e0e0e0;font-family:'Share Tech Mono',monospace;min-height:100vh;padding:20px 16px 60px}}
+    ::-webkit-scrollbar{{width:4px}}
+    ::-webkit-scrollbar-track{{background:#0a0a14}}
+    ::-webkit-scrollbar-thumb{{background:#1a1a2e}}
+
+    .report-header{{border-bottom:1px solid #1a1a2e;padding-bottom:20px;margin-bottom:28px}}
+    .report-title{{font-family:'Orbitron',monospace;font-size:clamp(18px,5vw,28px);font-weight:900;color:#00d4ff;letter-spacing:4px;margin-bottom:6px}}
+    .report-meta{{font-size:11px;color:#444;letter-spacing:2px}}
+    .report-meta span{{color:#666;margin-right:16px}}
+
+    .market-overview{{background:rgba(0,212,255,0.04);border:1px solid rgba(0,212,255,0.15);border-left:3px solid #00d4ff;padding:20px;margin-bottom:32px;border-radius:2px}}
+    .market-overview h2{{font-family:'Orbitron',monospace;font-size:11px;color:#00d4ff;letter-spacing:3px;margin-bottom:12px}}
+    .market-overview p{{font-size:13px;color:#aaa;line-height:1.8;margin-bottom:8px}}
+
+    .setups-grid{{display:flex;flex-direction:column;gap:20px;max-width:860px;margin:0 auto}}
+
+    .setup-card{{background:#0a0a14;border:1px solid #1a1a2e;border-radius:4px;overflow:hidden;transition:border-color 0.2s}}
+    .setup-card:hover{{border-color:#2a2a4e}}
+
+    .card-header{{display:flex;align-items:center;gap:10px;padding:16px 18px 12px;border-bottom:1px solid #111120;flex-wrap:wrap}}
+    .card-symbol{{font-family:'Orbitron',monospace;font-size:20px;font-weight:900;color:#fff;flex:1;min-width:60px}}
+    .card-dir{{font-size:10px;font-weight:700;padding:3px 10px;border:1px solid;letter-spacing:2px;border-radius:2px}}
+    .card-score{{font-size:11px;color:#f0c040;letter-spacing:1px}}
+    .card-tf{{font-size:9px;color:#333;border:1px solid #1a1a2e;padding:2px 7px;letter-spacing:1px}}
+
+    .levels-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:#111120}}
+    .level-box{{background:#0a0a14;padding:12px 14px}}
+    .level-label{{font-size:8px;color:#333;letter-spacing:2px;margin-bottom:4px}}
+    .level-val{{font-size:13px;color:#e0e0e0;font-weight:700}}
+
+    .ctx-section{{padding:14px 18px;border-top:1px solid #111120;display:flex;flex-direction:column;gap:10px}}
+    .ctx-bar-wrap{{display:flex;align-items:center;gap:10px}}
+    .ctx-bar-label{{font-size:9px;color:#444;letter-spacing:1px;min-width:80px}}
+    .ctx-bar-track{{flex:1;height:4px;background:#1a1a2e;border-radius:2px;overflow:hidden}}
+    .ctx-bar-fill{{height:100%;border-radius:2px;transition:width 0.5s}}
+    .ctx-bar-val{{font-size:10px;min-width:100px;text-align:right}}
+    .liq-row{{display:flex;gap:8px;flex-wrap:wrap}}
+    .liq-badge{{font-size:10px;padding:3px 10px;border-radius:2px;border:1px solid}}
+    .liq-long{{border-color:#ff444433;color:#ff4444;background:rgba(255,68,68,0.06)}}
+    .liq-short{{border-color:#00ff8833;color:#00ff88;background:rgba(0,255,136,0.06)}}
+    .vol-badge{{font-size:10px;padding:3px 10px;border-radius:2px;border:1px solid;display:inline-block}}
+
+    .analysis-section{{padding:18px;border-top:1px solid #111120}}
+    .analysis-p{{font-size:12px;color:#888;line-height:1.9;margin-bottom:10px}}
+    .analysis-p:last-child{{margin-bottom:0}}
+
+    .verdict-line{{font-size:13px;font-weight:700;padding:10px 18px;border-top:1px solid #111120}}
+    .verdict-take{{color:#00ff88;background:rgba(0,255,136,0.05)}}
+    .verdict-watch{{color:#f0c040;background:rgba(240,192,64,0.05)}}
+    .verdict-skip{{color:#ff4444;background:rgba(255,68,68,0.05)}}
+
+    .back-link{{display:inline-block;margin-bottom:24px;font-size:11px;color:#444;text-decoration:none;letter-spacing:2px;border:1px solid #1a1a2e;padding:6px 14px}}
+    .back-link:hover{{color:#00d4ff;border-color:#00d4ff}}
+  </style>
+</head>
+<body>
+  <div style="max-width:860px;margin:0 auto">
+    <a href="/reports" class="back-link">← ALL REPORTS</a>
+
+    <div class="report-header">
+      <div class="report-title">⚔ CITADEL REPORT</div>
+      <div class="report-meta">
+        <span>{created}</span>
+        <span>TIMEFRAME: {tf}</span>
+        <span>{len(setups)} SETUPS</span>
+      </div>
+    </div>
+
+    <div class="market-overview">
+      <h2>⚡ MARKET OVERVIEW</h2>
+      {market_overview_html}
+    </div>
+
+    <div class="setups-grid">
+      {cards_html}
+    </div>
+  </div>
+</body>
+</html>"""
+
+    return html
+
+
+@app.route('/reports')
+def reports_index():
+    if not _reports:
+        return """<!DOCTYPE html><html><head><meta charset="UTF-8"/>
+        <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet"/>
+        <style>body{{background:#040408;color:#e0e0e0;font-family:'Share Tech Mono',monospace;padding:40px;text-align:center}}</style>
+        </head><body><h2 style="font-family:Orbitron,monospace;color:#00d4ff;letter-spacing:4px">⚔ NO REPORTS YET</h2>
+        <p style="color:#444;margin-top:16px;font-size:12px">Run a Citadel Report from the scanner to generate the first report.</p>
+        </body></html>"""
+
+    rows = ''
+    for r in sorted(_reports.values(), key=lambda x: x['createdAt'], reverse=True):
+        created = r['createdAt'][:16].replace('T', ' ') + ' UTC'
+        rows += f"""
+        <a href="/report/{r['id']}" class="report-row">
+          <div class="rr-title">⚔ CITADEL REPORT</div>
+          <div class="rr-meta">{created} &nbsp;·&nbsp; {r['timeframe']} &nbsp;·&nbsp; {r['count']} assets</div>
+          <div class="rr-syms">{' · '.join(s['sym'] for s in r.get('setups', []))}</div>
+        </a>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>APEX Reports</title>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet"/>
+  <style>
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{background:#040408;color:#e0e0e0;font-family:'Share Tech Mono',monospace;padding:20px 16px}}
+    .page-title{{font-family:'Orbitron',monospace;font-size:22px;font-weight:900;color:#00d4ff;letter-spacing:4px;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid #1a1a2e}}
+    .report-row{{display:block;text-decoration:none;background:#0a0a14;border:1px solid #1a1a2e;padding:16px 18px;margin-bottom:10px;border-radius:2px;transition:border-color 0.2s}}
+    .report-row:hover{{border-color:#00d4ff}}
+    .rr-title{{font-family:'Orbitron',monospace;font-size:13px;color:#00d4ff;letter-spacing:2px;margin-bottom:5px}}
+    .rr-meta{{font-size:10px;color:#555;letter-spacing:1px;margin-bottom:6px}}
+    .rr-syms{{font-size:11px;color:#888}}
+  </style>
+</head>
+<body>
+  <div style="max-width:860px;margin:0 auto">
+    <div class="page-title">⚔ CITADEL REPORTS</div>
+    {rows}
+  </div>
+</body>
+</html>"""
 
 # ── Backtest API ──────────────────────────────────────────────
 
