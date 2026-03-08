@@ -8,107 +8,57 @@ import json as _json
 
 _backtest_lock = threading.Lock()
 
-# JSONBin config — set in Railway env vars
-# Strip non-ASCII characters that can sneak in when copy-pasting keys from browser
+# ── JSONBin — single bin stores BOTH setups and reports ───────
 def _clean(s): return ''.join(c for c in (s or '') if ord(c) < 128).strip()
-_JSONBIN_BIN_ID      = _clean(os.environ.get('JSONBIN_BIN_ID', ''))
-_JSONBIN_REPORTS_ID  = _clean(os.environ.get('JSONBIN_REPORTS_BIN_ID', ''))
-_JSONBIN_API_KEY     = _clean(os.environ.get('JSONBIN_API_KEY', ''))
-_JSONBIN_URL         = f'https://api.jsonbin.io/v3/b/{_JSONBIN_BIN_ID}'
-_JSONBIN_REPORTS_URL = f'https://api.jsonbin.io/v3/b/{_JSONBIN_REPORTS_ID}'
-print(f'[STORE] JSONBin config — BIN:{_JSONBIN_BIN_ID[:8]}... KEY:{_JSONBIN_API_KEY[:8]}...')
+_JSONBIN_BIN_ID  = _clean(os.environ.get('JSONBIN_BIN_ID', ''))
+_JSONBIN_API_KEY = _clean(os.environ.get('JSONBIN_API_KEY', ''))
+_JSONBIN_URL     = f'https://api.jsonbin.io/v3/b/{_JSONBIN_BIN_ID}'
+_JSONBIN_HEADERS = {'X-Master-Key': _JSONBIN_API_KEY, 'Content-Type': 'application/json'}
 
-def _jsonbin_load():
-    """Load setups from main bin, reports from reports bin (or main bin fallback)."""
-    setups = []
-    reports = {}
-    # Load setups
-    if _JSONBIN_BIN_ID and _JSONBIN_API_KEY:
-        try:
-            r = requests.get(_JSONBIN_URL + '/latest',
-                headers={'X-Master-Key': _JSONBIN_API_KEY}, timeout=15)
-            if r.ok:
-                data = r.json().get('record', {})
-                setups = data.get('setups', [])
-                print(f'[STORE] Loaded {len(setups)} setups from JSONBin')
-            else:
-                print(f'[STORE] Setups load error: {r.status_code}')
-        except Exception as e:
-            print(f'[STORE] Setups load error: {e}')
-    # Load reports — prefer dedicated bin, fallback to main bin
-    reports_url = _JSONBIN_REPORTS_URL if _JSONBIN_REPORTS_ID else (_JSONBIN_URL if _JSONBIN_BIN_ID else None)
-    if reports_url and _JSONBIN_API_KEY:
-        try:
-            r = requests.get(reports_url + '/latest',
-                headers={'X-Master-Key': _JSONBIN_API_KEY}, timeout=15)
-            if r.ok:
-                data = r.json().get('record', {})
-                reports = data.get('reports', data if isinstance(data, dict) and 'id' not in data else {})
-                print(f'[STORE] Loaded {len(reports)} reports from JSONBin')
-            else:
-                print(f'[STORE] Reports load error: {r.status_code}')
-        except Exception as e:
-            print(f'[STORE] Reports load error: {e}')
-    return reports, setups
+def _store_load():
+    """Load {setups, reports} from JSONBin. Returns (reports_dict, setups_list)."""
+    if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
+        print('[STORE] No JSONBin config — data will not persist across restarts')
+        return {}, []
+    try:
+        r = requests.get(_JSONBIN_URL + '/latest', headers=_JSONBIN_HEADERS, timeout=15)
+        if r.ok:
+            rec = r.json().get('record', {})
+            setups  = rec.get('setups', [])
+            reports = rec.get('reports', {})
+            print(f'[STORE] Loaded: {len(setups)} setups, {len(reports)} reports')
+            return reports, setups
+        print(f'[STORE] Load failed: {r.status_code} {r.text[:80]}')
+    except Exception as e:
+        print(f'[STORE] Load error: {e}')
+    return {}, []
 
-def _jsonbin_save_setups():
-    """Persist backtest setups to main JSONBin bin."""
+def _store_save():
+    """Save {setups, reports} to JSONBin as a single atomic write."""
     if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
         return
     try:
-        payload = {'setups': _backtest_setups[:200]}
-        r = requests.put(_JSONBIN_URL,
-            headers={'X-Master-Key': _JSONBIN_API_KEY, 'Content-Type': 'application/json'},
-            json=payload, timeout=15)
-        print(f'[STORE] Setups save {"OK" if r.ok else "FAILED: " + str(r.status_code)}')
+        payload = {'setups': _backtest_setups[:200], 'reports': _reports}
+        r = requests.put(_JSONBIN_URL, headers=_JSONBIN_HEADERS, json=payload, timeout=20)
+        print(f'[STORE] Save {"OK" if r.ok else "FAILED " + str(r.status_code) + ": " + r.text[:80]}')
     except Exception as e:
-        print(f'[STORE] Setups save error: {e}')
+        print(f'[STORE] Save error: {e}')
 
-def _jsonbin_save_reports():
-    """Persist reports to reports bin (or main bin if no dedicated reports bin)."""
-    if not _JSONBIN_API_KEY:
-        return
-    save_url = _JSONBIN_REPORTS_URL if _JSONBIN_REPORTS_ID else (_JSONBIN_URL if _JSONBIN_BIN_ID else None)
-    if not save_url:
-        print('[STORE] WARN: No JSONBin config for reports!')
-        return
-    try:
-        # Keep full analysis — it's only one bin for reports
-        payload = {'reports': _reports}
-        size = len(_json.dumps(payload))
-        print(f'[STORE] Saving {len(_reports)} reports to JSONBin (~{size//1024}KB)')
-        r = requests.put(save_url,
-            headers={'X-Master-Key': _JSONBIN_API_KEY, 'Content-Type': 'application/json'},
-            json=payload, timeout=20)
-        print(f'[STORE] Reports save {"OK" if r.ok else "FAILED: " + str(r.status_code) + " " + r.text[:100]}')
-    except Exception as e:
-        print(f'[STORE] Reports save error: {e}')
-
-def _jsonbin_save():
-    """Save both setups and reports."""
-    _jsonbin_save_setups()
-    if _JSONBIN_REPORTS_ID:
-        _jsonbin_save_reports()
-    else:
-        # No separate reports bin — save reports into main bin too
-        if _JSONBIN_BIN_ID and _JSONBIN_API_KEY:
-            try:
-                reports_slim = {}
-                for rid, rpt in _reports.items():
-                    reports_slim[rid] = {k: v for k, v in rpt.items() if k != 'analysis'}
-                    reports_slim[rid]['analysis'] = rpt.get('analysis', '')[:3000]
-                payload = {'setups': _backtest_setups[:200], 'reports': reports_slim}
-                r = requests.put(_JSONBIN_URL,
-                    headers={'X-Master-Key': _JSONBIN_API_KEY, 'Content-Type': 'application/json'},
-                    json=payload, timeout=15)
-                print(f'[STORE] Combined save {"OK" if r.ok else "FAILED: " + str(r.status_code)}')
-            except Exception as e:
-                print(f'[STORE] Combined save error: {e}')
-
-# ── Initialise both stores from JSONBin on startup ───────────
+# ── In-memory stores — populated from JSONBin on startup ─────
 import uuid as _uuid
-_reports, _initial_setups = _jsonbin_load()
-_backtest_setups = _initial_setups
+_reports         = {}
+_backtest_setups = []
+
+def _sync_from_jsonbin():
+    """Load JSONBin data into in-memory stores."""
+    rpts, setups = _store_load()
+    _reports.update(rpts)
+    with _backtest_lock:
+        if setups:
+            _backtest_setups.clear()
+            _backtest_setups.extend(setups)
+
+_sync_from_jsonbin()
 
 def _log_backtest_setup(symbol, direction, entry, stop, target, source, timeframe='1H', notes=''):
     """Log an AI-generated setup to the backtest store."""
@@ -133,7 +83,7 @@ def _log_backtest_setup(symbol, direction, entry, stop, target, source, timefram
         _backtest_setups.insert(0, setup)
         if len(_backtest_setups) > 500:
             _backtest_setups.pop()
-        _jsonbin_save()
+        _store_save()
     print(f'[BACKTEST] Logged: {symbol} {direction} E:{entry} S:{stop} T:{target} ({source})')
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -147,17 +97,11 @@ _worker_synced = False
 
 @app.before_request
 def _sync_store_once():
-    """Each Gunicorn worker loads from JSONBin on its first request."""
+    """Each Gunicorn worker syncs from JSONBin on its first request."""
     global _worker_synced
     if not _worker_synced:
         _worker_synced = True
-        print('[WORKER] First request — syncing from JSONBin')
-        fresh_reports, fresh_setups = _jsonbin_load()
-        _reports.update(fresh_reports)
-        with _backtest_lock:
-            if fresh_setups:
-                _backtest_setups.clear()
-                _backtest_setups.extend(fresh_setups)
+        _sync_from_jsonbin()
         print(f'[WORKER] Synced: {len(_backtest_setups)} setups, {len(_reports)} reports')
 
 # ── Telegram config (set via environment variables on Render) ─
@@ -1575,7 +1519,7 @@ def citadel_report():
         }
         print(f'[CITADEL] Report stored in memory. Total reports: {len(_reports)}')
         # Save reports immediately — use dedicated reports bin if available
-        _jsonbin_save_reports()
+        _store_save()
         print(f'[CITADEL] Report persisted to JSONBin: {report_id}')
 
         # Step 5: Send short Telegram notification with link
@@ -1614,15 +1558,8 @@ def citadel_report():
 def view_report(report_id):
     r = _reports.get(report_id)
     if not r:
-        # Not in memory — could be different worker process. Try loading from JSONBin.
-        print(f'[REPORT] {report_id} not in memory, fetching from JSONBin...')
-        fresh_reports, fresh_setups = _jsonbin_load()
-        # Merge into global stores
-        _reports.update(fresh_reports)
-        with _backtest_lock:
-            if fresh_setups and len(fresh_setups) > len(_backtest_setups):
-                _backtest_setups.clear()
-                _backtest_setups.extend(fresh_setups)
+        print(f'[REPORT] {report_id} not in memory — resyncing from JSONBin')
+        _sync_from_jsonbin()
         r = _reports.get(report_id)
     if not r:
         return '<h2 style="font-family:monospace;color:#ff4444;padding:40px">Report not found. Please run a new Citadel Report.</h2>', 404
@@ -1831,9 +1768,7 @@ def view_report(report_id):
 @app.route('/reports')
 def reports_index():
     if not _reports:
-        # Try reloading from JSONBin in case this is a fresh worker
-        fresh_reports, fresh_setups = _jsonbin_load()
-        _reports.update(fresh_reports)
+        _sync_from_jsonbin()
     if not _reports:
         return """<!DOCTYPE html><html><head><meta charset="UTF-8"/>
         <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet"/>
@@ -1885,13 +1820,8 @@ def backtest_get_setups():
     """Return all logged setups with current price evaluation."""
     # Multi-worker fix: if memory is empty, reload from JSONBin
     if not _backtest_setups:
-        print('[BACKTEST] Memory empty — reloading from JSONBin')
-        fresh_reports, fresh_setups = _jsonbin_load()
-        _reports.update(fresh_reports)
-        with _backtest_lock:
-            if fresh_setups:
-                _backtest_setups.clear()
-                _backtest_setups.extend(fresh_setups)
+        print('[BACKTEST] Memory empty — resyncing from JSONBin')
+        _sync_from_jsonbin()
     # Fetch current prices for open setups
     open_syms = list({s['symbol'] for s in _backtest_setups if s['status'] == 'OPEN'})
     prices = {}
@@ -1930,7 +1860,7 @@ def backtest_get_setups():
                             stored['status']     = setup['status']
                             stored['closedAt']   = setup['closedAt']
                             stored['closePrice'] = setup['closePrice']
-                    _jsonbin_save()
+                    _store_save()
         result.append(setup)
     return jsonify({'setups': result, 'total': len(result)})
 
@@ -1941,7 +1871,7 @@ def backtest_delete():
     sid = data.get('id')
     before = len(_backtest_setups)
     _backtest_setups[:] = [s for s in _backtest_setups if s['id'] != sid]
-    _jsonbin_save()
+    _store_save()
     return jsonify({'deleted': before - len(_backtest_setups)})
 
 @app.route('/backtest/expire', methods=['POST'])
@@ -1953,7 +1883,7 @@ def backtest_expire():
         if s['id'] == sid:
             s['status'] = 'EXPIRED'
             s['closedAt'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    _jsonbin_save()
+    _store_save()
     return jsonify({'ok': True})
 
 # ── Backtest UI page ─────────────────────────────────────────
