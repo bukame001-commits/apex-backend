@@ -126,7 +126,7 @@ def test_gemini_youtube():
         title      = data.get('title', '')
 
         gemini_url = ('https://generativelanguage.googleapis.com/v1beta/'
-                      'models/gemini-2.0-flash:generateContent?key=' + gemini_key)
+                      'models/gemini-2.0-flash-001:generateContent?key=' + gemini_key)
 
         prompt = f"""Find and summarise this YouTube video in detail:
 
