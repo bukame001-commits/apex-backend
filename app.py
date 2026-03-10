@@ -142,31 +142,30 @@ Use Google Search to find and access this video. Provide:
 
 Be specific — use actual numbers, coins, or facts from the video if available."""
 
-        payload = {{
-            'contents': [{{'parts': [{{'text': prompt}}]}}],
-            'tools': [{{'google_search': {{}}}}],
-            'generationConfig': {{'maxOutputTokens': 2000, 'temperature': 0.3}}
-        }}
+        payload = {
+            'contents': [{'parts': [{'text': prompt}]}],
+            'tools': [{'google_search': {}}],
+            'generationConfig': {'maxOutputTokens': 2000, 'temperature': 0.3}
+        }
 
         resp = requests.post(gemini_url, json=payload, timeout=60)
 
         if not resp.ok:
-            return jsonify({{'error': f'Gemini {resp.status_code}', 'detail': resp.text[:300]}}), 500
+            return jsonify({'error': f'Gemini {resp.status_code}', 'detail': resp.text[:300]}), 500
 
         result = resp.json()
         text = result['candidates'][0]['content']['parts'][0]['text']
 
-        # Check if grounding was used
         grounding_used = 'groundingMetadata' in str(result)
 
-        return jsonify({{
+        return jsonify({
             'success': True,
             'summary': text,
             'grounding_used': grounding_used,
-        }})
+        })
 
     except Exception as e:
-        return jsonify({{'error': str(e)}}), 500
+        return jsonify({'error': str(e)}), 500
 
 # ── Debug endpoint ───────────────────────────────────────────
 @app.route('/debug/store')
