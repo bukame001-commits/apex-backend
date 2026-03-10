@@ -111,6 +111,63 @@ def _sync_store_once():
         _sync_from_jsonbin()
         print(f'[WORKER] Synced: {len(_backtest_setups)} setups, {len(_reports)} reports')
 
+# ── YouTube/Gemini test endpoint ─────────────────────────────
+@app.route('/test/gemini-youtube', methods=['POST'])
+def test_gemini_youtube():
+    """Test Gemini API YouTube summarisation using Google Search grounding."""
+    try:
+        gemini_key = os.environ.get('GEMINI_API_KEY', '')
+        if not gemini_key:
+            return jsonify({'error': 'No GEMINI_API_KEY'}), 500
+
+        data = request.get_json()
+        youtube_url = data.get('url', '')
+        channel    = data.get('channel', '')
+        title      = data.get('title', '')
+
+        gemini_url = ('https://generativelanguage.googleapis.com/v1beta/'
+                      'models/gemini-2.0-flash:generateContent?key=' + gemini_key)
+
+        prompt = f"""Find and summarise this YouTube video in detail:
+
+Channel: {channel}
+Title: {title}
+URL: {youtube_url}
+
+Use Google Search to find and access this video. Provide:
+- What the video is about (2-3 sentences)
+- Key points covered (bullet points)
+- Most important insights, data, or price targets mentioned
+- Creator's overall conclusion or recommendation
+
+Be specific — use actual numbers, coins, or facts from the video if available."""
+
+        payload = {{
+            'contents': [{{'parts': [{{'text': prompt}}]}}],
+            'tools': [{{'google_search': {{}}}}],
+            'generationConfig': {{'maxOutputTokens': 2000, 'temperature': 0.3}}
+        }}
+
+        resp = requests.post(gemini_url, json=payload, timeout=60)
+
+        if not resp.ok:
+            return jsonify({{'error': f'Gemini {resp.status_code}', 'detail': resp.text[:300]}}), 500
+
+        result = resp.json()
+        text = result['candidates'][0]['content']['parts'][0]['text']
+
+        # Check if grounding was used
+        grounding_used = 'groundingMetadata' in str(result)
+
+        return jsonify({{
+            'success': True,
+            'summary': text,
+            'grounding_used': grounding_used,
+        }})
+
+    except Exception as e:
+        return jsonify({{'error': str(e)}}), 500
+
 # ── Debug endpoint ───────────────────────────────────────────
 @app.route('/debug/store')
 def debug_store():
