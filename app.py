@@ -1993,6 +1993,361 @@ def backtest_page():
         return f.read(), 200, {'Content-Type': 'text/html'}
 
 # ── Health check ─────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════
+# ── CREATOR DIGEST ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+
+DIGEST_CHANNELS = [
+    {'handle': 'KanalFinans',                    'name': 'Kanal Finans',          'lang': 'tr', 'category': 'Finance'},
+    {'handle': 'economisttv-artunç-kocabalkan',  'name': 'Economist TV',          'lang': 'tr', 'category': 'Finance'},
+    {'handle': 'selcoin',                        'name': 'Selcoin',               'lang': 'tr', 'category': 'Crypto'},
+    {'handle': 'Kriptomessi',                    'name': 'Kripto Messi',          'lang': 'tr', 'category': 'Crypto'},
+    {'handle': 'tunakaya',                       'name': 'Tuna Kaya',             'lang': 'tr', 'category': 'Crypto'},
+    {'handle': 'CoinBureauTrading',              'name': 'Coin Bureau Trading',   'lang': 'en', 'category': 'Crypto'},
+    {'handle': 'CoinBureau',                     'name': 'Coin Bureau',           'lang': 'en', 'category': 'Crypto'},
+    {'handle': 'CRYPTOCRUSHSHOW',                'name': 'Crypto Crush Show',     'lang': 'en', 'category': 'Crypto'},
+    {'handle': 'enbasariliborsakanaliorjin7422',  'name': 'En Başarılı Borsa',    'lang': 'tr', 'category': 'Finance'},
+    {'handle': 'michaelvdpoppe',                 'name': 'Michael van de Poppe',  'lang': 'en', 'category': 'Crypto'},
+    {'handle': 'Swan_Bitcoin',                   'name': 'Swan Bitcoin',          'lang': 'en', 'category': 'Crypto'},
+]
+
+_digest_cache     = []   # list of digest run results
+_digest_lock      = threading.Lock()
+_digest_last_run  = None
+_digest_seen      = set()  # tracks video titles already summarised today
+
+def _gemini_find_and_summarise(channel_name, handle, lang, hours, gemini_key):
+    """Ask Gemini to find the latest video from a channel and summarise it — no YouTube API needed."""
+    import datetime
+    since_date = (datetime.datetime.utcnow() - datetime.timedelta(hours=hours)).strftime('%d %B %Y')
+
+    if lang == 'tr':
+        prompt = f"""YouTube kanalı @{handle} ({channel_name}) için son {hours} saatte yayınlanan en son videoyu bul.
+
+Eğer son {hours} saatte yeni video yoksa, açıkça "Son {hours} saatte yeni video yok" yaz.
+
+Yeni video varsa aşağıdaki formatta yanıt ver:
+
+BAŞLIK: [videonun tam başlığı]
+URL: [YouTube URL]
+TARİH: [yayın tarihi]
+
+ÖZET:
+- Videonun ana konusu (2-3 cümle)
+- Önemli noktalar (madde madde)
+- Bahsedilen önemli veriler, fiyat hedefleri veya içgörüler
+- Kanalın genel sonucu veya tavsiyesi
+
+Gerçek video içeriğine dayalı olarak spesifik ve detaylı ol."""
+    else:
+        prompt = f"""Search YouTube for the latest video published in the last {hours} hours by the channel @{handle} ({channel_name}).
+
+If no new video was published in the last {hours} hours, clearly state "No new videos in the last {hours} hours."
+
+If there is a new video, respond in this exact format:
+
+TITLE: [exact video title]
+URL: [YouTube URL]
+DATE: [publish date]
+
+SUMMARY:
+- What the video is about (2-3 sentences)
+- Key points covered (bullet points)
+- Important data, price targets, or insights mentioned
+- Creator's overall conclusion or recommendation
+
+Be specific — use actual numbers and facts from the video."""
+
+    try:
+        gemini_url = (f'https://generativelanguage.googleapis.com/v1beta/'
+                      f'models/gemini-2.5-flash:generateContent?key={gemini_key}')
+        resp = requests.post(gemini_url, json={
+            'contents': [{'parts': [{'text': prompt}]}],
+            'tools': [{'google_search': {}}],
+            'generationConfig': {'maxOutputTokens': 1500, 'temperature': 0.3}
+        }, timeout=60)
+        if resp.ok:
+            text = resp.json()['candidates'][0]['content']['parts'][0]['text']
+            # Check if Gemini says no new video
+            no_video_phrases = ['no new video', 'son', 'yeni video yok', 'did not publish', 'could not find']
+            if any(p in text.lower() for p in no_video_phrases):
+                print(f'[DIGEST] No new video found for {channel_name}')
+                return None
+            return text
+        print(f'[DIGEST] Gemini error {resp.status_code}: {resp.text[:100]}')
+    except Exception as e:
+        print(f'[DIGEST] Gemini error: {e}')
+    return None
+
+def _parse_gemini_response(text, channel, lang):
+    """Extract title and URL from Gemini's structured response."""
+    import re
+    title, url = '', ''
+    title_key = 'BAŞLIK:' if lang == 'tr' else 'TITLE:'
+    url_key   = 'URL:'
+    for line in text.split('\n'):
+        if line.startswith(title_key):
+            title = line.replace(title_key, '').strip()
+        elif line.startswith(url_key):
+            url = line.replace(url_key, '').strip()
+    # Fallback URL search
+    if not url:
+        urls = re.findall(r'https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+', text)
+        if urls:
+            url = urls[0]
+    return title or f'New video from {channel}', url or ''
+
+def _run_digest(hours=24):
+    """Full digest — Gemini finds and summarises latest videos. No YouTube API needed."""
+    global _digest_last_run
+    gemini_key = os.environ.get('GEMINI_API_KEY', '')
+    tg_token   = os.environ.get('TELEGRAM_BOT_TOKEN', '') or TELEGRAM_BOT_TOKEN
+    tg_chat    = os.environ.get('TELEGRAM_CHAT_ID', '') or TELEGRAM_CHAT_ID
+
+    if not gemini_key:
+        return {'error': 'GEMINI_API_KEY not set'}
+
+    results  = []
+    run_time = time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())
+
+    import datetime as _dt
+    today = _dt.datetime.utcnow().strftime('%Y-%m-%d')
+
+    for ch in DIGEST_CHANNELS:
+        print(f'[DIGEST] Checking {ch["name"]}...')
+        response = _gemini_find_and_summarise(ch['name'], ch['handle'], ch['lang'], hours, gemini_key)
+        if not response:
+            continue
+
+        title, url = _parse_gemini_response(response, ch['name'], ch['lang'])
+
+        seen_key = f'{today}::{ch["name"]}::{title}'
+        if seen_key in _digest_seen:
+            print(f'[DIGEST] Already summarised "{title[:50]}" today — skipping')
+            continue
+        _digest_seen.add(seen_key)
+
+        entry = {
+            'channel':  ch['name'],
+            'category': ch['category'],
+            'lang':     ch['lang'],
+            'title':    title,
+            'url':      url,
+            'thumb':    '',
+            'summary':  response,
+            'run_time': run_time,
+        }
+        results.append(entry)
+
+        # Send to Telegram
+        if tg_token and tg_chat:
+            flag     = '🇹🇷' if ch['lang'] == 'tr' else '🇬🇧'
+            cat_icon = '📊' if ch['category'] == 'Finance' else '₿'
+            link     = f'[{title}]({url})' if url else title
+            msg = (f"{flag} {cat_icon} *{ch['name']}*\n"
+                   f"🎬 {link}\n\n"
+                   f"{response[:900]}{'...' if len(response)>900 else ''}")
+            try:
+                requests.post(
+                    f'https://api.telegram.org/bot{tg_token}/sendMessage',
+                    json={'chat_id': tg_chat, 'text': msg,
+                          'parse_mode': 'Markdown', 'disable_web_page_preview': False},
+                    timeout=10
+                )
+            except Exception as e:
+                print(f'[DIGEST] Telegram error: {e}')
+
+    with _digest_lock:
+        _digest_cache.clear()
+        _digest_cache.extend(results)
+        _digest_last_run = run_time
+
+    # Send digest summary link to Telegram
+    if tg_token and tg_chat and results:
+        try:
+            digest_url = 'https://web-production-d8201.up.railway.app/digest'
+            summary_msg = (f"📡 *CREATOR DIGEST READY*\n"
+                           f"🕐 {run_time}\n"
+                           f"📺 {len(results)} channel(s) summarised\n\n"
+                           f"👉 [View Full Digest]({digest_url})")
+            requests.post(
+                f'https://api.telegram.org/bot{tg_token}/sendMessage',
+                json={'chat_id': tg_chat, 'text': summary_msg,
+                      'parse_mode': 'Markdown', 'disable_web_page_preview': False},
+                timeout=10
+            )
+        except Exception as e:
+            print(f'[DIGEST] Telegram digest link error: {e}')
+
+    print(f'[DIGEST] Done — {len(results)} channels summarised')
+    return {'success': True, 'count': len(results), 'run_time': run_time, 'videos': results}
+
+
+@app.route('/digest/run', methods=['POST'])
+def digest_run():
+    """Trigger a digest run manually (or from scheduler)."""
+    hours = request.get_json(silent=True, force=True) or {}
+    hours = hours.get('hours', 24)
+    result = _run_digest(hours=hours)
+    if 'error' in result:
+        return jsonify(result), 500
+    return jsonify({'success': True, 'count': result['count'], 'run_time': result['run_time']})
+
+
+@app.route('/digest')
+def digest_page():
+    """Render the CreatorDigest webpage."""
+    with _digest_lock:
+        items = list(_digest_cache)
+
+    # Group by category
+    by_cat = {}
+    for item in items:
+        by_cat.setdefault(item['category'], []).append(item)
+
+    cards_html = ''
+    if not items:
+        cards_html = '<div style="color:#555;text-align:center;padding:60px;letter-spacing:2px;font-size:12px">NO DIGEST DATA — RUN THE DIGEST FIRST</div>'
+    else:
+        for cat, vids in by_cat.items():
+            icon = '📊' if cat == 'Finance' else '₿'
+            cards_html += f'<div class="cat-header">{icon} {cat.upper()}</div>'
+            for v in vids:
+                flag = '🇹🇷' if v['lang'] == 'tr' else '🇬🇧'
+                summary_html = v['summary'].replace('\n', '<br>').replace('**', '<b>').replace('*', '')
+                thumb = f'<img src="{v["thumb"]}" style="width:100%;border-radius:4px;margin-bottom:12px">' if v['thumb'] else ''
+                cards_html += f"""
+                <div class="card">
+                  {thumb}
+                  <div class="ch-name">{flag} {v['channel']} <span class="time">{v['published'][:10]}</span></div>
+                  <a class="vid-title" href="{v['url']}" target="_blank">{v['title']}</a>
+                  <div class="summary">{summary_html}</div>
+                  <a class="watch-btn" href="{v['url']}" target="_blank">▶ WATCH VIDEO</a>
+                </div>"""
+
+    last = _digest_last_run or 'Never'
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>APEX — Creator Digest</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@700;900&display=swap" rel="stylesheet">
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#0a0a0f;color:#e0e0e0;font-family:'Share Tech Mono',monospace;padding:16px}}
+  .header{{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;border-bottom:1px solid #1a1a2e;padding-bottom:14px;margin-bottom:20px}}
+  .title{{font-family:'Orbitron',monospace;font-size:18px;font-weight:900;color:#00d4ff;letter-spacing:4px}}
+  .subtitle{{font-size:9px;color:#444;letter-spacing:2px;margin-top:4px}}
+  .nav-links{{display:flex;gap:8px;flex-wrap:wrap}}
+  .nav-links a{{font-size:9px;color:#888;text-decoration:none;border:1px solid #2a2a3e;padding:4px 12px;letter-spacing:1px}}
+  .nav-links a:hover{{color:#00d4ff;border-color:#00d4ff}}
+  .run-bar{{display:flex;align-items:center;gap:10px;margin-bottom:20px;flex-wrap:wrap}}
+  .run-btn{{background:#00d4ff22;border:1px solid #00d4ff;color:#00d4ff;padding:8px 20px;font-family:'Share Tech Mono',monospace;font-size:11px;cursor:pointer;letter-spacing:2px}}
+  .run-btn:hover{{background:#00d4ff44}}
+  .run-btn:disabled{{opacity:0.4;cursor:not-allowed}}
+  .last-run{{font-size:9px;color:#444;letter-spacing:1px}}
+  .status{{font-size:11px;color:#f0c040;letter-spacing:1px}}
+  .cat-header{{font-size:10px;color:#00d4ff;letter-spacing:3px;margin:24px 0 12px;border-left:3px solid #00d4ff;padding-left:10px}}
+  .card{{background:#0f0f1a;border:1px solid #1a1a2e;padding:16px;margin-bottom:14px;border-radius:4px}}
+  .card:hover{{border-color:#2a2a4e}}
+  .ch-name{{font-size:10px;color:#888;letter-spacing:2px;margin-bottom:6px;display:flex;justify-content:space-between}}
+  .time{{color:#444}}
+  .vid-title{{display:block;font-size:14px;color:#00d4ff;text-decoration:none;margin-bottom:12px;line-height:1.4;font-weight:bold}}
+  .vid-title:hover{{color:#fff}}
+  .summary{{font-size:12px;color:#bbb;line-height:1.7;margin-bottom:14px}}
+  .watch-btn{{display:inline-block;font-size:10px;color:#00d4ff;text-decoration:none;border:1px solid #00d4ff33;padding:5px 14px;letter-spacing:1px}}
+  .watch-btn:hover{{background:#00d4ff22}}
+  .hours-select{{background:#111;border:1px solid #2a2a3e;color:#e0e0e0;padding:6px 10px;font-family:'Share Tech Mono',monospace;font-size:11px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <div class="title">📡 CREATOR DIGEST</div>
+    <div class="subtitle">AI SUMMARIES · YOUTUBE · CRYPTO & FINANCE CHANNELS</div>
+  </div>
+  <div class="nav-links">
+    <a href="/reports">📋 REPORTS</a>
+    <a href="/backtest">📊 BACKTEST</a>
+    <a href="https://bukame001-commits.github.io/apex-scanner/">⚡ SCANNER</a>
+  </div>
+</div>
+
+<div class="run-bar">
+  <select class="hours-select" id="hoursSelect">
+    <option value="24">Last 24 hours</option>
+    <option value="48">Last 48 hours</option>
+    <option value="72">Last 72 hours</option>
+    <option value="168">Last 7 days</option>
+  </select>
+  <button class="run-btn" onclick="runDigest()" id="runBtn">▶ RUN DIGEST</button>
+  <span class="last-run">Last run: {last}</span>
+  <span class="status" id="status"></span>
+</div>
+
+{cards_html}
+
+<script>
+async function runDigest() {{
+  const btn = document.getElementById('runBtn');
+  const status = document.getElementById('status');
+  const hours = parseInt(document.getElementById('hoursSelect').value);
+  btn.disabled = true;
+  btn.textContent = '⏳ RUNNING...';
+  status.textContent = 'Fetching videos and generating summaries — this takes 1-2 minutes...';
+  try {{
+    const r = await fetch('/digest/run', {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{hours}})
+    }});
+    const d = await r.json();
+    if (d.success) {{
+      status.textContent = `✅ ${{d.count}} videos summarised — reloading...`;
+      setTimeout(()=>location.reload(), 2000);
+    }} else {{
+      status.textContent = `❌ ${{d.error}}`;
+    }}
+  }} catch(e) {{
+    status.textContent = `❌ ${{e.message}}`;
+  }}
+  btn.disabled = false;
+  btn.textContent = '▶ RUN DIGEST';
+}}
+</script>
+</body>
+</html>"""
+
+
+def _digest_scheduler():
+    import datetime as _dt
+    while True:
+        now      = _dt.datetime.utcnow()
+        midnight = (now + _dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        target   = now.replace(hour=7, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += _dt.timedelta(days=1)
+        next_event = min(midnight, target)
+        wait = (next_event - now).total_seconds()
+        time.sleep(max(wait, 1))
+        now = _dt.datetime.utcnow()
+        if now.hour == 0:
+            _digest_seen.clear()
+            print('[DIGEST] Midnight — seen videos cleared')
+        if now.hour == 7:
+            print('[DIGEST] Auto-run starting...')
+            try:
+                _run_digest(hours=24)
+            except Exception as e:
+                print(f'[DIGEST] Auto-run error: {e}')
+
+# Start digest scheduler in background
+_digest_thread = threading.Thread(target=_digest_scheduler, daemon=True)
+_digest_thread.start()
+
+# ── END CREATOR DIGEST ─────────────────────────────────────────
+
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok', 'monitor': _monitor_running})
