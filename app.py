@@ -2083,7 +2083,7 @@ Report Structure:
             )
         else:
             # Fallback: pass YouTube URL directly as video part
-            import google.genai.types as genai_types
+            import google.generativeai.types as genai_types
             response = client.models.generate_content(
                 model=model_name,
                 contents=[
