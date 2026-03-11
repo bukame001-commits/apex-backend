@@ -2014,8 +2014,9 @@ DIGEST_CHANNELS = [
 
 _digest_cache     = []   # list of digest run results
 _digest_lock      = threading.Lock()
-_digest_last_run  = None
-_digest_seen      = set()  # tracks video titles already summarised today
+_digest_last_run      = None
+_digest_seen          = set()   # tracks video titles already summarised today
+_digest_channel_status = {}     # channel -> 'new video' | 'no new video' | 'error'
 
 def _gemini_find_and_summarise(channel_name, handle, lang, hours, gemini_key):
     """Ask Gemini to find the latest video from a channel and summarise it — no YouTube API needed."""
@@ -2023,23 +2024,27 @@ def _gemini_find_and_summarise(channel_name, handle, lang, hours, gemini_key):
     since_date = (datetime.datetime.utcnow() - datetime.timedelta(hours=hours)).strftime('%d %B %Y')
 
     if lang == 'tr':
-        prompt = f"""YouTube kanalı @{handle} ({channel_name}) için son {hours} saatte yayınlanan en son videoyu bul.
+        prompt = f"""YouTube'da @{handle} ({channel_name}) kanalinin son {hours} saatte yayinladigi en son videoyu ara.
 
-Eğer son {hours} saatte yeni video yoksa, açıkça "Son {hours} saatte yeni video yok" yaz.
+Son {hours} saatte yeni video yoksa acikca "Son {hours} saatte yeni video yok" yaz.
 
-Yeni video varsa aşağıdaki formatta yanıt ver:
+Yeni video varsa asagidaki formatta yanit ver:
 
-BAŞLIK: [videonun tam başlığı]
+BASLIK: [videonun tam basligi]
 URL: [YouTube URL]
-TARİH: [yayın tarihi]
+TARIH: [yayin tarihi]
 
-ÖZET:
-- Videonun ana konusu (2-3 cümle)
-- Önemli noktalar (madde madde)
-- Bahsedilen önemli veriler, fiyat hedefleri veya içgörüler
-- Kanalın genel sonucu veya tavsiyesi
+ANALIZ:
+Sen Citadel'de kidemli bir makro ve kripto analistisin. Gorev: bu videodan uygulanabilir istihbarat cikar.
 
-Gerçek video içeriğine dayalı olarak spesifik ve detaylı ol."""
+- MAKRO BAGLAN: Hangi makro ortama yakit veriyor? Fed, likidite, DXY, tahviller?
+- ANA TEZ: Temel yonsel arguman nedir? Boga/ayi/notr? Guven seviyesi?
+- FIYAT SEVIYELERI: Her spesifik fiyat seviyesi, hedef, destek, direnc. Varlik adini belirt.
+- KATALIZORLER: Onemli olaylar, on-chain sinyaller, piyasa yapisi degisimleri?
+- RISK FAKTORLERI: Ana asagi yonlu riskler, tezi gecersiz kilan senaryolar?
+- CITADEL GORUSU: Tek cumle — bu analiz islem yapilabilir mi? Piyasa yapisiyla ortusiyor mu?
+
+Dogrudan, yogun ve kurumsal ol. Sayi kullan."""
     else:
         prompt = f"""Search YouTube for the latest video published in the last {hours} hours by the channel @{handle} ({channel_name}).
 
@@ -2051,13 +2056,18 @@ TITLE: [exact video title]
 URL: [YouTube URL]
 DATE: [publish date]
 
-SUMMARY:
-- What the video is about (2-3 sentences)
-- Key points covered (bullet points)
-- Important data, price targets, or insights mentioned
-- Creator's overall conclusion or recommendation
+ANALYSIS:
+You are a senior macro and crypto analyst at Citadel. Your job is to extract actionable intelligence from this video — not summarise it for a general audience.
 
-Be specific — use actual numbers and facts from the video."""
+Cover the following:
+- MACRO CONTEXT: What macro backdrop or narrative is the creator responding to? Fed, liquidity, risk-on/off, DXY, bonds?
+- KEY THESIS: What is the creator's core directional argument? Bull, bear, neutral? What is the conviction level?
+- PRICE LEVELS & TARGETS: Extract every specific price level, target, support, resistance, or invalidation mentioned. Include the asset name.
+- CATALYSTS: What upcoming events, on-chain signals, or market structure shifts does the creator flag as key catalysts?
+- RISK FACTORS: What does the creator identify as the main downside risks or scenarios that invalidate their thesis?
+- CITADEL TAKE: In one sentence — is this creator's analysis tradeable? Does it align with or contradict current market structure?
+
+Be direct, dense, and institutional. No fluff. Use numbers wherever possible."""
 
     try:
         gemini_url = (f'https://generativelanguage.googleapis.com/v1beta/'
@@ -2114,10 +2124,13 @@ def _run_digest(hours=24):
     import datetime as _dt
     today = _dt.datetime.utcnow().strftime('%Y-%m-%d')
 
+    _channel_status = {ch['name']: '⏳ checking...' for ch in DIGEST_CHANNELS}
+
     for ch in DIGEST_CHANNELS:
         print(f'[DIGEST] Checking {ch["name"]}...')
         response = _gemini_find_and_summarise(ch['name'], ch['handle'], ch['lang'], hours, gemini_key)
         if not response:
+            _channel_status[ch['name']] = '— no new video'
             continue
 
         title, url = _parse_gemini_response(response, ch['name'], ch['lang'])
@@ -2129,25 +2142,25 @@ def _run_digest(hours=24):
         _digest_seen.add(seen_key)
 
         entry = {
-            'channel':  ch['name'],
-            'category': ch['category'],
-            'lang':     ch['lang'],
-            'title':    title,
-            'url':      url,
-            'thumb':    '',
-            'summary':  response,
-            'run_time': run_time,
+            'channel':   ch['name'],
+            'category':  ch['category'],
+            'lang':      ch['lang'],
+            'title':     title,
+            'url':       url,
+            'thumb':     '',
+            'published': run_time,
+            'summary':   response,
+            'run_time':  run_time,
         }
+        _channel_status[ch['name']] = f'✅ {title[:40]}'
         results.append(entry)
 
-        # Send to Telegram
+        # Send to Telegram — channel name + title only, full analysis on digest page
         if tg_token and tg_chat:
             flag     = '🇹🇷' if ch['lang'] == 'tr' else '🇬🇧'
             cat_icon = '📊' if ch['category'] == 'Finance' else '₿'
             link     = f'[{title}]({url})' if url else title
-            msg = (f"{flag} {cat_icon} *{ch['name']}*\n"
-                   f"🎬 {link}\n\n"
-                   f"{response[:900]}{'...' if len(response)>900 else ''}")
+            msg = f"{flag} {cat_icon} *{ch['name']}*\n🎬 {link}"
             try:
                 requests.post(
                     f'https://api.telegram.org/bot{tg_token}/sendMessage',
@@ -2162,6 +2175,8 @@ def _run_digest(hours=24):
         _digest_cache.clear()
         _digest_cache.extend(results)
         _digest_last_run = run_time
+        _digest_channel_status.clear()
+        _digest_channel_status.update(_channel_status)
 
     # Send digest summary link to Telegram
     if tg_token and tg_chat and results:
@@ -2186,13 +2201,20 @@ def _run_digest(hours=24):
 
 @app.route('/digest/run', methods=['POST'])
 def digest_run():
-    """Trigger a digest run manually (or from scheduler)."""
-    hours = request.get_json(silent=True, force=True) or {}
-    hours = hours.get('hours', 24)
-    result = _run_digest(hours=hours)
-    if 'error' in result:
-        return jsonify(result), 500
-    return jsonify({'success': True, 'count': result['count'], 'run_time': result['run_time']})
+    """Trigger a digest run in background — returns immediately, results appear on /digest page."""
+    data  = request.get_json(silent=True, force=True) or {}
+    hours = data.get('hours', 24)
+    # Check if already running
+    if getattr(digest_run, '_running', False):
+        return jsonify({'success': False, 'error': 'Digest already running — please wait'})
+    def _bg():
+        digest_run._running = True
+        try:
+            _run_digest(hours=hours)
+        finally:
+            digest_run._running = False
+    threading.Thread(target=_bg, daemon=True).start()
+    return jsonify({'success': True, 'message': f'Digest started for last {hours}h — reload page in ~2 minutes'})
 
 
 @app.route('/digest')
@@ -2227,6 +2249,17 @@ def digest_page():
                 </div>"""
 
     last = _digest_last_run or 'Never'
+    with _digest_lock:
+        ch_status = dict(_digest_channel_status)
+
+    # Build channel status table
+    status_rows = ''
+    for ch in DIGEST_CHANNELS:
+        st = ch_status.get(ch['name'], '— not checked yet')
+        flag = '🇹🇷' if ch['lang'] == 'tr' else '🇬🇧'
+        color = '#00ff88' if st.startswith('✅') else '#444' if st.startswith('—') else '#f0c040'
+        status_rows += f'<tr><td style="color:#aaa">{flag} {ch["name"]}</td><td style="color:{color};text-align:right">{st}</td></tr>'
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -2274,6 +2307,12 @@ def digest_page():
   </div>
 </div>
 
+<details style="margin-bottom:16px;border:1px solid #1a1a2e;padding:10px">
+  <summary style="font-size:10px;color:#555;letter-spacing:2px;cursor:pointer">CHANNEL STATUS ▼</summary>
+  <table style="width:100%;margin-top:10px;font-size:11px;border-collapse:collapse">
+    {status_rows}
+  </table>
+</details>
 <div class="run-bar">
   <select class="hours-select" id="hoursSelect">
     <option value="24">Last 24 hours</option>
@@ -2295,7 +2334,7 @@ async function runDigest() {{
   const hours = parseInt(document.getElementById('hoursSelect').value);
   btn.disabled = true;
   btn.textContent = '⏳ RUNNING...';
-  status.textContent = 'Fetching videos and generating summaries — this takes 1-2 minutes...';
+  status.textContent = 'Started — checking all channels. Takes ~2 mins. Auto-refreshing...';
   try {{
     const r = await fetch('/digest/run', {{
       method: 'POST',
@@ -2304,16 +2343,23 @@ async function runDigest() {{
     }});
     const d = await r.json();
     if (d.success) {{
-      status.textContent = `✅ ${{d.count}} videos summarised — reloading...`;
-      setTimeout(()=>location.reload(), 2000);
+      status.textContent = '⏳ ' + d.message;
+      let polls = 0;
+      const timer = setInterval(() => {{
+        polls++;
+        if (polls > 12) {{ clearInterval(timer); }}
+        location.reload();
+      }}, 15000);
     }} else {{
-      status.textContent = `❌ ${{d.error}}`;
+      status.textContent = `❌ ${{d.error || d.message}}`;
+      btn.disabled = false;
+      btn.textContent = '▶ RUN DIGEST';
     }}
   }} catch(e) {{
     status.textContent = `❌ ${{e.message}}`;
+    btn.disabled = false;
+    btn.textContent = '▶ RUN DIGEST';
   }}
-  btn.disabled = false;
-  btn.textContent = '▶ RUN DIGEST';
 }}
 </script>
 </body>
