@@ -2029,52 +2029,57 @@ def _gemini_find_and_summarise(channel_name, handle, lang, hours, gemini_key):
     since_date = (datetime.datetime.utcnow() - datetime.timedelta(hours=hours)).strftime('%d %B %Y')
 
     if lang == 'tr':
-        prompt = f"""YouTube'da @{handle} ({channel_name}) kanalinin son {hours} saatte yayinladigi en son videoyu ara.
+        import datetime as _dt2
+        now_str   = _dt2.datetime.utcnow().strftime('%d %B %Y')
+        since_str = (_dt2.datetime.utcnow() - _dt2.timedelta(hours=hours)).strftime('%d %B %Y %H:%M UTC')
+        prompt = f"""Bugun {now_str}. YouTube'da @{handle} ({channel_name}) kanalinin {since_str} tarihinden sonra yayinladigi videolari ara.
 
-Son {hours} saatte yeni video yoksa acikca "Son {hours} saatte yeni video yok" yaz.
+Kanalin sayfasina giderek en son yuklemelerini kontrol et. Son {hours} saatte yuklenen video var mi bak.
 
-Yeni video varsa asagidaki formatta yanit ver:
+{since_str} tarihinden sonra video yoksa tam olarak su yaziyi yaz: "Son {hours} saatte yeni video yok."
+
+Yeni video bulduysan asagidaki formatta yanit ver:
 
 BASLIK: [videonun tam basligi]
 URL: [YouTube URL]
-TARIH: [yayin tarihi]
+TARIH: [tam yayin tarihi ve saati]
 
 ANALIZ:
-Sen Citadel'de kidemli bir makro ve kripto analistisin. Gorev: bu videodan uygulanabilir istihbarat cikar.
+Sen Citadel'de kidemli bir makro ve kripto analistisin. Uygulanabilir istihbarat cikar — genel ozet degil.
 
-- MAKRO BAGLAN: Hangi makro ortama yakit veriyor? Fed, likidite, DXY, tahviller?
-- ANA TEZ: Temel yonsel arguman nedir? Boga/ayi/notr? Guven seviyesi?
-- FIYAT SEVIYELERI: Her spesifik fiyat seviyesi, hedef, destek, direnc. Varlik adini belirt.
+- MAKRO BAGLAM: Hangi makro ortama yakit veriyor? Fed, likidite, DXY, tahviller, jeopolitik?
+- ANA TEZ: Temel yonsel arguman — boga/ayi/notr? Guven seviyesi?
+- FIYAT SEVIYELERI: Her fiyat seviyesi, hedef, destek, direnc, gecersizlestirme noktasi. Varlik adini yaz.
 - KATALIZORLER: Onemli olaylar, on-chain sinyaller, piyasa yapisi degisimleri?
-- RISK FAKTORLERI: Ana asagi yonlu riskler, tezi gecersiz kilan senaryolar?
-- CITADEL GORUSU: Tek cumle — bu analiz islem yapilabilir mi? Piyasa yapisiyla ortusiyor mu?
+- RISK FAKTORLERI: Ana asagi riskler ve tezi gecersiz kilan senaryolar?
+- CITADEL GORUSU: Tek cumle — bu analiz islem yapilabilir mi?
 
-Dogrudan, yogun ve kurumsal ol. Sayi kullan."""
+Dogrudan, yogun, kurumsal. Sayi kullan."""
     else:
-        prompt = f"""Search YouTube for the latest video published in the last {hours} hours by the channel @{handle} ({channel_name}).
+        import datetime as _dt2
+        now_str   = _dt2.datetime.utcnow().strftime('%B %d, %Y')
+        since_str = (_dt2.datetime.utcnow() - _dt2.timedelta(hours=hours)).strftime('%B %d, %Y %H:%M UTC')
+        prompt = f"""Today is {now_str}. Go to the YouTube channel @{handle} ({channel_name}) and check if they uploaded any video after {since_str}.
 
-If no new video was published in the last {hours} hours, clearly state "No new videos in the last {hours} hours."
+Check the channel's Videos tab sorted by newest. If their most recent video was uploaded before {since_str}, respond with exactly: "No new videos in the last {hours} hours."
 
-IMPORTANT: Only report a video if it was genuinely published within the last {hours} hours. If you are not certain, say "No new videos in the last {hours} hours." Do NOT report old videos.
-
-If there is a confirmed new video, respond in this exact format:
+If you find a video uploaded after {since_str}, respond in this format:
 
 TITLE: [exact video title]
 URL: [YouTube URL]
-DATE: [publish date]
+DATE: [exact publish date]
 
 ANALYSIS:
-You are a senior macro and crypto analyst at Citadel. Your job is to extract actionable intelligence from this video — not summarise it for a general audience.
+You are a senior macro and crypto analyst at Citadel. Extract actionable intelligence — not a general summary.
 
-Cover the following:
-- MACRO CONTEXT: What macro backdrop or narrative is the creator responding to? Fed, liquidity, risk-on/off, DXY, bonds?
-- KEY THESIS: What is the creator's core directional argument? Bull, bear, neutral? What is the conviction level?
-- PRICE LEVELS & TARGETS: Extract every specific price level, target, support, resistance, or invalidation mentioned. Include the asset name.
-- CATALYSTS: What upcoming events, on-chain signals, or market structure shifts does the creator flag as key catalysts?
-- RISK FACTORS: What does the creator identify as the main downside risks or scenarios that invalidate their thesis?
-- CITADEL TAKE: In one sentence — is this creator's analysis tradeable? Does it align with or contradict current market structure?
+- MACRO CONTEXT: What macro backdrop is the creator responding to? Fed, liquidity, DXY, bonds, geopolitics?
+- KEY THESIS: Core directional argument — bull/bear/neutral? Conviction level?
+- PRICE LEVELS & TARGETS: Every specific price, target, support, resistance, invalidation level. Name the asset.
+- CATALYSTS: Upcoming events, on-chain signals, market structure shifts flagged?
+- RISK FACTORS: Main downside risks or scenarios that invalidate the thesis?
+- CITADEL TAKE: One sentence — tradeable? Aligns with or contradicts current market structure?
 
-Be direct, dense, and institutional. No fluff. Use numbers wherever possible."""
+Dense, institutional, no fluff. Exact numbers."""
 
     try:
         gemini_url = (f'https://generativelanguage.googleapis.com/v1beta/'
@@ -2238,6 +2243,9 @@ def digest_run():
 @app.route('/digest')
 def digest_page():
     """Render the CreatorDigest webpage."""
+    # Always sync from JSONBin so any worker shows latest data
+    if not _digest_cache:
+        _sync_from_jsonbin()
     with _digest_lock:
         items = list(_digest_cache)
 
