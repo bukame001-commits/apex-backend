@@ -2023,109 +2023,1381 @@ _digest_last_run      = None
 _digest_seen          = set()   # tracks video titles already summarised today
 _digest_channel_status = {}     # channel -> 'new video' | 'no new video' | 'error'
 
-def _gemini_call(prompt, gemini_key, use_grounding=True, max_tokens=500):
-    """Single Gemini API call. Returns text or None."""
+def _gemini_analyse_video(channel_name, handle, video_id, video_url, title, lang, gemini_key, deep_dive=True):
+    """Analyse a YouTube video using transcript + Gemini native video fallback."""
+    import google.generativeai as genai_sdk
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    if lang == 'tr':
+        analyst_prompt = f"""Title: {title}
+Channel: {channel_name}
+Role: Senior Citadel Macro Analyst
+Task: Analyse the following Turkish financial content. Translate all key insights into English.
+
+Report Structure:
+1. SUMMARY: 2-sentence executive overview of the creator's core argument.
+2. KEY THESIS: What is the directional bet? Be precise — asset, direction, timeframe.
+3. PRICE LEVELS & TARGETS: Every specific price, support, resistance, target, invalidation mentioned. Name the asset.
+4. TURKISH MARKET IMPACT: Specific implications for TRY, BIST 100, TCMB policy, or local inflation dynamics.
+5. ALPHA SIGNAL: One non-consensus insight the broader market is likely overlooking.
+6. RISK: The bear case they are ignoring or underweighting.
+7. VERDICT: HIGH CONVICTION | SPECULATIVE | NOISE — one sentence why."""
+    else:
+        analyst_prompt = f"""Title: {title}
+Channel: {channel_name}
+Role: Senior Citadel Macro Analyst
+Task: Analyse the following financial content and produce an institutional intelligence report.
+
+Report Structure:
+1. SUMMARY: 2-sentence executive overview of the creator's core argument.
+2. KEY THESIS: What is the directional bet? Be precise — asset, direction, timeframe.
+3. PRICE LEVELS & TARGETS: Every specific price, support, resistance, target, invalidation mentioned. Name the asset.
+4. MACRO CONTEXT: Fed, liquidity, DXY, bonds, geopolitics — what backdrop is the creator responding to?
+5. ALPHA SIGNAL: One non-consensus insight the broader market is likely overlooking.
+6. RISK: The bear case they are ignoring or underweighting.
+7. VERDICT: HIGH CONVICTION | SPECULATIVE | NOISE — one sentence why."""
+
+    model_name = 'gemini-3.1-pro-preview' if deep_dive else 'gemini-2.5-flash'
+    client = genai_sdk.Client(api_key=gemini_key)
+
+    # Step 1: Try transcript first
+    transcript_text = None
     try:
-        gemini_url = (f'https://generativelanguage.googleapis.com/v1beta/'
-                      f'models/gemini-2.5-flash:generateContent?key={gemini_key}')
-        payload = {
-            'contents': [{'parts': [{'text': prompt}]}],
-            'generationConfig': {'maxOutputTokens': max_tokens, 'temperature': 0.2}
-        }
-        if use_grounding:
-            payload['tools'] = [{'google_search': {}}]
-        resp = requests.post(gemini_url, json=payload, timeout=60)
-        if resp.ok:
-            parts = resp.json()['candidates'][0].get('content', {}).get('parts', [])
-            return ' '.join(p['text'] for p in parts if 'text' in p).strip() or None
-        print(f'[DIGEST] Gemini {resp.status_code}: {resp.text[:80]}')
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        try:
+            transcript = transcript_list.find_transcript(['tr', 'en'])
+        except Exception:
+            transcript = transcript_list.find_transcript(['en', 'tr'])
+        transcript_text = ' '.join([t['text'] for t in transcript.fetch()])
+        print(f'[DIGEST] Got transcript for {channel_name} ({len(transcript_text)} chars)')
     except Exception as e:
-        print(f'[DIGEST] Gemini call error: {e}')
-    return None
+        print(f'[DIGEST] Transcript unavailable for {channel_name}: {e}')
+
+    try:
+        if transcript_text:
+            # Analyse via transcript text
+            response = client.models.generate_content(
+                model=model_name,
+                contents=f"{analyst_prompt}\n\nTranscript:\n{transcript_text[:12000]}",
+                config={'thinking_config': {'thinking_level': 'MEDIUM'}, 'max_output_tokens': 2000}
+            )
+        else:
+            # Fallback: pass YouTube URL directly as video part
+            import google.genai.types as genai_types
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    analyst_prompt,
+                    genai_types.Part.from_uri(
+                        file_uri=video_url,
+                        mime_type='video/youtube'
+                    )
+                ],
+                config={'thinking_config': {'thinking_level': 'MEDIUM'}, 'max_output_tokens': 2000}
+            )
+        return response.text
+    except Exception as e:
+        print(f'[DIGEST] Gemini analyse error for {channel_name}: {e}')
+        return None
 
 
-def _gemini_find_and_summarise(channel_name, handle, lang, hours, gemini_key):
-    """Two-step: (1) find latest video URL, (2) analyse that specific URL."""
-    import datetime as _dt2
+def _gemini_find_latest_video(channel_name, handle, hours, gemini_key):
+    """Step 1: Use Gemini grounding to find the latest video URL and ID."""
+    import datetime as _dt2, re, requests as _req
     now_str   = _dt2.datetime.utcnow().strftime('%B %d, %Y')
     since_str = (_dt2.datetime.utcnow() - _dt2.timedelta(hours=hours)).strftime('%B %d, %Y %H:%M UTC')
 
-    # ── Step 1: Find the video URL ────────────────────────────
     find_prompt = f"""Today is {now_str}. Search YouTube for the most recent video uploaded by @{handle} ({channel_name}) after {since_str}.
 
-Check their channel page. If their latest video was uploaded before {since_str}, reply with only: NO_NEW_VIDEO
+Go to their channel page and check the Videos tab sorted by newest first.
 
-If a new video exists, reply with only these three lines:
+If their latest video was uploaded BEFORE {since_str}, reply with exactly: NO_NEW_VIDEO
+
+If a new video exists reply with ONLY these three lines and nothing else:
 TITLE: [exact title]
-URL: [direct youtube.com/watch?v= URL]
-DATE: [upload date]
+URL: https://www.youtube.com/watch?v=[video_id]
+DATE: [upload date]"""
 
-Nothing else."""
+    try:
+        import google.generativeai as genai_sdk
+        client = genai_sdk.Client(api_key=gemini_key)
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=find_prompt,
+            config={'tools': [{'google_search': {}}], 'max_output_tokens': 200}
+        )
+        found = response.text.strip()
+    except Exception as e:
+        print(f'[DIGEST] Find video error for {channel_name}: {e}')
+        return None, None, None
 
-    found = _gemini_call(find_prompt, gemini_key, use_grounding=True, max_tokens=200)
-    if not found:
-        return None
-
-    if 'NO_NEW_VIDEO' in found.upper() or 'no new video' in found.lower():
-        print(f'[DIGEST] No new video for {channel_name}')
-        return None
-
-    # Extract URL from step 1 response
-    import re
-    urls = re.findall(r'https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+', found)
-    video_url = urls[0] if urls else None
+    if not found or 'NO_NEW_VIDEO' in found.upper() or 'no new video' in found.lower():
+        return None, None, None
 
     # Extract title
     title_match = re.search(r'TITLE:\s*(.+)', found)
     title = title_match.group(1).strip() if title_match else ''
 
-    if not video_url:
-        print(f'[DIGEST] Could not extract URL for {channel_name} — response: {found[:100]}')
+    # Extract watch URL
+    url_match = re.search(r'https?://(?:www\.)?youtube\.com/watch\?v=([\w-]+)', found)
+    if not url_match:
+        url_match = re.search(r'https?://youtu\.be/([\w-]+)', found)
+
+    if url_match:
+        video_id  = url_match.group(1)
+        video_url = f'https://www.youtube.com/watch?v={video_id}'
+        print(f'[DIGEST] Found: {channel_name} — {title[:50]} ({video_id})')
+        return title, video_id, video_url
+
+    print(f'[DIGEST] URL not extracted for {channel_name}: {found[:100]}')
+    return None, None, None
+
+
+def _gemini_find_and_summarise(channel_name, handle, lang, hours, gemini_key):
+    """Two-step: find latest video then analyse it with transcript or native video."""
+    title, video_id, video_url = _gemini_find_latest_video(channel_name, handle, hours, gemini_key)
+    if not video_id:
         return None
 
-    print(f'[DIGEST] Found video for {channel_name}: {title[:50]} — {video_url}')
-
-    # ── Step 2: Analyse the specific video URL ────────────────
-    if lang == 'tr':
-        analyse_prompt = f"""Bu YouTube videosunu izle ve Citadel analist bakis acisiyla analiz et:
-{video_url}
-
-Kanal: {channel_name}
-Baslik: {title}
-
-ANALIZ:
-- MAKRO BAGLAM: Hangi makro ortama yakit veriyor? Fed, likidite, DXY, tahviller?
-- ANA TEZ: Temel yonsel arguman — boga/ayi/notr? Guven seviyesi?
-- FIYAT SEVIYELERI: Her fiyat seviyesi, hedef, destek, direnc. Varlik adini yaz.
-- KATALIZORLER: Onemli olaylar, on-chain sinyaller, piyasa yapisi degisimleri?
-- RISK FAKTORLERI: Tezi gecersiz kilan senaryolar?
-- CITADEL GORUSU: Tek cumle — bu analiz islem yapilabilir mi?
-
-Dogrudan, yogun, kurumsal. Sayi kullan."""
-    else:
-        analyse_prompt = f"""Watch this YouTube video and analyse it through the lens of a senior Citadel macro analyst:
-{video_url}
-
-Channel: {channel_name}
-Title: {title}
-
-Provide:
-- MACRO CONTEXT: What macro backdrop is the creator responding to? Fed, liquidity, DXY, bonds, geopolitics?
-- KEY THESIS: Core directional argument — bull/bear/neutral? Conviction level?
-- PRICE LEVELS & TARGETS: Every specific price, target, support, resistance, invalidation. Name the asset.
-- CATALYSTS: Upcoming events, on-chain signals, market structure shifts?
-- RISK FACTORS: Scenarios that invalidate the thesis?
-- CITADEL TAKE: One sentence — tradeable? Aligns with or contradicts current market structure?
-
-Dense, institutional, no fluff. Exact numbers."""
-
-    analysis = _gemini_call(analyse_prompt, gemini_key, use_grounding=True, max_tokens=1500)
+    analysis = _gemini_analyse_video(channel_name, handle, video_id, video_url, title, lang, gemini_key)
     if not analysis:
-        # Fallback: return what we found without deep analysis
-        return f"TITLE: {title}\nURL: {video_url}\n\nANALYSIS: Video found but detailed analysis unavailable."
+        return None
 
-    return f"TITLE: {title}\nURL: {video_url}\n\nANALYSIS:\n{analysis}"
+    return f"TITLE: {title}\nURL: {video_url}\n\n{analysis}"
 
+
+def _parse_gemini_response(text, channel, lang):
+    """Extract title and URL from Gemini's structured response."""
+    import re
+    title, url = '', ''
+    title_key = 'BAŞLIK:' if lang == 'tr' else 'TITLE:'
+    url_key   = 'URL:'
+    for line in text.split('\n'):
+        if line.startswith(title_key):
+            title = line.replace(title_key, '').strip()
+        elif line.startswith(url_key):
+            url = line.replace(url_key, '').strip()
+    # Fallback URL search
+    if not url:
+        urls = re.findall(r'https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+', text)
+        if urls:
+            url = urls[0]
+    return title or f'New video from {channel}', url or ''
+
+def _run_digest(hours=24):
+    """Full digest — Gemini finds and summarises latest videos. No YouTube API needed."""
+    global _digest_last_run
+    gemini_key = os.environ.get('GEMINI_API_KEY', '')
+    tg_token   = os.environ.get('TELEGRAM_BOT_TOKEN', '') or TELEGRAM_BOT_TOKEN
+    tg_chat    = os.environ.get('TELEGRAM_CHAT_ID', '') or TELEGRAM_CHAT_ID
+
+    if not gemini_key:
+        return {'error': 'GEMINI_API_KEY not set'}
+
+    results  = []
+    run_time = time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())
+
+    import datetime as _dt
+    today = _dt.datetime.utcnow().strftime('%Y-%m-%d')
+
+    _channel_status = {ch['name']: '⏳ checking...' for ch in DIGEST_CHANNELS}
+
+    for ch in DIGEST_CHANNELS:
+        print(f'[DIGEST] Checking {ch["name"]}...')
+        response = _gemini_find_and_summarise(ch['name'], ch['handle'], ch['lang'], hours, gemini_key)
+        if not response:
+            _channel_status[ch['name']] = '— no new video'
+            continue
+
+        title, url = _parse_gemini_response(response, ch['name'], ch['lang'])
+
+        seen_key = f'{today}::{ch["name"]}::{title}'
+        if seen_key in _digest_seen:
+            print(f'[DIGEST] Already summarised "{title[:50]}" today — skipping')
+            continue
+        _digest_seen.add(seen_key)
+
+        entry = {
+            'channel':   ch['name'],
+            'category':  ch['category'],
+            'lang':      ch['lang'],
+            'title':     title,
+            'url':       url,
+            'thumb':     '',
+            'published': run_time,
+            'summary':   response,
+            'run_time':  run_time,
+        }
+        _channel_status[ch['name']] = f'✅ {title[:40]}'
+        results.append(entry)
+
+        # Send to Telegram — channel name + title only, full analysis on digest page
+        if tg_token and tg_chat:
+            flag     = '🇹🇷' if ch['lang'] == 'tr' else '🇬🇧'
+            cat_icon = '📊' if ch['category'] == 'Finance' else '₿'
+            link     = f'[{title}]({url})' if url else title
+            msg = f"{flag} {cat_icon} *{ch['name']}*\n🎬 {link}"
+            try:
+                requests.post(
+                    f'https://api.telegram.org/bot{tg_token}/sendMessage',
+                    json={'chat_id': tg_chat, 'text': msg,
+                          'parse_mode': 'Markdown', 'disable_web_page_preview': False},
+                    timeout=10
+                )
+            except Exception as e:
+                print(f'[DIGEST] Telegram error: {e}')
+
+    with _digest_lock:
+        _digest_cache.clear()
+        _digest_cache.extend(results)
+        _digest_last_run = run_time
+        _digest_channel_status.clear()
+        _digest_channel_status.update(_channel_status)
+
+    # Persist digest to JSONBin so all workers see it
+    _store_save()
+
+    # Send digest summary link to Telegram
+    if tg_token and tg_chat and results:
+        try:
+            digest_url = 'https://web-production-d8201.up.railway.app/digest'
+            summary_msg = (f"📡 *CREATOR DIGEST READY*\n"
+                           f"🕐 {run_time}\n"
+                           f"📺 {len(results)} channel(s) summarised\n\n"
+                           f"👉 [View Full Digest]({digest_url})")
+            requests.post(
+                f'https://api.telegram.org/bot{tg_token}/sendMessage',
+                json={'chat_id': tg_chat, 'text': summary_msg,
+                      'parse_mode': 'Markdown', 'disable_web_page_preview': False},
+                timeout=10
+            )
+        except Exception as e:
+            print(f'[DIGEST] Telegram digest link error: {e}')
+
+    print(f'[DIGEST] Done — {len(results)} channels summarised')
+    return {'success': True, 'count': len(results), 'run_time': run_time, 'videos': results}
+
+
+@app.route('/digest/run', methods=['POST'])
+def digest_run():
+    """Trigger a digest run in background — returns immediately, results appear on /digest page."""
+    data  = request.get_json(silent=True, force=True) or {}
+    hours = data.get('hours', 24)
+    # Check if already running
+    if getattr(digest_run, '_running', False):
+        return jsonify({'success': False, 'error': 'Digest already running — please wait'})
+    def _bg():
+        digest_run._running = True
+        try:
+            _run_digest(hours=hours)
+        finally:
+            digest_run._running = False
+    threading.Thread(target=_bg, daemon=True).start()
+    return jsonify({'success': True, 'message': f'Digest started for last {hours}h — reload page in ~2 minutes'})
+
+
+@app.route('/digest')
+def digest_page():
+    """Render the CreatorDigest webpage."""
+    # Always sync from JSONBin so any worker shows latest data
+    if not _digest_cache:
+        _sync_from_jsonbin()
+    with _digest_lock:
+        items = list(_digest_cache)
+
+    # Group by category
+    by_cat = {}
+    for item in items:
+        by_cat.setdefault(item['category'], []).append(item)
+
+    cards_html = ''
+    if not items:
+        cards_html = '<div style="color:#555;text-align:center;padding:60px;letter-spacing:2px;font-size:12px">NO DIGEST DATA — RUN THE DIGEST FIRST</div>'
+    else:
+        for cat, vids in by_cat.items():
+            icon = '📊' if cat == 'Finance' else '₿'
+            cards_html += f'<div class="cat-header">{icon} {cat.upper()}</div>'
+            for v in vids:
+                flag = '🇹🇷' if v['lang'] == 'tr' else '🇬🇧'
+                summary_html = v['summary'].replace('\n', '<br>').replace('**', '<b>').replace('*', '')
+                thumb = f'<img src="{v["thumb"]}" style="width:100%;border-radius:4px;margin-bottom:12px">' if v['thumb'] else ''
+                cards_html += f"""
+                <div class="card">
+                  {thumb}
+                  <div class="ch-name">{flag} {v['channel']} <span class="time">{v['published'][:10]}</span></div>
+                  <a class="vid-title" href="{v['url']}" target="_blank">{v['title']}</a>
+                  <div class="summary">{summary_html}</div>
+                  <a class="watch-btn" href="{v['url']}" target="_blank">▶ WATCH VIDEO</a>
+                </div>"""
+
+    last = _digest_last_run or 'Never'
+    with _digest_lock:
+        ch_status = dict(_digest_channel_status)
+
+    # Build channel status table
+    status_rows = ''
+    for ch in DIGEST_CHANNELS:
+        st = ch_status.get(ch['name'], '— not checked yet')
+        flag = '🇹🇷' if ch['lang'] == 'tr' else '🇬🇧'
+        color = '#00ff88' if st.startswith('✅') else '#444' if st.startswith('—') else '#f0c040'
+        status_rows += f'<tr><td style="color:#aaa">{flag} {ch["name"]}</td><td style="color:{color};text-align:right">{st}</td></tr>'
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>APEX — Creator Digest</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@700;900&display=swap" rel="stylesheet">
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#0a0a0f;color:#e0e0e0;font-family:'Share Tech Mono',monospace;padding:16px}}
+  .header{{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;border-bottom:1px solid #1a1a2e;padding-bottom:14px;margin-bottom:20px}}
+  .title{{font-family:'Orbitron',monospace;font-size:18px;font-weight:900;color:#00d4ff;letter-spacing:4px}}
+  .subtitle{{font-size:9px;color:#444;letter-spacing:2px;margin-top:4px}}
+  .nav-links{{display:flex;gap:8px;flex-wrap:wrap}}
+  .nav-links a{{font-size:9px;color:#888;text-decoration:none;border:1px solid #2a2a3e;padding:4px 12px;letter-spacing:1px}}
+  .nav-links a:hover{{color:#00d4ff;border-color:#00d4ff}}
+  .run-bar{{display:flex;align-items:center;gap:10px;margin-bottom:20px;flex-wrap:wrap}}
+  .run-btn{{background:#00d4ff22;border:1px solid #00d4ff;color:#00d4ff;padding:8px 20px;font-family:'Share Tech Mono',monospace;font-size:11px;cursor:pointer;letter-spacing:2px}}
+  .run-btn:hover{{background:#00d4ff44}}
+  .run-btn:disabled{{opacity:0.4;cursor:not-allowed}}
+  .last-run{{font-size:9px;color:#444;letter-spacing:1px}}
+  .status{{font-size:11px;color:#f0c040;letter-spacing:1px}}
+  .cat-header{{font-size:10px;color:#00d4ff;letter-spacing:3px;margin:24px 0 12px;border-left:3px solid #00d4ff;padding-left:10px}}
+  .card{{background:#0f0f1a;border:1px solid #1a1a2e;padding:16px;margin-bottom:14px;border-radius:4px}}
+  .card:hover{{border-color:#2a2a4e}}
+  .ch-name{{font-size:10px;color:#888;letter-spacing:2px;margin-bottom:6px;display:flex;justify-content:space-between}}
+  .time{{color:#444}}
+  .vid-title{{display:block;font-size:14px;color:#00d4ff;text-decoration:none;margin-bottom:12px;line-height:1.4;font-weight:bold}}
+  .vid-title:hover{{color:#fff}}
+  .summary{{font-size:12px;color:#bbb;line-height:1.7;margin-bottom:14px}}
+  .watch-btn{{display:inline-block;font-size:10px;color:#00d4ff;text-decoration:none;border:1px solid #00d4ff33;padding:5px 14px;letter-spacing:1px}}
+  .watch-btn:hover{{background:#00d4ff22}}
+  .hours-select{{background:#111;border:1px solid #2a2a3e;color:#e0e0e0;padding:6px 10px;font-family:'Share Tech Mono',monospace;font-size:11px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <div class="title">📡 CREATOR DIGEST</div>
+    <div class="subtitle">AI SUMMARIES · YOUTUBE · CRYPTO & FINANCE CHANNELS</div>
+  </div>
+  <div class="nav-links">
+    <a href="/reports">📋 REPORTS</a>
+    <a href="/backtest">📊 BACKTEST</a>
+    <a href="https://bukame001-commits.github.io/apex-scanner/">⚡ SCANNER</a>
+  </div>
+</div>
+
+<details style="margin-bottom:16px;border:1px solid #1a1a2e;padding:10px">
+  <summary style="font-size:10px;color:#555;letter-spacing:2px;cursor:pointer">CHANNEL STATUS ▼</summary>
+  <table style="width:100%;margin-top:10px;font-size:11px;border-collapse:collapse">
+    {status_rows}
+  </table>
+</details>
+<div class="run-bar">
+  <select class="hours-select" id="hoursSelect">
+    <option value="24">Last 24 hours</option>
+    <option value="48">Last 48 hours</option>
+    <option value="72">Last 72 hours</option>
+    <option value="168">Last 7 days</option>
+  </select>
+  <button class="run-btn" onclick="runDigest()" id="runBtn">▶ RUN DIGEST</button>
+  <span class="last-run">Last run: {last}</span>
+  <span class="status" id="status"></span>
+</div>
+
+{cards_html}
+
+<script>
+async function runDigest() {{
+  const btn = document.getElementById('runBtn');
+  const status = document.getElementById('status');
+  const hours = parseInt(document.getElementById('hoursSelect').value);
+  btn.disabled = true;
+  btn.textContent = '⏳ RUNNING...';
+  status.textContent = 'Started — checking all channels. Takes ~2 mins. Auto-refreshing...';
+  try {{
+    const r = await fetch('/digest/run', {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{hours}})
+    }});
+    const d = await r.json();
+    if (d.success) {{
+      status.textContent = '⏳ ' + d.message;
+      let polls = 0;
+      const timer = setInterval(() => {{
+        polls++;
+        if (polls > 12) {{ clearInterval(timer); }}
+        location.reload();
+      }}, 15000);
+    }} else {{
+      status.textContent = `❌ ${{d.error || d.message}}`;
+      btn.disabled = false;
+      btn.textContent = '▶ RUN DIGEST';
+    }}
+  }} catch(e) {{
+    status.textContent = `❌ ${{e.message}}`;
+    btn.disabled = false;
+    btn.textContent = '▶ RUN DIGEST';
+  }}
+}}
+</script>
+</body>
+</html>"""
+
+
+def _digest_scheduler():
+    import datetime as _dt
+    while True:
+        now      = _dt.datetime.utcnow()
+        midnight = (now + _dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        target   = now.replace(hour=7, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += _dt.timedelta(days=1)
+        next_event = min(midnight, target)
+        wait = (next_event - now).total_seconds()
+        time.sleep(max(wait, 1))
+        now = _dt.datetime.utcnow()
+        if now.hour == 0:
+            _digest_seen.clear()
+            print('[DIGEST] Midnight — seen videos cleared')
+        if now.hour == 7:
+            print('[DIGEST] Auto-run starting...')
+            try:
+                _run_digest(hours=24)
+            except Exception as e:
+                print(f'[DIGEST] Auto-run error: {e}')
+
+# Start digest scheduler in background
+_digest_thread = threading.Thread(target=_digest_scheduler, daemon=True)
+_digest_thread.start()
+
+# ── END CREATOR DIGEST ─────────────────────────────────────────
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok', 'monitor': _monitor_running})
+
+# ── Fetch single stock from Yahoo Finance ─────────────────────
+def parse_klines_from_rows(rows, interval):
+    """Convert OHLCV rows (list of lists) into kline format [[ts_ms, o, h, l, c, v], ...]"""
+    import datetime
+    klines = []
+    for row in rows:
+        try:
+            if len(row) < 5:
+                continue
+            # Parse date string to timestamp
+            date_str = str(row[0]).strip()
+            try:
+                dt = datetime.datetime.strptime(date_str, '%Y-%m-%d')
+            except ValueError:
+                try:
+                    dt = datetime.datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+                except ValueError:
+                    continue
+            ts_ms = int(dt.timestamp() * 1000)
+            o = float(row[1]) if row[1] and str(row[1]).strip() not in ('', 'null') else None
+            h = float(row[2]) if row[2] and str(row[2]).strip() not in ('', 'null') else None
+            l = float(row[3]) if row[3] and str(row[3]).strip() not in ('', 'null') else None
+            c = float(row[4]) if row[4] and str(row[4]).strip() not in ('', 'null') else None
+            v = float(row[5]) if len(row) > 5 and row[5] and str(row[5]).strip() not in ('', 'null') else 0
+            if o and h and l and c:
+                klines.append([ts_ms, o, h, l, c, v])
+        except Exception:
+            continue
+    return klines
+
+def fetch_stooq(sym, interval='1wk'):
+    """Fetch OHLCV from Stooq as fallback. Returns klines list or None."""
+    try:
+        # Stooq interval codes: d=daily, w=weekly, m=monthly
+        interval_map = {'1wk': 'w', '1d': 'd', '60m': 'd'}  # No hourly on Stooq free
+        stooq_interval = interval_map.get(interval, 'd')
+        # Stooq ticker format: lowercase + .us suffix
+        stooq_sym = sym.lower().replace('-', '.') + '.us'
+        url = f'https://stooq.com/q/d/l/?s={stooq_sym}&i={stooq_interval}'
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,*/*',
+            'Referer': 'https://stooq.com/'
+        }
+        r = requests.get(url, headers=headers, timeout=10)
+        if not r.ok or 'No data' in r.text or len(r.text) < 50:
+            return None
+        # Parse CSV — header: Date,Open,High,Low,Close,Volume
+        lines = r.text.strip().splitlines()
+        if len(lines) < 3:
+            return None
+        rows = []
+        for line in lines[1:]:  # skip header
+            parts = line.strip().split(',')
+            if len(parts) >= 5:
+                rows.append(parts)
+        # Stooq returns oldest first — reverse to get newest last (match Yahoo format)
+        rows.reverse()
+        klines = parse_klines_from_rows(rows, interval)
+        return klines if len(klines) >= 20 else None
+    except Exception as e:
+        print(f'Stooq {sym} error: {e}')
+        return None
+
+def fetch_one_stock(sym, interval='1wk'):
+    try:
+        # Normalise interval names (frontend may send 1w, Yahoo needs 1wk)
+        interval_map = {'1w': '1wk', '1week': '1wk', '4h': '60m', '4hour': '60m'}
+        interval = interval_map.get(interval, interval)
+        range_map = {'1wk': '4y', '1d': '2y', '60m': '730d'}
+        range_val = range_map.get(interval, '4y')
+
+        # ── 1. Try Yahoo Finance first ──
+        yahoo_klines = None
+        market_cap = None
+        try:
+            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={interval}&range={range_val}'
+            r = requests.get(url, headers=HEADERS, timeout=8)
+            if r.ok:
+                data = r.json()
+                result = data.get('chart', {}).get('result', [None])[0]
+                if result:
+                    timestamps = result.get('timestamp', [])
+                    q = result.get('indicators', {}).get('quote', [{}])[0]
+                    market_cap = result.get('meta', {}).get('marketCap')
+                    if q and len(timestamps) >= 20:
+                        klines = []
+                        opens   = q.get('open',   [None]*len(timestamps))
+                        highs   = q.get('high',   [None]*len(timestamps))
+                        lows    = q.get('low',    [None]*len(timestamps))
+                        closes  = q.get('close',  [None]*len(timestamps))
+                        volumes = q.get('volume', [0]*len(timestamps))
+                        for i, ts in enumerate(timestamps):
+                            if opens[i] is not None and closes[i] is not None:
+                                klines.append([ts * 1000, opens[i], highs[i], lows[i], closes[i], volumes[i] or 0])
+                        if len(klines) >= 20:
+                            yahoo_klines = klines
+        except Exception as e:
+            print(f'{sym} Yahoo error: {e}')
+
+        if yahoo_klines:
+            return sym, {'klines': yahoo_klines, 'marketCap': market_cap, 'type': 'stock'}
+
+        # ── 2. Stooq fallback — only fires when Yahoo fails ──
+        # Skip Stooq for 60m (intraday) — it doesn't have reliable hourly data
+        if interval != '60m':
+            print(f'{sym}: Yahoo failed, trying Stooq...')
+            stooq_klines = fetch_stooq(sym, interval)
+            if stooq_klines:
+                print(f'{sym}: Stooq success ({len(stooq_klines)} bars)')
+                return sym, {'klines': stooq_klines, 'marketCap': None, 'type': 'stock'}
+
+        return sym, None
+    except Exception as e:
+        print(f'{sym} error: {e}')
+        return sym, None
+
+# ── Crypto pairs — fetch real list from multiple exchanges ───
+@app.route('/binance-pairs')
+def binance_pairs():
+    EXCLUDE = {'USDT','USDC','BUSD','TUSD','USDD','USDP','FDUSD','DAI','FRAX',
+               'LUSD','PYUSD','GUSD','SUSD','USDB','USDX','EURC','WBTC','WETH',
+               'WBNB','STETH','WSTETH','CBETH','RETH','BETH','BTCB','HBTC'}
+    seen = set()
+    symbols = []
+
+    # 1. Try Binance
+    try:
+        r = requests.get('https://api.binance.com/api/v3/exchangeInfo', headers=HEADERS, timeout=10)
+        if r.ok:
+            data = r.json()
+            for s in data.get('symbols', []):
+                if (s.get('quoteAsset') == 'USDT' and
+                    s.get('status') == 'TRADING' and
+                    s.get('isSpotTradingAllowed', False)):
+                    base = s['baseAsset']
+                    if base not in seen and base not in EXCLUDE:
+                        seen.add(base)
+                        symbols.append(base)
+            if symbols:
+                print(f'Binance pairs: {len(symbols)}')
+                return jsonify({'symbols': symbols, 'count': len(symbols), 'source': 'binance'})
+    except Exception as e:
+        print(f'Binance exchangeInfo error: {e}')
+
+    # 2. Try KuCoin
+    try:
+        r2 = requests.get('https://api.kucoin.com/api/v2/symbols', headers=HEADERS, timeout=10)
+        if r2.ok:
+            data2 = r2.json()
+            for s in data2.get('data', []):
+                if s.get('quoteCurrency') == 'USDT' and s.get('enableTrading', False):
+                    base = s['baseCurrency']
+                    if base not in seen and base not in EXCLUDE:
+                        seen.add(base)
+                        symbols.append(base)
+            if symbols:
+                print(f'KuCoin pairs: {len(symbols)}')
+                return jsonify({'symbols': symbols, 'count': len(symbols), 'source': 'kucoin'})
+    except Exception as e:
+        print(f'KuCoin symbols error: {e}')
+
+    # 3. Try OKX
+    try:
+        r3 = requests.get('https://www.okx.com/api/v5/public/instruments?instType=SPOT', headers=HEADERS, timeout=10)
+        if r3.ok:
+            data3 = r3.json()
+            for s in data3.get('data', []):
+                if s.get('quoteCcy') == 'USDT' and s.get('state') == 'live':
+                    base = s['baseCcy']
+                    if base not in seen and base not in EXCLUDE:
+                        seen.add(base)
+                        symbols.append(base)
+            if symbols:
+                print(f'OKX pairs: {len(symbols)}')
+                return jsonify({'symbols': symbols, 'count': len(symbols), 'source': 'okx'})
+    except Exception as e:
+        print(f'OKX instruments error: {e}')
+
+    return jsonify({'symbols': [], 'count': 0, 'source': 'none'})
+
+# ── Crypto OHLCV data — fetch from multiple exchanges server-side ──────
+@app.route('/crypto')
+def crypto():
+    symbols_param = request.args.get('symbols', '')
+    symbols = [s.strip().upper() for s in symbols_param.split(',') if s.strip()][:200]
+    if not symbols:
+        return jsonify({})
+
+    interval = request.args.get('interval', '1d')
+    limit = int(request.args.get('limit', '300'))
+
+    # Normalize intervals per exchange
+    kucoin_interval = {'1w': '1week', '4h': '4hour', '1d': '1day'}.get(interval, '1day')
+    binance_interval = {'1w': '1w', '4h': '4h', '1d': '1d'}.get(interval, '1d')
+    okx_bar = {'1w': '1W', '4h': '4H', '1d': '1D'}.get(interval, '1D')
+
+    print(f'[CRYPTO] {len(symbols)} symbols | interval={interval} kucoin={kucoin_interval} binance={binance_interval} okx={okx_bar}')
+
+    def fetch_one_crypto(sym):
+        # ── For weekly: try OKX first (returns 300 bars in one call) ──
+        if interval == '1w':
+            try:
+                url_okx_w = f'https://www.okx.com/api/v5/market/history-candles?instId={sym}-USDT&bar=1W&limit=300'
+                r_okx = requests.get(url_okx_w, headers=HEADERS, timeout=10)
+                if r_okx.ok:
+                    raw = r_okx.json().get('data', [])
+                    if raw and len(raw) >= 50:
+                        klines = []
+                        for c in reversed(raw):
+                            try:
+                                klines.append([int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])])
+                            except Exception:
+                                continue
+                        if len(klines) >= 50:
+                            return sym, {'klines': klines, 'type': 'crypto', 'source': 'okx_weekly'}
+            except Exception as e:
+                print(f'[CRYPTO] OKX weekly {sym} error: {e}')
+
+        # ── 1. KuCoin — reliable from Railway/cloud IPs ──
+        try:
+            end_ts = int(time.time())
+            secs = {'1week': 604800, '1day': 86400, '4hour': 14400}.get(kucoin_interval, 86400)
+            start_ts = end_ts - (limit * secs)
+            url_kc = f'https://api.kucoin.com/api/v1/market/candles?symbol={sym}-USDT&type={kucoin_interval}&startAt={start_ts}&endAt={end_ts}'
+            r = requests.get(url_kc, headers=HEADERS, timeout=10)
+            if r.ok:
+                candles = r.json().get('data', [])
+                if candles and len(candles) >= 20:
+                    klines = []
+                    for c in reversed(candles):
+                        try:
+                            klines.append([int(c[0])*1000, float(c[1]), float(c[3]), float(c[4]), float(c[2]), float(c[5])])
+                        except Exception:
+                            continue
+                    if len(klines) >= 20:
+                        return sym, {'klines': klines, 'type': 'crypto', 'source': 'kucoin'}
+            else:
+                print(f'[CRYPTO] KuCoin {sym}: HTTP {r.status_code}')
+        except Exception as e:
+            print(f'[CRYPTO] KuCoin {sym} error: {e}')
+
+        # ── 2. OKX ──
+        try:
+            url_okx = f'https://www.okx.com/api/v5/market/history-candles?instId={sym}-USDT&bar={okx_bar}&limit={min(limit, 300)}'
+            r2 = requests.get(url_okx, headers=HEADERS, timeout=10)
+            if r2.ok:
+                candles2 = r2.json().get('data', [])
+                if candles2 and len(candles2) >= 20:
+                    klines = []
+                    for c in reversed(candles2):
+                        try:
+                            klines.append([int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])])
+                        except Exception:
+                            continue
+                    if len(klines) >= 20:
+                        return sym, {'klines': klines, 'type': 'crypto', 'source': 'okx'}
+            else:
+                print(f'[CRYPTO] OKX {sym}: HTTP {r2.status_code}')
+        except Exception as e:
+            print(f'[CRYPTO] OKX {sym} error: {e}')
+
+        # ── 3. Binance Spot ──
+        try:
+            url_bs = f'https://api.binance.com/api/v3/klines?symbol={sym}USDT&interval={binance_interval}&limit={limit}'
+            r3 = requests.get(url_bs, headers=HEADERS, timeout=8)
+            if r3.ok:
+                data3 = r3.json()
+                if isinstance(data3, list) and len(data3) >= 20:
+                    klines = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in data3]
+                    return sym, {'klines': klines, 'type': 'crypto', 'source': 'binance_spot'}
+            else:
+                print(f'[CRYPTO] Binance Spot {sym}: HTTP {r3.status_code} {r3.text[:80]}')
+        except Exception as e:
+            print(f'[CRYPTO] Binance Spot {sym} error: {e}')
+
+        # ── 4. Binance Futures ──
+        try:
+            url_bf = f'https://fapi.binance.com/fapi/v1/klines?symbol={sym}USDT&interval={binance_interval}&limit={limit}'
+            r4 = requests.get(url_bf, headers=HEADERS, timeout=8)
+            if r4.ok:
+                data4 = r4.json()
+                if isinstance(data4, list) and len(data4) >= 20:
+                    klines = [[c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in data4]
+                    return sym, {'klines': klines, 'type': 'crypto', 'source': 'binance_futures'}
+            else:
+                print(f'[CRYPTO] Binance Futures {sym}: HTTP {r4.status_code} {r4.text[:80]}')
+        except Exception as e:
+            print(f'[CRYPTO] Binance Futures {sym} error: {e}')
+
+        print(f'[CRYPTO] ALL sources failed for {sym}')
+        return sym, None
+
+    results = {}
+    # Reduced workers to avoid triggering exchange rate limits
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(fetch_one_crypto, sym): sym for sym in symbols}
+        for future in as_completed(futures):
+            sym, data = future.result()
+            if data:
+                results[sym] = data
+
+    sources = {}
+    for d in results.values():
+        src = d.get('source', 'unknown')
+        sources[src] = sources.get(src, 0) + 1
+    print(f'[CRYPTO] Done: {len(results)}/{len(symbols)} fetched. Sources: {sources}')
+    return jsonify(results)
+
+# ── Stock OHLCV data — parallel fetch via thread pool ────────
+@app.route('/stocks')
+def stocks():
+    symbols_param = request.args.get('symbols', '')
+    symbols = [s.strip().upper() for s in symbols_param.split(',') if s.strip()][:200]
+    if not symbols:
+        return jsonify({})
+
+    interval = request.args.get('interval', '1wk')
+    results = {}
+    with ThreadPoolExecutor(max_workers=40) as executor:
+        futures = {executor.submit(fetch_one_stock, sym, interval): sym for sym in symbols}
+        for future in as_completed(futures):
+            sym, data = future.result()
+            if data:
+                results[sym] = data
+
+    return jsonify(results)
+
+# ── Russell 2000 constituents via iShares IWM ETF ────────────
+@app.route('/russell2000')
+def russell2000():
+    global _russell_cache, _russell_cache_time
+
+    # Return cache if still fresh
+    if _russell_cache and (time.time() - _russell_cache_time) < CACHE_TTL:
+        return jsonify({
+            'tickers': _russell_cache,
+            'count': len(_russell_cache),
+            'source': 'cache'
+        })
+
+    try:
+        url = (
+            'https://www.ishares.com/us/products/239707/ishares-russell-2000-etf/'
+            '1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund'
+        )
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.ishares.com/',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        }
+        r = requests.get(url, headers=headers, timeout=20)
+        if not r.ok:
+            raise Exception(f'iShares returned {r.status_code}')
+
+        tickers = []
+        seen = set()
+        reader = csv.reader(io.StringIO(r.text))
+        data_started = False
+        consecutive_invalid = 0
+
+        for row in reader:
+            if not row:
+                continue
+            ticker = row[0].strip().strip('"').upper()
+
+            # Skip header rows until we hit real ticker data
+            if not data_started:
+                if ticker and 1 <= len(ticker) <= 5 and ticker.replace('-','').replace('.','').isalpha():
+                    data_started = True
+                else:
+                    continue
+
+            # Stop if we hit the cash/futures/footer section
+            # iShares CSVs end equity section with rows like "Cash", "-", empty tickers
+            if not ticker or ticker in ('TICKER','NAME','CASH','USD','EUR','GBP','-','','TOTAL'):
+                consecutive_invalid += 1
+                if consecutive_invalid > 10:
+                    break  # End of equity section
+                continue
+            consecutive_invalid = 0
+
+            # Accept standard US equity tickers: 1-5 alpha chars, optional hyphen for class shares
+            # Covers: AAPL, BRK-B, BF-B, etc.
+            clean = ticker.replace('-','').replace('.','')
+            if not (1 <= len(ticker) <= 6 and clean.isalpha() and clean.isupper()):
+                continue
+
+            # Skip known non-equity rows
+            if ticker in ('CASH','USD','EUR','GBP','CHF','JPY','XTSLA','PUT','CALL'):
+                continue
+
+            if ticker not in seen:
+                seen.add(ticker)
+                tickers.append(ticker)
+
+        if len(tickers) > 100:
+            _russell_cache = tickers
+            _russell_cache_time = time.time()
+            print(f'Russell 2000: fetched {len(tickers)} tickers from iShares')
+            return jsonify({
+                'tickers': tickers,
+                'count': len(tickers),
+                'source': 'ishares'
+            })
+
+        raise Exception(f'Only parsed {len(tickers)} tickers — possible format change')
+
+    except Exception as e:
+        print(f'Russell 2000 fetch failed: {e}')
+        return jsonify({'error': str(e)}), 503
+
+# ── S&P 500 constituents via iShares IVV ETF ─────────────────
+@app.route('/sp500')
+def sp500():
+    try:
+        url = (
+            'https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/'
+            '1467271812596.ajax?fileType=csv&fileName=IVV_holdings&dataType=fund'
+        )
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.ishares.com/'
+        }
+        r = requests.get(url, headers=headers, timeout=20)
+        if not r.ok:
+            raise Exception(f'{r.status_code}')
+
+        tickers = []
+        reader = csv.reader(io.StringIO(r.text))
+        started = False
+        for row in reader:
+            if not row:
+                continue
+            ticker = row[0].strip().strip('"')
+            if not started:
+                if ticker.isupper() and 1 <= len(ticker) <= 5 and ticker.isalpha():
+                    started = True
+                else:
+                    continue
+            if ticker and ticker.isupper() and ticker.isalpha() and ticker not in ('CASH', 'USD'):
+                tickers.append(ticker)
+
+        return jsonify({'tickers': tickers[:505], 'count': len(tickers)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 503
+
+# ── Monitor control routes ───────────────────────────────────
+@app.route('/monitor/config', methods=['POST'])
+def monitor_config():
+    """Accept token/chat_id from frontend and store for this session."""
+    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+    data = request.get_json(silent=True) or {}
+    token   = data.get('token', '').strip()
+    chat_id = data.get('chat_id', '').strip()
+    if token and chat_id:
+        TELEGRAM_BOT_TOKEN = token
+        TELEGRAM_CHAT_ID   = chat_id
+        print(f'[MONITOR] Telegram configured via frontend — chat_id: {chat_id}')
+        return jsonify({'ok': True, 'message': 'Telegram configured for this session'})
+    return jsonify({'ok': False, 'message': 'Missing token or chat_id'}), 400
+
+@app.route('/monitor/status')
+def monitor_status():
+    now = time.time()
+    recent = [sym for sym, t in _last_alert_time.items() if now - t < ALERT_COOLDOWN_SECONDS]
+    return jsonify({
+        'running': _monitor_running,
+        'scan_interval_minutes': SCAN_INTERVAL_SECONDS // 60,
+        'alert_cooldown_hours': ALERT_COOLDOWN_SECONDS // 3600,
+        'spike_threshold': VOLUME_SPIKE_MULTIPLIER,
+        'coins_monitored': len(MONITOR_COINS),
+        'recent_alerts': len(recent),
+        'telegram_configured': bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+    })
+
+@app.route('/monitor/test')
+def monitor_test():
+    """Send test message — accepts token/chat_id as query params for one-off test."""
+    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+    # Allow passing token/chat_id directly in URL for test
+    token   = request.args.get('token',   TELEGRAM_BOT_TOKEN).strip()
+    chat_id = request.args.get('chat_id', TELEGRAM_CHAT_ID).strip()
+    if token and chat_id:
+        # Temporarily set for this request
+        old_token, old_cid = TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+        TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID = token, chat_id
+        ok = send_telegram(
+            f'✅ <b>APEX SCANNER</b> — Test notification\n'
+            f'Alerts are working correctly!\n'
+            f'Monitoring <b>{len(MONITOR_COINS)}</b> coins for volume spikes (2.5× threshold).'
+        )
+        TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID = old_token, old_cid
+        return jsonify({'sent': ok})
+    return jsonify({'sent': False, 'error': 'No Telegram token configured'})
+
+@app.route('/monitor/scan-now')
+def monitor_scan_now():
+    """Trigger an immediate scan. Accepts token/chat_id to set config first."""
+    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+    token   = request.args.get('token',   '').strip()
+    chat_id = request.args.get('chat_id', '').strip()
+    if token and chat_id:
+        TELEGRAM_BOT_TOKEN = token
+        TELEGRAM_CHAT_ID   = chat_id
+    threading.Thread(target=run_monitor_scan, daemon=True).start()
+    return jsonify({'status': 'scan started', 'coins': len(MONITOR_COINS)})
+
+# ── Telegram Intelligence — import module ────────────────────
+try:
+    import telegram_intel as tg_intel
+    print('[TG-INTEL] Module loaded')
+except Exception as e:
+    tg_intel = None
+    print(f'[TG-INTEL] Module load failed: {e}')
+
+@app.route('/tg-intel/status')
+def tg_intel_status():
+    if not tg_intel:
+        return jsonify({'ok': False, 'error': 'Module not loaded'})
+    return jsonify({
+        'ok':             True,
+        'authenticated':  tg_intel.is_authenticated(),
+        'has_apex_data':  len(tg_intel._last_apex_alerts) > 0,
+        'has_vol_data':   len(tg_intel._last_volume_spikes) > 0,
+        'apex_count':     len(tg_intel._last_apex_alerts),
+        'vol_count':      len(tg_intel._last_volume_spikes),
+    })
+
+@app.route('/tg-intel/send-code', methods=['POST'])
+def tg_intel_send_code():
+    if not tg_intel:
+        return jsonify({'ok': False, 'error': 'Module not loaded'})
+    data     = request.get_json()
+    api_id   = data.get('api_id', '').strip()
+    api_hash = data.get('api_hash', '').strip()
+    phone    = data.get('phone', '').strip()
+    if not api_id or not api_hash or not phone:
+        return jsonify({'ok': False, 'error': 'api_id, api_hash and phone required'})
+    result = tg_intel.auth_send_code(api_id, api_hash, phone)
+    return jsonify(result)
+
+@app.route('/tg-intel/verify-code', methods=['POST'])
+def tg_intel_verify_code():
+    if not tg_intel:
+        return jsonify({'ok': False, 'error': 'Module not loaded'})
+    data     = request.get_json()
+    phone    = data.get('phone', '').strip()
+    code     = data.get('code', '').strip()
+    api_id   = data.get('api_id', '').strip()
+    api_hash = data.get('api_hash', '').strip()
+    if not phone or not code:
+        return jsonify({'ok': False, 'error': 'phone and code required'})
+    result = tg_intel.auth_verify_code(phone, code, api_id, api_hash)
+    return jsonify(result)
+
+@app.route('/tg-intel/verify-2fa', methods=['POST'])
+def tg_intel_verify_2fa():
+    if not tg_intel:
+        return jsonify({'ok': False, 'error': 'Module not loaded'})
+    data     = request.get_json()
+    password = data.get('password', '').strip()
+    api_id   = data.get('api_id', '').strip()
+    api_hash = data.get('api_hash', '').strip()
+    if not password:
+        return jsonify({'ok': False, 'error': 'password required'})
+    result = tg_intel.auth_verify_2fa(password, api_id, api_hash)
+    return jsonify(result)
+
+_app_start_time = time.time()
+
+@app.route('/tg-intel/run', methods=['POST'])
+def tg_intel_run():
+    if not tg_intel:
+        return jsonify({'ok': False, 'error': 'Module not loaded'})
+    if not tg_intel.is_authenticated():
+        return jsonify({'ok': False, 'error': 'Not authenticated — complete setup first'})
+    # Ignore requests that arrive within 90s of startup (stale browser requests)
+    if time.time() - _app_start_time < 90:
+        print('[TG-INTEL] Ignoring run request — too soon after startup')
+        return jsonify({'ok': False, 'error': 'Server just started — please wait a moment and try again'})
+    data     = request.get_json()
+    channels = data.get('channels', [])   # list of [name, id] pairs
+    hours    = int(data.get('hours', 24))
+    if not channels:
+        return jsonify({'ok': False, 'error': 'No channels provided'})
+    # Run in background thread — returns immediately
+    def _run():
+        report, err = tg_intel.run_analysis(channels, lookback_hours=hours)
+        if err:
+            print(f'[TG-INTEL] Analysis error: {err}')
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({'ok': True, 'status': 'Analysis started — report will arrive on Telegram'})
+
+@app.route('/apex-results', methods=['POST'])
+def apex_results():
+    """Receive APEX scan results from frontend and store for Intelligence analysis."""
+    try:
+        if not tg_intel:
+            return jsonify({'ok': False})
+        data    = request.get_json()
+        alerts  = data.get('alerts', [])
+        tg_intel.set_apex_alerts(alerts)
+        print(f'[TG-INTEL] Received {len(alerts)} APEX results from frontend')
+        return jsonify({'ok': True, 'count': len(alerts)})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/volume-results', methods=['POST'])
+def volume_results():
+    """Receive volume spike results from frontend and store for Intelligence analysis."""
+    try:
+        if not tg_intel:
+            return jsonify({'ok': False})
+        data   = request.get_json()
+        spikes = data.get('spikes', [])
+        tg_intel.set_volume_spikes(spikes)
+        print(f'[TG-INTEL] Received {len(spikes)} volume spikes from frontend')
+        return jsonify({'ok': True, 'count': len(spikes)})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+# ════════════════════════════════════════════════════════════════
+# FIND THE BOTTOM — On-chain accumulation intelligence endpoint
+# ════════════════════════════════════════════════════════════════
+
+def fetch_bottom_signals():
+    """
+    Fetch all 5 tiers of on-chain signals to detect market bottoms.
+    Uses free APIs: Binance, CryptoQuant (free), Glassnode (free tier).
+    Returns structured signal data with deploy score.
+    """
+    signals = []
+    deploy_score = 0
+
+    # ── TIER 1: NUPL ──────────────────────────────────────────
+    # Already cached from volume scan, or fetch fresh
+    try:
+        nupl = fetch_nupl()
+        if nupl is not None:
+            if nupl < 0:
+                status = 'green'; pts = 1
+                interp = f'Entire market underwater. Long-term holders capitulating. Historically the strongest buy zone — every BTC bottom has touched NUPL < 0.'
+            elif nupl < 0.25:
+                status = 'amber'; pts = 0
+                interp = f'Market near breakeven. Fear and hope mixed. Not yet full capitulation but approaching accumulation territory.'
+            else:
+                status = 'red'; pts = 0
+                interp = f'Market still in profit on average. Not yet a bottom — too early to deploy full position.'
+            deploy_score += pts
+            signals.append({
+                'tier':           'TIER 1',
+                'name':           'NUPL (Net Unrealized Profit/Loss)',
+                'value':          f'{nupl:.4f}',
+                'status':         status,
+                'interpretation': interp,
+            })
+    except Exception as e:
+        signals.append({'tier':'TIER 1','name':'NUPL','value':'Unavailable','status':'red','interpretation':str(e)})
+
+    # -- TIER 2: LTH Realized Price vs Current Price --------
+    # Coinmetrics (real) -> Bitbo -> 2yr MA proxy
+    try:
+        lth_price = fetch_lth_realized_price()
+        klines_url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=365"
+        r = requests.get(klines_url, headers=HEADERS, timeout=10)
+        current_price = None
+        vwap_365 = None
+        if r.ok:
+            klines = r.json()
+            closes  = [float(k[4]) for k in klines]
+            volumes = [float(k[5]) for k in klines]
+            current_price = closes[-1]
+            total_vol = sum(volumes)
+            vwap_365 = sum(cv*v for cv,v in zip(closes, volumes)) / total_vol if total_vol > 0 else None
+        reference_price = lth_price if lth_price else vwap_365
+        ref_label = "LTH Realized Price" if lth_price else "365d VWAP (proxy)"
+        if reference_price and current_price:
+            sopr_val = current_price / reference_price
+            pct_diff = (current_price - reference_price) / reference_price * 100
+            if sopr_val < 0.85:
+                status = 'green'; pts = 1
+                interp = (f'Price {abs(pct_diff):.1f}% BELOW {ref_label} (${reference_price:,.0f}). '
+                          f'Long-term holders deeply underwater. Capitulation zone. '
+                          f'Every major BTC bottom has occurred at or below this level.')
+            elif sopr_val < 1.0:
+                status = 'amber'; pts = 0
+                interp = (f'Price {abs(pct_diff):.1f}% below {ref_label} (${reference_price:,.0f}). '
+                          f'LTH holders in loss but not full capitulation yet. Approaching accumulation zone.')
+            else:
+                status = 'red'; pts = 0
+                interp = (f'Price {pct_diff:.1f}% ABOVE {ref_label} (${reference_price:,.0f}). '
+                          f'LTH holders still profitable. Not a bottom signal yet.')
+            deploy_score += pts
+            signals.append({
+                'tier':           'TIER 2',
+                'name':           f'LTH Realized Price ({ref_label})',
+                'value':          f'Ratio: {sopr_val:.4f}  |  BTC: ${current_price:,.0f}  |  Ref: ${reference_price:,.0f}',
+                'status':         status,
+                'interpretation': interp,
+            })
+    except Exception as e:
+        signals.append({'tier':'TIER 2','name':'LTH Realized Price','value':'Unavailable','status':'red','interpretation':str(e)})
+    # ── TIER 3: Exchange Reserve Flow ─────────────────────────
+    # Net BTC flow to/from exchanges over 7d using Binance order book proxy
+    # Real method: CryptoQuant free API for exchange reserves
+    try:
+        cq_url = 'https://api.cryptoquant.com/v1/btc/exchange-flows/reserve?window=DAY&limit=14'
+        rcq = requests.get(cq_url, headers={'Authorization': 'Bearer free'}, timeout=8)
+        exchange_flow_ok = False
+
+        if rcq.ok and 'data' in rcq.json():
+            data = rcq.json()['data']
+            if len(data) >= 7:
+                recent  = [d['reserve_usd'] for d in data[-7:]]
+                older   = [d['reserve_usd'] for d in data[-14:-7]]
+                recent_avg = sum(recent) / len(recent)
+                older_avg  = sum(older)  / len(older)
+                flow_pct   = (recent_avg - older_avg) / older_avg * 100 if older_avg else 0
+                exchange_flow_ok = True
+
+                if flow_pct < -3:
+                    status = 'green'; pts = 1
+                    interp = f'Exchange reserves falling {abs(flow_pct):.1f}% over 7 days. Coins leaving exchanges = supply reduction = accumulation. Smart money moving to cold storage.'
+                elif flow_pct < 0:
+                    status = 'amber'; pts = 0
+                    interp = f'Exchange reserves slightly declining ({flow_pct:.1f}%). Early signs of accumulation but not conclusive yet.'
+                else:
+                    status = 'red'; pts = 0
+                    interp = f'Exchange reserves rising {flow_pct:.1f}%. Coins moving TO exchanges = preparation to sell. Not a buy signal.'
+                deploy_score += pts
+                signals.append({
+                    'tier':           'TIER 3',
+                    'name':           'Exchange Reserve Flow (7d)',
+                    'value':          f'{flow_pct:+.2f}% (7d change)',
+                    'status':         status,
+                    'interpretation': interp,
+                })
+
+        if not exchange_flow_ok:
+            # Fallback: use Binance spot volume trend as proxy
+            # High sell volume on spot with price flat = accumulation
+            vol_url = 'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=30'
+            rv = requests.get(vol_url, headers=HEADERS, timeout=8)
+            if rv.ok:
+                vklines = rv.json()
+                vols    = [float(k[5]) * float(k[4]) for k in vklines]  # USD volume
+                recent_vol = sum(vols[-7:]) / 7
+                older_vol  = sum(vols[-30:-7]) / 23
+                vol_ratio  = recent_vol / older_vol if older_vol else 1
+
+                if vol_ratio > 1.5:
+                    status = 'amber'; pts = 0
+                    interp = f'Spot volume {vol_ratio:.1f}x above 30d average. High activity — could be capitulation selling or accumulation. Monitor direction.'
+                else:
+                    status = 'red'; pts = 0
+                    interp = 'Exchange flow data unavailable. Spot volume normal — no strong signal.'
+                signals.append({
+                    'tier':           'TIER 3',
+                    'name':           'Exchange Flow (Spot Volume Proxy)',
+                    'value':          f'Volume ratio: {vol_ratio:.2f}x vs 30d avg',
+                    'status':         status,
+                    'interpretation': interp,
+                })
+    except Exception as e:
+        signals.append({'tier':'TIER 3','name':'Exchange Reserve Flow','value':'Unavailable','status':'red','interpretation':str(e)})
+
+    # ── TIER 4: Whale Accumulation ────────────────────────────
+    # Use BTC large transaction volume as whale proxy (Binance aggTrades >$500k)
+    try:
+        agg_url = 'https://api.binance.com/api/v3/aggTrades?symbol=BTCUSDT&limit=1000'
+        ra = requests.get(agg_url, headers=HEADERS, timeout=8)
+        if ra.ok:
+            trades    = ra.json()
+            whale_buy = 0; whale_sell = 0; threshold = 500_000
+            for t in trades:
+                usd = float(t['p']) * float(t['q'])
+                if usd >= threshold:
+                    if t['m'] is False:  # buyer is taker
+                        whale_buy += usd
+                    else:
+                        whale_sell += usd
+
+            total_whale = whale_buy + whale_sell
+            if total_whale > 0:
+                whale_buy_pct = whale_buy / total_whale * 100
+            else:
+                whale_buy_pct = 50
+
+            if whale_buy_pct >= 60:
+                status = 'green'; pts = 1
+                interp = f'Whale buyers ({whale_buy_pct:.0f}% of large trades) dominating recent flow. Large players accumulating. This is the signature of institutional bottom-buying.'
+            elif whale_buy_pct >= 45:
+                status = 'amber'; pts = 0
+                interp = f'Whale flow balanced ({whale_buy_pct:.0f}% buy). Neither strong accumulation nor distribution. Wait for clearer signal.'
+            else:
+                status = 'red'; pts = 0
+                interp = f'Whale sellers ({100-whale_buy_pct:.0f}% of large trades) dominating. Large players distributing — not a bottom signal.'
+            deploy_score += pts
+            signals.append({
+                'tier':           'TIER 4',
+                'name':           'Whale Accumulation (Trades >$500k)',
+                'value':          f'{whale_buy_pct:.1f}% whale buy pressure  |  ${total_whale/1_000_000:.1f}M in large trades',
+                'status':         status,
+                'interpretation': interp,
+            })
+    except Exception as e:
+        signals.append({'tier':'TIER 4','name':'Whale Accumulation','value':'Unavailable','status':'red','interpretation':str(e)})
+
+    # ── TIER 5: Stablecoin Dry Powder ────────────────────────
+    # USDT + USDC market cap vs BTC market cap = potential buying power ratio
+    try:
+        cg_url = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,tether,usd-coin&vs_currencies=usd&include_market_cap=true'
+        rcg = requests.get(cg_url, timeout=8)
+        if rcg.ok:
+            cg_data = rcg.json()
+            btc_mcap  = cg_data.get('bitcoin',{}).get('usd_market_cap', 0)
+            usdt_mcap = cg_data.get('tether',{}).get('usd_market_cap', 0)
+            usdc_mcap = cg_data.get('usd-coin',{}).get('usd_market_cap', 0)
+            stable_total = usdt_mcap + usdc_mcap
+            ratio = (stable_total / btc_mcap * 100) if btc_mcap > 0 else 0
+
+            if ratio >= 20:
+                status = 'green'; pts = 1
+                interp = f'Stablecoin supply is {ratio:.1f}% of BTC market cap — enormous dry powder waiting to deploy. Historically, ratios above 20% precede major rallies when other signals align.'
+            elif ratio >= 12:
+                status = 'amber'; pts = 0
+                interp = f'Stablecoin ratio {ratio:.1f}%. Moderate dry powder available. Not extreme but buying power exists.'
+            else:
+                status = 'red'; pts = 0
+                interp = f'Stablecoin ratio only {ratio:.1f}%. Most capital already deployed in crypto. Limited additional buying power — late cycle signal.'
+            deploy_score += pts
+            signals.append({
+                'tier':           'TIER 5',
+                'name':           'Stablecoin Dry Powder (USDT+USDC vs BTC MCap)',
+                'value':          f'{ratio:.1f}%  |  ${stable_total/1e9:.1f}B stables vs ${btc_mcap/1e9:.1f}B BTC',
+                'status':         status,
+                'interpretation': interp,
+            })
+    except Exception as e:
+        signals.append({'tier':'TIER 5','name':'Stablecoin Dry Powder','value':'Unavailable','status':'red','interpretation':str(e)})
+
+    return signals, deploy_score
+
+@app.route('/find-bottom', methods=['POST'])
+def find_bottom():
+    """On-chain bottom detection — all 5 signal tiers."""
+    try:
+        signals, deploy_score = fetch_bottom_signals()
+
+        # Historical context based on score
+        historical_map = {
+            5: 'All 5 signals aligned previously at: Nov 2022 ($15,800) · Mar 2020 ($3,800) · Dec 2018 ($3,200). Each was followed by 300-1000%+ rallies within 12-18 months.',
+            4: '4/5 signals aligned previously near: Jan 2023 ($16,500) · Apr 2020 ($6,500). Strong accumulation zone — these entries yielded 200-500% within a year.',
+            3: '3/5 signals: Moderate accumulation zone. Historical returns from here: 100-300% over 12 months. Consider partial position (25-50% of allocation).',
+            2: '2/5 signals: Early warning — market moving toward accumulation zone but not there yet. Prepare capital, watch for more signals to align.',
+            1: '1/5 signals: Too early. Market not yet in accumulation territory. Cash is a position.',
+            0: '0/5 signals: Market not in accumulation zone. Historical data suggests patience — forcing entries at this stage has poor risk/reward.',
+        }
+        historical = historical_map.get(deploy_score, '')
+
+        # Gemini verdict
+        verdict = None
+        gemini_key = os.environ.get('GEMINI_API_KEY', '')
+        if gemini_key and signals:
+            sig_parts = []
+            for s in signals:
+                sig_parts.append(s['tier'] + ' ' + s['name'] + ': ' + s['value'] + ' — ' + s['status'].upper())
+            sig_summary = '\n'.join(sig_parts)
+            prompt = (
+                "You are a senior macro crypto strategist advising a long-term holder "
+                "who wants to deploy remaining capital at the optimal moment.\n\n"
+                "Current on-chain signals:\n"
+                + sig_summary +
+                "\n\nDeploy score: " + str(deploy_score) + "/5\n\n"
+                "Give a direct 3-4 sentence verdict: "
+                "1. Are we in a bottom accumulation zone now? "
+                "2. Key risk that makes it worse before better? "
+                "3. What signal to wait for if score < 4? "
+                "Be direct. No disclaimers. Manage your own money."
+            )
+            try:
+                url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}'
+                resp = requests.post(url, json={
+                    'contents': [{'parts': [{'text': prompt}]}],
+                    'generationConfig': {'maxOutputTokens': 300, 'temperature': 0.4}
+                }, timeout=20)
+                if resp.ok:
+                    verdict = resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+            except Exception as e:
+                print(f'[BOTTOM] Gemini error: {e}')
+
+        # Grab LTH price + current BTC price for proximity widget
+        lth_p = _lth_cache.get('value')
+        btc_p = None
+        try:
+            rp = requests.get('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', timeout=5)
+            if rp.ok:
+                btc_p = float(rp.json()['price'])
+        except Exception:
+            pass
+
+        return jsonify({
+            'ok':                 True,
+            'deploy_score':       deploy_score,
+            'signals':            signals,
+            'historical_context': historical,
+            'verdict':            verdict,
+            'lth_price':          lth_p,
+            'btc_price':          btc_p,
+        })
+
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 3000))
+    app.run(host='0.0.0.0', port=port)
 
 def _parse_gemini_response(text, channel, lang):
     """Extract title and URL from Gemini's structured response."""
