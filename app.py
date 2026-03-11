@@ -1,3 +1,4 @@
+import re
 import os
 import csv
 import io
@@ -2145,51 +2146,47 @@ DATE: [upload date]"""
             print(f'[DIGEST] Empty response for {channel_name}')
             return None, None, None
 
+        # SAFETY 1: check response and candidates exist
+        if not response or not response.candidates:
+            print(f'[DIGEST] No response for {channel_name}')
+            return None, None, None
+
+        candidate = response.candidates[0]
+        meta      = getattr(candidate, 'grounding_metadata', None)
         video_url = None
         title     = ''
 
-        # Method 1: grounding_chunks — safe iteration with None checks
-        try:
-            meta   = response.candidates[0].grounding_metadata
-            chunks = meta.grounding_chunks if (meta and meta.grounding_chunks) else []
-            for chunk in chunks:
-                uri = chunk.web.uri if (chunk.web and chunk.web.uri) else None
-                if uri and ('youtube.com/watch' in uri or 'youtu.be/' in uri):
+        # SAFETY 2: grounding_chunks (primary — verified URLs)
+        if meta and hasattr(meta, 'grounding_chunks') and meta.grounding_chunks:
+            for chunk in meta.grounding_chunks:
+                uri = getattr(chunk.web, 'uri', None) if chunk.web else None
+                if uri and 'youtube.com/watch' in uri:
                     video_url = uri
-                    title = chunk.web.title or ''
-                    print(f'[DIGEST] Got URL from grounding_chunks: {channel_name} — {video_url}')
+                    title     = getattr(chunk.web, 'title', '') or ''
+                    print(f'[DIGEST] URL from grounding_chunks: {channel_name} — {video_url}')
                     break
-        except Exception as e:
-            print(f'[DIGEST] grounding_chunks error: {e}')
 
-        # Method 2: sources field (new in March 2026 SDK)
-        if not video_url:
-            try:
-                meta    = response.candidates[0].grounding_metadata
-                sources = meta.sources if (meta and hasattr(meta, 'sources') and meta.sources) else []
-                for src in sources:
-                    url_candidate = getattr(src, 'url', None)
-                    if url_candidate and 'youtube.com' in url_candidate:
-                        video_url = url_candidate
-                        print(f'[DIGEST] Got URL from sources: {channel_name} — {video_url}')
-                        break
-            except Exception as e:
-                print(f'[DIGEST] sources error: {e}')
+        # SAFETY 3: search_entry_point rendered HTML
+        if not video_url and meta and hasattr(meta, 'search_entry_point') and meta.search_entry_point:
+            raw_html = getattr(meta.search_entry_point, 'rendered_content', '') or ''
+            found_html = re.search(r'href="(https://www\.youtube\.com/watch\?v=[\w-]+)"', raw_html)
+            if found_html:
+                video_url = found_html.group(1)
+                print(f'[DIGEST] URL from search_entry_point: {channel_name} — {video_url}')
 
-        # Method 3: Parse text response
+        # SAFETY 4: parse text response
         if not video_url and response.text:
-            found = response.text.strip()
-            if 'NO_NEW_VIDEO' in found.upper() or 'no new video' in found.lower():
+            text = response.text
+            if 'NO_NEW_VIDEO' in text.upper() or 'no new video' in text.lower():
+                print(f'[DIGEST] No new video for {channel_name}')
                 return None, None, None
-            url_match = re.search(r'https?://(?:www\.)?youtube\.com/watch\?v=([\w-]+)', found)
-            if not url_match:
-                url_match = re.search(r'https?://youtu\.be/([\w-]+)', found)
-            if url_match:
-                video_url = f'https://www.youtube.com/watch?v={url_match.group(1)}'
-                print(f'[DIGEST] Got URL from text: {channel_name} — {video_url}')
+            text_links = re.findall(r'https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+', text)
+            if text_links:
+                video_url = text_links[0]
+                print(f'[DIGEST] URL from text: {channel_name} — {video_url}')
             if not title:
-                title_match = re.search(r'TITLE:\s*(.+)', found)
-                title = title_match.group(1).strip() if title_match else ''
+                t_match = re.search(r'TITLE:\s*(.+)', text)
+                title = t_match.group(1).strip() if t_match else ''
 
         if not video_url:
             print(f'[DIGEST] No URL found for {channel_name}')
