@@ -2120,16 +2120,8 @@ def _gemini_find_latest_video(channel_name, handle, hours, gemini_key):
     now_str   = _dt2.datetime.utcnow().strftime('%B %d, %Y')
     since_str = (_dt2.datetime.utcnow() - _dt2.timedelta(hours=hours)).strftime('%B %d, %Y %H:%M UTC')
 
-    find_prompt = f"""Today is {now_str}. Search YouTube for the most recent video uploaded by @{handle} ({channel_name}) after {since_str}.
-
-Go to their channel page and check the Videos tab sorted by newest first.
-
-If their latest video was uploaded BEFORE {since_str}, reply with exactly: NO_NEW_VIDEO
-
-If a new video exists reply with ONLY these three lines and nothing else:
-TITLE: [exact title]
-URL: https://www.youtube.com/watch?v=[video_id]
-DATE: [upload date]"""
+    # Simple prompt — fewer words = fewer tool calls = no TOO_MANY_TOOL_CALLS error
+    find_prompt = f"site:youtube.com {channel_name} video uploaded after {since_str}"
 
     try:
         from google.genai import types as genai_types
