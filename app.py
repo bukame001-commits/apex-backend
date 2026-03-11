@@ -2141,35 +2141,65 @@ DATE: [upload date]"""
                 max_output_tokens=300
             )
         )
-        # Safe extraction — response.text can be None if grounding returns no text
-        if not response or not response.text:
+        if not response:
             print(f'[DIGEST] Empty response for {channel_name}')
             return None, None, None
-        found = response.text.strip()
-    except Exception as e:
-        print(f'[DIGEST] Find video error for {channel_name}: {e}')
-        return None, None, None
 
-    if not found or 'NO_NEW_VIDEO' in found.upper() or 'no new video' in found.lower():
-        return None, None, None
+        # Method 1: Extract from grounding_metadata chunks (verified real URLs)
+        video_url = None
+        title     = ''
+        try:
+            chunks = response.candidates[0].grounding_metadata.grounding_chunks
+            for chunk in chunks:
+                uri = chunk.web.uri if chunk.web else None
+                if uri and 'youtube.com/watch' in uri:
+                    video_url = uri
+                    # Extract title from chunk if available
+                    title = chunk.web.title if chunk.web.title else ''
+                    print(f'[DIGEST] Got URL from grounding_chunks: {channel_name} — {video_url}')
+                    break
+                elif uri and 'youtu.be/' in uri:
+                    video_url = uri
+                    title = chunk.web.title if chunk.web.title else ''
+                    print(f'[DIGEST] Got URL from grounding_chunks (short): {channel_name} — {video_url}')
+                    break
+        except Exception as e:
+            print(f'[DIGEST] grounding_chunks parse error: {e}')
 
-    # Extract title
-    title_match = re.search(r'TITLE:\s*(.+)', found)
-    title = title_match.group(1).strip() if title_match else ''
+        # Method 2: Fallback — try to parse URL from text response
+        if not video_url and response.text:
+            found = response.text.strip()
+            if 'NO_NEW_VIDEO' in found.upper() or 'no new video' in found.lower():
+                return None, None, None
+            url_match = re.search(r'https?://(?:www\.)?youtube\.com/watch\?v=([\w-]+)', found)
+            if not url_match:
+                url_match = re.search(r'https?://youtu\.be/([\w-]+)', found)
+            if url_match:
+                video_url = f'https://www.youtube.com/watch?v={url_match.group(1)}'
+                print(f'[DIGEST] Got URL from text: {channel_name} — {video_url}')
+            # Extract title from text if not from chunks
+            if not title:
+                title_match = re.search(r'TITLE:\s*(.+)', found)
+                title = title_match.group(1).strip() if title_match else ''
 
-    # Extract watch URL
-    url_match = re.search(r'https?://(?:www\.)?youtube\.com/watch\?v=([\w-]+)', found)
-    if not url_match:
-        url_match = re.search(r'https?://youtu\.be/([\w-]+)', found)
+        if not video_url:
+            print(f'[DIGEST] No URL found for {channel_name}')
+            return None, None, None
 
-    if url_match:
-        video_id  = url_match.group(1)
-        video_url = f'https://www.youtube.com/watch?v={video_id}'
+        # Extract video_id from url
+        vid_match = re.search(r'watch\?v=([\w-]+)', video_url)
+        if not vid_match:
+            vid_match = re.search(r'youtu\.be/([\w-]+)', video_url)
+        video_id = vid_match.group(1) if vid_match else video_url
+        if not title:
+            title = channel_name
+
         print(f'[DIGEST] Found: {channel_name} — {title[:50]} ({video_id})')
         return title, video_id, video_url
 
-    print(f'[DIGEST] URL not extracted for {channel_name}: {found[:100]}')
-    return None, None, None
+    except Exception as e:
+        print(f'[DIGEST] Find video error for {channel_name}: {e}')
+        return None, None, None
 
 
 def _gemini_find_and_summarise(channel_name, handle, lang, hours, gemini_key):
