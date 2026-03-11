@@ -2031,7 +2031,6 @@ _digest_channel_status = {}     # channel -> 'new video' | 'no new video' | 'err
 
 def _gemini_analyse_video(channel_name, handle, video_id, video_url, title, lang, gemini_key, deep_dive=True):
     """Analyse a YouTube video using transcript + Gemini native video fallback."""
-    from google import genai as genai_sdk
     from youtube_transcript_api import YouTubeTranscriptApi
 
     if lang == 'tr':
