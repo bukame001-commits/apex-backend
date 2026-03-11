@@ -2120,8 +2120,8 @@ def _gemini_find_latest_video(channel_name, handle, hours, gemini_key):
     now_str   = _dt2.datetime.utcnow().strftime('%B %d, %Y')
     since_str = (_dt2.datetime.utcnow() - _dt2.timedelta(hours=hours)).strftime('%B %d, %Y %H:%M UTC')
 
-    # Simple prompt — fewer words = fewer tool calls = no TOO_MANY_TOOL_CALLS error
-    find_prompt = f"site:youtube.com {channel_name} video uploaded after {since_str}"
+    # Natural language question — single tool call, no TOO_MANY_TOOL_CALLS
+    find_prompt = f"What is the latest video from the YouTube channel '{channel_name}' posted in the last {hours} hours?"
 
     try:
         from google.genai import types as genai_types
