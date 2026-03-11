@@ -19,20 +19,20 @@ def _store_load():
     """Load {setups, reports} from JSONBin. Returns (reports_dict, setups_list)."""
     if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
         print('[STORE] No JSONBin config — data will not persist across restarts')
-        return {}, []
+        return {}, [], []
     try:
         r = requests.get(_JSONBIN_URL + '/latest', headers=_JSONBIN_HEADERS, timeout=15)
         if r.ok:
             rec = r.json().get('record', {})
             setups  = rec.get('setups', [])
             reports = rec.get('reports', {})
+            digest  = rec.get('digest', [])
             # JSONBin may return [] if bin was init'd wrong — force to dict
-            if not isinstance(reports, dict):
-                reports = {}
-            if not isinstance(setups, list):
-                setups = []
-            print(f'[STORE] Loaded: {len(setups)} setups, {len(reports)} reports')
-            return reports, setups
+            if not isinstance(reports, dict): reports = {}
+            if not isinstance(setups, list):  setups  = []
+            if not isinstance(digest, list):  digest  = []
+            print(f'[STORE] Loaded: {len(setups)} setups, {len(reports)} reports, {len(digest)} digest items')
+            return reports, setups, digest
         print(f'[STORE] Load failed: {r.status_code} {r.text[:80]}')
     except Exception as e:
         print(f'[STORE] Load error: {e}')
@@ -43,7 +43,8 @@ def _store_save():
     if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
         return
     try:
-        payload = {'setups': _backtest_setups[:200], 'reports': _reports}
+        payload = {'setups': _backtest_setups[:200], 'reports': _reports,
+                   'digest': _digest_cache[:50]}
         r = requests.put(_JSONBIN_URL, headers=_JSONBIN_HEADERS, json=payload, timeout=20)
         print(f'[STORE] Save {"OK" if r.ok else "FAILED " + str(r.status_code) + ": " + r.text[:80]}')
     except Exception as e:
@@ -57,13 +58,17 @@ _backtest_setups = []
 def _sync_from_jsonbin():
     """Load JSONBin data into in-memory stores (safe to call multiple times)."""
     try:
-        rpts, setups = _store_load()
+        rpts, setups, digest = _store_load()
         _reports.update(rpts)
         with _backtest_lock:
             if setups:
                 _backtest_setups.clear()
                 _backtest_setups.extend(setups)
-        print(f'[STORE] Sync complete: {len(_backtest_setups)} setups, {len(_reports)} reports')
+        with _digest_lock:
+            if digest:
+                _digest_cache.clear()
+                _digest_cache.extend(digest)
+        print(f'[STORE] Sync complete: {len(_backtest_setups)} setups, {len(_reports)} reports, {len(_digest_cache)} digest')
     except Exception as e:
         print(f'[STORE] Sync error (non-fatal): {e}')
 
@@ -2050,7 +2055,9 @@ Dogrudan, yogun ve kurumsal ol. Sayi kullan."""
 
 If no new video was published in the last {hours} hours, clearly state "No new videos in the last {hours} hours."
 
-If there is a new video, respond in this exact format:
+IMPORTANT: Only report a video if it was genuinely published within the last {hours} hours. If you are not certain, say "No new videos in the last {hours} hours." Do NOT report old videos.
+
+If there is a confirmed new video, respond in this exact format:
 
 TITLE: [exact video title]
 URL: [YouTube URL]
@@ -2078,9 +2085,17 @@ Be direct, dense, and institutional. No fluff. Use numbers wherever possible."""
             'generationConfig': {'maxOutputTokens': 1500, 'temperature': 0.3}
         }, timeout=60)
         if resp.ok:
-            text = resp.json()['candidates'][0]['content']['parts'][0]['text']
+            candidate = resp.json()['candidates'][0]
+            # Extract text from any part that has a 'text' key (skip tool_use parts)
+            parts = candidate.get('content', {}).get('parts', [])
+            text = ' '.join(p['text'] for p in parts if 'text' in p).strip()
+            if not text:
+                print(f'[DIGEST] Gemini returned no text for {channel_name}')
+                return None
             # Check if Gemini says no new video
-            no_video_phrases = ['no new video', 'son', 'yeni video yok', 'did not publish', 'could not find']
+            no_video_phrases = ['no new video', 'yeni video yok', 'did not publish',
+                                 'could not find', 'unable to find', 'bulamadim',
+                                 'son {hours} saatte yeni video yok']
             if any(p in text.lower() for p in no_video_phrases):
                 print(f'[DIGEST] No new video found for {channel_name}')
                 return None
@@ -2177,6 +2192,9 @@ def _run_digest(hours=24):
         _digest_last_run = run_time
         _digest_channel_status.clear()
         _digest_channel_status.update(_channel_status)
+
+    # Persist digest to JSONBin so all workers see it
+    _store_save()
 
     # Send digest summary link to Telegram
     if tg_token and tg_chat and results:
