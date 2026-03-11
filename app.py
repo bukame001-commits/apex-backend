@@ -2148,6 +2148,17 @@ def _gemini_find_latest_video(channel_name, handle, hours, gemini_key):
         video_url = None
         title     = ''
 
+        # DEBUG — log full metadata structure so we know what fields exist
+        try:
+            print(f'[DIGEST DEBUG] {channel_name} finish_reason: {candidate.finish_reason}')
+            print(f'[DIGEST DEBUG] {channel_name} meta type: {type(meta)}')
+            print(f'[DIGEST DEBUG] {channel_name} meta attrs: {[a for a in dir(meta) if not a.startswith("_")]}')
+            chunks = getattr(meta, "grounding_chunks", None)
+            print(f'[DIGEST DEBUG] {channel_name} grounding_chunks: {chunks}')
+            print(f'[DIGEST DEBUG] {channel_name} response text[:100]: {(response.text or "")[:100]}')
+        except Exception as de:
+            print(f'[DIGEST DEBUG] meta inspection error: {de}')
+
         # SAFETY 2: grounding_chunks (primary — verified URLs)
         if meta and hasattr(meta, 'grounding_chunks') and meta.grounding_chunks:
             for chunk in meta.grounding_chunks:
