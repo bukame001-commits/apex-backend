@@ -2145,28 +2145,38 @@ DATE: [upload date]"""
             print(f'[DIGEST] Empty response for {channel_name}')
             return None, None, None
 
-        # Method 1: Extract from grounding_metadata chunks (verified real URLs)
         video_url = None
         title     = ''
+
+        # Method 1: grounding_chunks — safe iteration with None checks
         try:
-            chunks = response.candidates[0].grounding_metadata.grounding_chunks
+            meta   = response.candidates[0].grounding_metadata
+            chunks = meta.grounding_chunks if (meta and meta.grounding_chunks) else []
             for chunk in chunks:
-                uri = chunk.web.uri if chunk.web else None
-                if uri and 'youtube.com/watch' in uri:
+                uri = chunk.web.uri if (chunk.web and chunk.web.uri) else None
+                if uri and ('youtube.com/watch' in uri or 'youtu.be/' in uri):
                     video_url = uri
-                    # Extract title from chunk if available
-                    title = chunk.web.title if chunk.web.title else ''
+                    title = chunk.web.title or ''
                     print(f'[DIGEST] Got URL from grounding_chunks: {channel_name} — {video_url}')
                     break
-                elif uri and 'youtu.be/' in uri:
-                    video_url = uri
-                    title = chunk.web.title if chunk.web.title else ''
-                    print(f'[DIGEST] Got URL from grounding_chunks (short): {channel_name} — {video_url}')
-                    break
         except Exception as e:
-            print(f'[DIGEST] grounding_chunks parse error: {e}')
+            print(f'[DIGEST] grounding_chunks error: {e}')
 
-        # Method 2: Fallback — try to parse URL from text response
+        # Method 2: sources field (new in March 2026 SDK)
+        if not video_url:
+            try:
+                meta    = response.candidates[0].grounding_metadata
+                sources = meta.sources if (meta and hasattr(meta, 'sources') and meta.sources) else []
+                for src in sources:
+                    url_candidate = getattr(src, 'url', None)
+                    if url_candidate and 'youtube.com' in url_candidate:
+                        video_url = url_candidate
+                        print(f'[DIGEST] Got URL from sources: {channel_name} — {video_url}')
+                        break
+            except Exception as e:
+                print(f'[DIGEST] sources error: {e}')
+
+        # Method 3: Parse text response
         if not video_url and response.text:
             found = response.text.strip()
             if 'NO_NEW_VIDEO' in found.upper() or 'no new video' in found.lower():
@@ -2177,7 +2187,6 @@ DATE: [upload date]"""
             if url_match:
                 video_url = f'https://www.youtube.com/watch?v={url_match.group(1)}'
                 print(f'[DIGEST] Got URL from text: {channel_name} — {video_url}')
-            # Extract title from text if not from chunks
             if not title:
                 title_match = re.search(r'TITLE:\s*(.+)', found)
                 title = title_match.group(1).strip() if title_match else ''

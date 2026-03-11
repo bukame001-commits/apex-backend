@@ -2,5 +2,5 @@ flask
 flask-cors
 requests
 gunicorn
-google-genai
+google-genai>=0.4.0
 youtube-transcript-api
