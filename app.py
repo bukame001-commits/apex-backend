@@ -2025,7 +2025,7 @@ _digest_channel_status = {}     # channel -> 'new video' | 'no new video' | 'err
 
 def _gemini_analyse_video(channel_name, handle, video_id, video_url, title, lang, gemini_key, deep_dive=True):
     """Analyse a YouTube video using transcript + Gemini native video fallback."""
-    import google.generativeai as genai_sdk
+    from google import genai as genai_sdk
     from youtube_transcript_api import YouTubeTranscriptApi
 
     if lang == 'tr':
@@ -2083,7 +2083,7 @@ Report Structure:
             )
         else:
             # Fallback: pass YouTube URL directly as video part
-            import google.generativeai.types as genai_types
+            from google.genai import types as genai_types
             response = client.models.generate_content(
                 model=model_name,
                 contents=[
@@ -2119,7 +2119,7 @@ URL: https://www.youtube.com/watch?v=[video_id]
 DATE: [upload date]"""
 
     try:
-        import google.generativeai as genai_sdk
+        from google import genai as genai_sdk
         client = genai_sdk.Client(api_key=gemini_key)
         response = client.models.generate_content(
             model='gemini-2.5-flash',
