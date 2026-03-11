@@ -105,6 +105,12 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
+# Gemini client — initialized once at module level
+from google import genai as _genai
+from google.genai import types as _genai_types
+_GEMINI_KEY = os.environ.get('GEMINI_API_KEY', '')
+_genai_client = _genai.Client(api_key=_GEMINI_KEY) if _GEMINI_KEY else None
+
 _worker_synced = False
 
 @app.before_request
@@ -2058,7 +2064,8 @@ Report Structure:
 7. VERDICT: HIGH CONVICTION | SPECULATIVE | NOISE — one sentence why."""
 
     model_name = 'gemini-3.1-pro-preview' if deep_dive else 'gemini-2.5-flash'
-    client = genai_sdk.Client(api_key=gemini_key)
+    from google.genai import types as genai_types
+    client = _genai_client or _genai.Client(api_key=gemini_key)
 
     # Step 1: Try transcript first
     transcript_text = None
@@ -2079,7 +2086,10 @@ Report Structure:
             response = client.models.generate_content(
                 model=model_name,
                 contents=f"{analyst_prompt}\n\nTranscript:\n{transcript_text[:12000]}",
-                config={'thinking_config': {'thinking_level': 'MEDIUM'}, 'max_output_tokens': 2000}
+                config=genai_types.GenerateContentConfig(
+                    thinking_config=genai_types.ThinkingConfig(include_thoughts=True),
+                    max_output_tokens=2000
+                )
             )
         else:
             # Fallback: pass YouTube URL directly as video part
@@ -2093,7 +2103,10 @@ Report Structure:
                         mime_type='video/youtube'
                     )
                 ],
-                config={'thinking_config': {'thinking_level': 'MEDIUM'}, 'max_output_tokens': 2000}
+                config=genai_types.GenerateContentConfig(
+                    thinking_config=genai_types.ThinkingConfig(include_thoughts=True),
+                    max_output_tokens=2000
+                )
             )
         return response.text
     except Exception as e:
@@ -2119,13 +2132,20 @@ URL: https://www.youtube.com/watch?v=[video_id]
 DATE: [upload date]"""
 
     try:
-        from google import genai as genai_sdk
-        client = genai_sdk.Client(api_key=gemini_key)
+        from google.genai import types as genai_types
+        client = _genai_client or _genai.Client(api_key=gemini_key)
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=find_prompt,
-            config={'tools': [{'google_search': {}}], 'max_output_tokens': 200}
+            config=genai_types.GenerateContentConfig(
+                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+                max_output_tokens=300
+            )
         )
+        # Safe extraction — response.text can be None if grounding returns no text
+        if not response or not response.text:
+            print(f'[DIGEST] Empty response for {channel_name}')
+            return None, None, None
         found = response.text.strip()
     except Exception as e:
         print(f'[DIGEST] Find video error for {channel_name}: {e}')
@@ -2202,7 +2222,9 @@ def _run_digest(hours=24):
 
     _channel_status = {ch['name']: '⏳ checking...' for ch in DIGEST_CHANNELS}
 
-    for ch in DIGEST_CHANNELS:
+    for i, ch in enumerate(DIGEST_CHANNELS):
+        if i > 0:
+            time.sleep(60)  # 60s between channels — stay within RPM limits
         print(f'[DIGEST] Checking {ch["name"]}...')
         response = _gemini_find_and_summarise(ch['name'], ch['handle'], ch['lang'], hours, gemini_key)
         if not response:
