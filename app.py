@@ -2023,92 +2023,109 @@ _digest_last_run      = None
 _digest_seen          = set()   # tracks video titles already summarised today
 _digest_channel_status = {}     # channel -> 'new video' | 'no new video' | 'error'
 
+def _gemini_call(prompt, gemini_key, use_grounding=True, max_tokens=500):
+    """Single Gemini API call. Returns text or None."""
+    try:
+        gemini_url = (f'https://generativelanguage.googleapis.com/v1beta/'
+                      f'models/gemini-2.5-flash:generateContent?key={gemini_key}')
+        payload = {
+            'contents': [{'parts': [{'text': prompt}]}],
+            'generationConfig': {'maxOutputTokens': max_tokens, 'temperature': 0.2}
+        }
+        if use_grounding:
+            payload['tools'] = [{'google_search': {}}]
+        resp = requests.post(gemini_url, json=payload, timeout=60)
+        if resp.ok:
+            parts = resp.json()['candidates'][0].get('content', {}).get('parts', [])
+            return ' '.join(p['text'] for p in parts if 'text' in p).strip() or None
+        print(f'[DIGEST] Gemini {resp.status_code}: {resp.text[:80]}')
+    except Exception as e:
+        print(f'[DIGEST] Gemini call error: {e}')
+    return None
+
+
 def _gemini_find_and_summarise(channel_name, handle, lang, hours, gemini_key):
-    """Ask Gemini to find the latest video from a channel and summarise it — no YouTube API needed."""
-    import datetime
-    since_date = (datetime.datetime.utcnow() - datetime.timedelta(hours=hours)).strftime('%d %B %Y')
+    """Two-step: (1) find latest video URL, (2) analyse that specific URL."""
+    import datetime as _dt2
+    now_str   = _dt2.datetime.utcnow().strftime('%B %d, %Y')
+    since_str = (_dt2.datetime.utcnow() - _dt2.timedelta(hours=hours)).strftime('%B %d, %Y %H:%M UTC')
 
+    # ── Step 1: Find the video URL ────────────────────────────
+    find_prompt = f"""Today is {now_str}. Search YouTube for the most recent video uploaded by @{handle} ({channel_name}) after {since_str}.
+
+Check their channel page. If their latest video was uploaded before {since_str}, reply with only: NO_NEW_VIDEO
+
+If a new video exists, reply with only these three lines:
+TITLE: [exact title]
+URL: [direct youtube.com/watch?v= URL]
+DATE: [upload date]
+
+Nothing else."""
+
+    found = _gemini_call(find_prompt, gemini_key, use_grounding=True, max_tokens=200)
+    if not found:
+        return None
+
+    if 'NO_NEW_VIDEO' in found.upper() or 'no new video' in found.lower():
+        print(f'[DIGEST] No new video for {channel_name}')
+        return None
+
+    # Extract URL from step 1 response
+    import re
+    urls = re.findall(r'https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+', found)
+    video_url = urls[0] if urls else None
+
+    # Extract title
+    title_match = re.search(r'TITLE:\s*(.+)', found)
+    title = title_match.group(1).strip() if title_match else ''
+
+    if not video_url:
+        print(f'[DIGEST] Could not extract URL for {channel_name} — response: {found[:100]}')
+        return None
+
+    print(f'[DIGEST] Found video for {channel_name}: {title[:50]} — {video_url}')
+
+    # ── Step 2: Analyse the specific video URL ────────────────
     if lang == 'tr':
-        import datetime as _dt2
-        now_str   = _dt2.datetime.utcnow().strftime('%d %B %Y')
-        since_str = (_dt2.datetime.utcnow() - _dt2.timedelta(hours=hours)).strftime('%d %B %Y %H:%M UTC')
-        prompt = f"""Bugun {now_str}. YouTube'da @{handle} ({channel_name}) kanalinin {since_str} tarihinden sonra yayinladigi videolari ara.
+        analyse_prompt = f"""Bu YouTube videosunu izle ve Citadel analist bakis acisiyla analiz et:
+{video_url}
 
-Kanalin sayfasina giderek en son yuklemelerini kontrol et. Son {hours} saatte yuklenen video var mi bak.
-
-{since_str} tarihinden sonra video yoksa tam olarak su yaziyi yaz: "Son {hours} saatte yeni video yok."
-
-Yeni video bulduysan asagidaki formatta yanit ver:
-
-BASLIK: [videonun tam basligi]
-URL: [YouTube URL]
-TARIH: [tam yayin tarihi ve saati]
+Kanal: {channel_name}
+Baslik: {title}
 
 ANALIZ:
-Sen Citadel'de kidemli bir makro ve kripto analistisin. Uygulanabilir istihbarat cikar — genel ozet degil.
-
-- MAKRO BAGLAM: Hangi makro ortama yakit veriyor? Fed, likidite, DXY, tahviller, jeopolitik?
+- MAKRO BAGLAM: Hangi makro ortama yakit veriyor? Fed, likidite, DXY, tahviller?
 - ANA TEZ: Temel yonsel arguman — boga/ayi/notr? Guven seviyesi?
-- FIYAT SEVIYELERI: Her fiyat seviyesi, hedef, destek, direnc, gecersizlestirme noktasi. Varlik adini yaz.
+- FIYAT SEVIYELERI: Her fiyat seviyesi, hedef, destek, direnc. Varlik adini yaz.
 - KATALIZORLER: Onemli olaylar, on-chain sinyaller, piyasa yapisi degisimleri?
-- RISK FAKTORLERI: Ana asagi riskler ve tezi gecersiz kilan senaryolar?
+- RISK FAKTORLERI: Tezi gecersiz kilan senaryolar?
 - CITADEL GORUSU: Tek cumle — bu analiz islem yapilabilir mi?
 
 Dogrudan, yogun, kurumsal. Sayi kullan."""
     else:
-        import datetime as _dt2
-        now_str   = _dt2.datetime.utcnow().strftime('%B %d, %Y')
-        since_str = (_dt2.datetime.utcnow() - _dt2.timedelta(hours=hours)).strftime('%B %d, %Y %H:%M UTC')
-        prompt = f"""Today is {now_str}. Go to the YouTube channel @{handle} ({channel_name}) and check if they uploaded any video after {since_str}.
+        analyse_prompt = f"""Watch this YouTube video and analyse it through the lens of a senior Citadel macro analyst:
+{video_url}
 
-Check the channel's Videos tab sorted by newest. If their most recent video was uploaded before {since_str}, respond with exactly: "No new videos in the last {hours} hours."
+Channel: {channel_name}
+Title: {title}
 
-If you find a video uploaded after {since_str}, respond in this format:
-
-TITLE: [exact video title]
-URL: [YouTube URL]
-DATE: [exact publish date]
-
-ANALYSIS:
-You are a senior macro and crypto analyst at Citadel. Extract actionable intelligence — not a general summary.
-
+Provide:
 - MACRO CONTEXT: What macro backdrop is the creator responding to? Fed, liquidity, DXY, bonds, geopolitics?
 - KEY THESIS: Core directional argument — bull/bear/neutral? Conviction level?
-- PRICE LEVELS & TARGETS: Every specific price, target, support, resistance, invalidation level. Name the asset.
-- CATALYSTS: Upcoming events, on-chain signals, market structure shifts flagged?
-- RISK FACTORS: Main downside risks or scenarios that invalidate the thesis?
+- PRICE LEVELS & TARGETS: Every specific price, target, support, resistance, invalidation. Name the asset.
+- CATALYSTS: Upcoming events, on-chain signals, market structure shifts?
+- RISK FACTORS: Scenarios that invalidate the thesis?
 - CITADEL TAKE: One sentence — tradeable? Aligns with or contradicts current market structure?
 
 Dense, institutional, no fluff. Exact numbers."""
 
-    try:
-        gemini_url = (f'https://generativelanguage.googleapis.com/v1beta/'
-                      f'models/gemini-2.5-flash:generateContent?key={gemini_key}')
-        resp = requests.post(gemini_url, json={
-            'contents': [{'parts': [{'text': prompt}]}],
-            'tools': [{'google_search': {}}],
-            'generationConfig': {'maxOutputTokens': 1500, 'temperature': 0.3}
-        }, timeout=60)
-        if resp.ok:
-            candidate = resp.json()['candidates'][0]
-            # Extract text from any part that has a 'text' key (skip tool_use parts)
-            parts = candidate.get('content', {}).get('parts', [])
-            text = ' '.join(p['text'] for p in parts if 'text' in p).strip()
-            if not text:
-                print(f'[DIGEST] Gemini returned no text for {channel_name}')
-                return None
-            # Check if Gemini says no new video
-            no_video_phrases = ['no new video', 'yeni video yok', 'did not publish',
-                                 'could not find', 'unable to find', 'bulamadim',
-                                 'son {hours} saatte yeni video yok']
-            if any(p in text.lower() for p in no_video_phrases):
-                print(f'[DIGEST] No new video found for {channel_name}')
-                return None
-            return text
-        print(f'[DIGEST] Gemini error {resp.status_code}: {resp.text[:100]}')
-    except Exception as e:
-        print(f'[DIGEST] Gemini error: {e}')
-    return None
+    analysis = _gemini_call(analyse_prompt, gemini_key, use_grounding=True, max_tokens=1500)
+    if not analysis:
+        # Fallback: return what we found without deep analysis
+        return f"TITLE: {title}\nURL: {video_url}\n\nANALYSIS: Video found but detailed analysis unavailable."
+
+    return f"TITLE: {title}\nURL: {video_url}\n\nANALYSIS:\n{analysis}"
+
 
 def _parse_gemini_response(text, channel, lang):
     """Extract title and URL from Gemini's structured response."""
