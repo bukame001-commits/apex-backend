@@ -2065,20 +2065,55 @@ Report Structure:
 
     model_name = 'gemini-3.1-pro-preview' if deep_dive else 'gemini-2.5-flash'
     from google.genai import types as genai_types
+    import requests as _req2
     client = _genai_client or _genai.Client(api_key=gemini_key)
 
-    # Step 1: Try transcript first
-    transcript_text = None
-    try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+    # Resolve Vertex redirect URL → real YouTube URL
+    real_yt_url = video_url
+    if 'vertexaisearch.cloud.google.com' in video_url or 'grounding-api-redirect' in video_url:
         try:
-            transcript = transcript_list.find_transcript(['tr', 'en'])
-        except Exception:
-            transcript = transcript_list.find_transcript(['en', 'tr'])
-        transcript_text = ' '.join([t['text'] for t in transcript.fetch()])
-        print(f'[DIGEST] Got transcript for {channel_name} ({len(transcript_text)} chars)')
-    except Exception as e:
-        print(f'[DIGEST] Transcript unavailable for {channel_name}: {e}')
+            r = _req2.get(video_url, timeout=15, allow_redirects=True)
+            if 'youtube.com/watch' in r.url or 'youtu.be/' in r.url:
+                real_yt_url = r.url
+                print(f'[DIGEST] Resolved redirect → {real_yt_url[:60]}')
+            else:
+                # Check history for YouTube hop
+                for hop in r.history:
+                    if 'youtube.com/watch' in hop.url:
+                        real_yt_url = hop.url
+                        print(f'[DIGEST] Resolved redirect (hop) → {real_yt_url[:60]}')
+                        break
+        except Exception as re2:
+            print(f'[DIGEST] Redirect resolve error: {re2}')
+
+    # Extract video_id from resolved URL if not already set
+    if not video_id or video_id == video_url:
+        vm = re.search(r'(?:watch\?v=|youtu\.be/)([\w-]+)', real_yt_url)
+        video_id = vm.group(1) if vm else None
+
+    # Step 1: Try transcript — handle v0.x, v1.x, and v1.2.x+ API differences
+    transcript_text = None
+    if video_id:
+        try:
+            snippets = None
+            # v1.2.x+: instance method fetch().to_raw_data()
+            try:
+                ytt = YouTubeTranscriptApi()
+                snippets = ytt.fetch(video_id).to_raw_data()
+                print(f'[DIGEST] Transcript via fetch() for {channel_name}')
+            except Exception:
+                pass
+            # v1.x / v0.x: class method get_transcript()
+            if not snippets:
+                try:
+                    snippets = YouTubeTranscriptApi.get_transcript(video_id, languages=['tr', 'en'])
+                except Exception:
+                    snippets = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
+            if snippets:
+                transcript_text = ' '.join([t.get('text', '') for t in snippets])
+                print(f'[DIGEST] Got transcript for {channel_name} ({len(transcript_text)} chars)')
+        except Exception as e:
+            print(f'[DIGEST] Transcript unavailable for {channel_name}: {e}')
 
     try:
         if transcript_text:
@@ -2091,15 +2126,15 @@ Report Structure:
                     max_output_tokens=2000
                 )
             )
-        else:
-            # Fallback: pass YouTube URL directly as video part
-            from google.genai import types as genai_types
+        elif real_yt_url and 'youtube.com/watch' in real_yt_url:
+            # Fallback: pass real YouTube URL as video part
+            print(f'[DIGEST] Using native video analysis for {channel_name}')
             response = client.models.generate_content(
                 model=model_name,
                 contents=[
                     analyst_prompt,
                     genai_types.Part.from_uri(
-                        file_uri=video_url,
+                        file_uri=real_yt_url,
                         mime_type='video/youtube'
                     )
                 ],
@@ -2108,6 +2143,9 @@ Report Structure:
                     max_output_tokens=2000
                 )
             )
+        else:
+            print(f'[DIGEST] No transcript or valid URL for {channel_name}, skipping')
+            return None
         return response.text
     except Exception as e:
         print(f'[DIGEST] Gemini analyse error for {channel_name}: {e}')
