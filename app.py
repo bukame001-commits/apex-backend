@@ -2120,8 +2120,7 @@ def _gemini_find_latest_video(channel_name, handle, hours, gemini_key):
     now_str   = _dt2.datetime.utcnow().strftime('%B %d, %Y')
     since_str = (_dt2.datetime.utcnow() - _dt2.timedelta(hours=hours)).strftime('%B %d, %Y %H:%M UTC')
 
-    # Natural language question — single tool call, no TOO_MANY_TOOL_CALLS
-    find_prompt = f"What is the latest video from the YouTube channel '{channel_name}' posted in the last {hours} hours?"
+    find_prompt = f"Find the YouTube watch URL for the latest video from '{channel_name}'"
 
     try:
         from google.genai import types as genai_types
@@ -2131,65 +2130,38 @@ def _gemini_find_latest_video(channel_name, handle, hours, gemini_key):
             contents=find_prompt,
             config=genai_types.GenerateContentConfig(
                 tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
-                max_output_tokens=300
+                max_output_tokens=1000,
+                temperature=0.0
             )
         )
-        if not response:
-            print(f'[DIGEST] Empty response for {channel_name}')
-            return None, None, None
-
-        # SAFETY 1: check response and candidates exist
         if not response or not response.candidates:
             print(f'[DIGEST] No response for {channel_name}')
             return None, None, None
 
-        candidate = response.candidates[0]
-        meta      = getattr(candidate, 'grounding_metadata', None)
+        meta      = response.candidates[0].grounding_metadata
         video_url = None
         title     = ''
 
-        # DEBUG — log full metadata structure so we know what fields exist
-        try:
-            print(f'[DIGEST DEBUG] {channel_name} finish_reason: {candidate.finish_reason}')
-            print(f'[DIGEST DEBUG] {channel_name} meta type: {type(meta)}')
-            print(f'[DIGEST DEBUG] {channel_name} meta attrs: {[a for a in dir(meta) if not a.startswith("_")]}')
-            chunks = getattr(meta, "grounding_chunks", None)
-            print(f'[DIGEST DEBUG] {channel_name} grounding_chunks: {chunks}')
-            print(f'[DIGEST DEBUG] {channel_name} response text[:100]: {(response.text or "")[:100]}')
-        except Exception as de:
-            print(f'[DIGEST DEBUG] meta inspection error: {de}')
+        # Method 1: take first grounding chunk URI directly (Vertex redirect is fine)
+        if meta and meta.grounding_chunks:
+            uri = getattr(meta.grounding_chunks[0].web, 'uri', None) if meta.grounding_chunks[0].web else None
+            if uri:
+                video_url = uri
+                title     = getattr(meta.grounding_chunks[0].web, 'title', '') or ''
+                print(f'[DIGEST] URL from grounding_chunks: {channel_name} — {video_url[:70]}')
 
-        # SAFETY 2: grounding_chunks (primary — verified URLs)
-        if meta and hasattr(meta, 'grounding_chunks') and meta.grounding_chunks:
-            for chunk in meta.grounding_chunks:
-                uri = getattr(chunk.web, 'uri', None) if chunk.web else None
-                if uri and 'youtube.com/watch' in uri:
-                    video_url = uri
-                    title     = getattr(chunk.web, 'title', '') or ''
-                    print(f'[DIGEST] URL from grounding_chunks: {channel_name} — {video_url}')
-                    break
-
-        # SAFETY 3: search_entry_point rendered HTML
-        if not video_url and meta and hasattr(meta, 'search_entry_point') and meta.search_entry_point:
-            raw_html = getattr(meta.search_entry_point, 'rendered_content', '') or ''
-            found_html = re.search(r'href="(https://www\.youtube\.com/watch\?v=[\w-]+)"', raw_html)
-            if found_html:
-                video_url = found_html.group(1)
-                print(f'[DIGEST] URL from search_entry_point: {channel_name} — {video_url}')
-
-        # SAFETY 4: parse text response
-        if not video_url and response.text:
-            text = response.text
-            if 'NO_NEW_VIDEO' in text.upper() or 'no new video' in text.lower():
+        # Method 2: scan text for any youtube or google link
+        if not video_url:
+            all_text = response.text or ''
+            if 'no new video' in all_text.lower() or 'no video' in all_text.lower():
                 print(f'[DIGEST] No new video for {channel_name}')
                 return None, None, None
-            text_links = re.findall(r'https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+', text)
-            if text_links:
-                video_url = text_links[0]
-                print(f'[DIGEST] URL from text: {channel_name} — {video_url}')
-            if not title:
-                t_match = re.search(r'TITLE:\s*(.+)', text)
-                title = t_match.group(1).strip() if t_match else ''
+            links = re.findall(r'https?://[^\s"<>]+', all_text)
+            for link in links:
+                if 'youtube' in link or 'google' in link:
+                    video_url = link
+                    print(f'[DIGEST] URL from text: {channel_name} — {video_url[:70]}')
+                    break
 
         if not video_url:
             print(f'[DIGEST] No URL found for {channel_name}')
