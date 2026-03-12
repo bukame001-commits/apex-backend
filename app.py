@@ -2069,55 +2069,46 @@ Report Structure:
     client = _genai_client or _genai.Client(api_key=gemini_key)
 
     # Resolve Vertex redirect URL → real YouTube URL
+    # Try HEAD first (fast), fall back to GET if HEAD fails silently
     real_yt_url = video_url
     if 'vertexaisearch.cloud.google.com' in video_url or 'grounding-api-redirect' in video_url:
-        try:
-            r = _req2.get(video_url, timeout=15, allow_redirects=True)
-            if 'youtube.com/watch' in r.url or 'youtu.be/' in r.url:
-                real_yt_url = r.url
-                print(f'[DIGEST] Resolved redirect → {real_yt_url[:60]}')
-            else:
-                # Check history for YouTube hop
+        for method in [_req2.head, _req2.get]:
+            try:
+                r = method(video_url, timeout=12, allow_redirects=True)
+                # Check final URL
+                if 'youtube.com/watch' in r.url or 'youtu.be/' in r.url:
+                    real_yt_url = r.url
+                    print(f'[DIGEST] Resolved redirect → {real_yt_url[:60]}')
+                    break
+                # Check hop chain
                 for hop in r.history:
-                    if 'youtube.com/watch' in hop.url:
+                    if 'youtube.com/watch' in hop.url or 'youtu.be/' in hop.url:
                         real_yt_url = hop.url
                         print(f'[DIGEST] Resolved redirect (hop) → {real_yt_url[:60]}')
                         break
-        except Exception as re2:
-            print(f'[DIGEST] Redirect resolve error: {re2}')
+                if real_yt_url != video_url:
+                    break
+            except Exception as re2:
+                print(f'[DIGEST] Redirect resolve error ({method.__name__}): {re2}')
 
-    # Extract video_id from resolved URL if not already set
+    # Extract video_id from resolved URL
     if not video_id or video_id == video_url:
         vm = re.search(r'(?:watch\?v=|youtu\.be/)([\w-]+)', real_yt_url)
         video_id = vm.group(1) if vm else None
 
-    # Step 1: Try transcript — handle v0.x, v1.x, and v1.2.x+ API differences
+    # Step 1: Try transcript — fetch() is the working v1.2.x+ method
     transcript_text = None
     if video_id:
         try:
-            snippets = None
-            # v1.2.x+: instance method fetch().to_raw_data()
-            try:
-                ytt = YouTubeTranscriptApi()
-                snippets = ytt.fetch(video_id).to_raw_data()
-                print(f'[DIGEST] Transcript via fetch() for {channel_name}')
-            except Exception:
-                pass
-            # v1.x / v0.x: class method get_transcript()
-            if not snippets:
-                try:
-                    snippets = YouTubeTranscriptApi.get_transcript(video_id, languages=['tr', 'en'])
-                except Exception:
-                    snippets = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
-            if snippets:
-                transcript_text = ' '.join([t.get('text', '') for t in snippets])
-                print(f'[DIGEST] Got transcript for {channel_name} ({len(transcript_text)} chars)')
+            ytt = YouTubeTranscriptApi()
+            snippets = ytt.fetch(video_id).to_raw_data()
+            transcript_text = ' '.join([t.get('text', '') for t in snippets])
+            print(f'[DIGEST] Got transcript for {channel_name} ({len(transcript_text)} chars)')
         except Exception as e:
             print(f'[DIGEST] Transcript unavailable for {channel_name}: {e}')
 
     try:
         if transcript_text:
-            # Analyse via transcript text
             response = client.models.generate_content(
                 model=model_name,
                 contents=f"{analyst_prompt}\n\nTranscript:\n{transcript_text[:12000]}",
@@ -2127,7 +2118,7 @@ Report Structure:
                 )
             )
         elif real_yt_url and 'youtube.com/watch' in real_yt_url:
-            # Fallback: pass real YouTube URL as video part
+            # No transcript — use native Gemini video analysis
             print(f'[DIGEST] Using native video analysis for {channel_name}')
             response = client.models.generate_content(
                 model=model_name,
@@ -2144,8 +2135,16 @@ Report Structure:
                 )
             )
         else:
-            print(f'[DIGEST] No transcript or valid URL for {channel_name}, skipping')
-            return None
+            # Redirect failed — still try native video with the Vertex URL directly
+            print(f'[DIGEST] Trying Vertex URL directly for {channel_name}')
+            response = client.models.generate_content(
+                model=model_name,
+                contents=f"{analyst_prompt}\n\nNote: Analyse the video at this URL: {video_url}",
+                config=genai_types.GenerateContentConfig(
+                    tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+                    max_output_tokens=2000
+                )
+            )
         return response.text
     except Exception as e:
         print(f'[DIGEST] Gemini analyse error for {channel_name}: {e}')
@@ -2180,40 +2179,60 @@ def _gemini_find_latest_video(channel_name, handle, hours, gemini_key):
         video_url = None
         title     = ''
 
-        # Method 1: take first grounding chunk URI directly (Vertex redirect is fine)
+        # Method 1: grounding chunk URI — resolve Vertex redirect → real YouTube URL
         if meta and meta.grounding_chunks:
             uri = getattr(meta.grounding_chunks[0].web, 'uri', None) if meta.grounding_chunks[0].web else None
             if uri:
-                video_url = uri
-                title     = getattr(meta.grounding_chunks[0].web, 'title', '') or ''
-                print(f'[DIGEST] URL from grounding_chunks: {channel_name} — {video_url[:70]}')
+                # Resolve redirect to get real YouTube URL
+                for method in [_req.head, _req.get]:
+                    try:
+                        rr = method(uri, timeout=12, allow_redirects=True)
+                        if 'youtube.com/watch' in rr.url or 'youtu.be/' in rr.url:
+                            video_url = rr.url
+                            print(f'[DIGEST] Resolved: {channel_name} — {video_url[:60]}')
+                            break
+                        for hop in rr.history:
+                            if 'youtube.com/watch' in hop.url:
+                                video_url = hop.url
+                                break
+                        if video_url:
+                            break
+                    except Exception:
+                        pass
+                # If redirect failed, keep raw URI for fallback
+                if not video_url:
+                    video_url = uri
 
-        # Method 2: scan text for any youtube or google link
-        if not video_url:
-            all_text = response.text or ''
+        # Method 2: scan text for direct YouTube URL
+        all_text = response.text or ''
+        if not video_url or 'vertexaisearch' in video_url:
             if 'no new video' in all_text.lower() or 'no video' in all_text.lower():
                 print(f'[DIGEST] No new video for {channel_name}')
                 return None, None, None
-            links = re.findall(r'https?://[^\s"<>]+', all_text)
-            for link in links:
-                if 'youtube' in link or 'google' in link:
-                    video_url = link
-                    print(f'[DIGEST] URL from text: {channel_name} — {video_url[:70]}')
-                    break
+            yt_links = re.findall(r'https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+', all_text)
+            if yt_links:
+                video_url = yt_links[0]
+                print(f'[DIGEST] URL from text: {channel_name} — {video_url[:70]}')
 
         if not video_url:
             print(f'[DIGEST] No URL found for {channel_name}')
             return None, None, None
 
-        # Extract video_id from url
+        # Extract video_id
         vid_match = re.search(r'watch\?v=([\w-]+)', video_url)
         if not vid_match:
             vid_match = re.search(r'youtu\.be/([\w-]+)', video_url)
-        video_id = vid_match.group(1) if vid_match else video_url
-        if not title:
+        video_id = vid_match.group(1) if vid_match else None
+
+        # Extract real title from Gemini text (chunk.web.title is just the domain)
+        title = ''
+        m = re.search(r'["]([ -~]{10,100})["]', all_text)
+        if m:
+            title = m.group(1).strip()
+        if not title or title.lower() in ('youtube.com', 'youtu.be', 'youtube'):
             title = channel_name
 
-        print(f'[DIGEST] Found: {channel_name} — {title[:50]} ({video_id})')
+        print(f'[DIGEST] Found: {channel_name} — {title[:50]}')
         return title, video_id, video_url
 
     except Exception as e:
