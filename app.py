@@ -2038,7 +2038,7 @@ def _gemini_analyse_video(channel_name, handle, video_id, video_url, title, lang
         analyst_prompt = f"""Title: {title}
 Channel: {channel_name}
 Role: Senior Citadel Macro Analyst
-Task: Analyse the following Turkish financial content. Translate all key insights into English.
+Task: Analyse the following Turkish financial content. Write your entire report in Turkish.
 
 Report Structure:
 1. SUMMARY: 2-sentence executive overview of the creator's core argument.
@@ -2372,17 +2372,46 @@ def digest_run():
     """Trigger a digest run in background — returns immediately, results appear on /digest page."""
     data  = request.get_json(silent=True, force=True) or {}
     hours = data.get('hours', 24)
-    # Check if already running
-    if getattr(digest_run, '_running', False):
-        return jsonify({'success': False, 'error': 'Digest already running — please wait'})
+
+    # Cross-worker lock via JSONBin — prevents both gunicorn workers running simultaneously
+    try:
+        lock_r = requests.get(_JSONBIN_URL + '/latest', headers=_JSONBIN_HEADERS, timeout=10)
+        if lock_r.ok:
+            rec = lock_r.json().get('record', {})
+            if rec.get('digest_running'):
+                import datetime as _dtl
+                started = rec.get('digest_started', '')
+                return jsonify({'success': False, 'error': f'Digest already running (started {started}) — please wait'})
+    except Exception:
+        pass  # If lock check fails, proceed anyway
+
+    # Set lock
+    try:
+        import datetime as _dtl2
+        lock_data = _store_load()
+        rpts, setups, digest = lock_data
+        requests.put(_JSONBIN_URL, headers=_JSONBIN_HEADERS, timeout=10,
+                     json={'reports': rpts, 'setups': setups, 'digest': digest,
+                           'digest_running': True,
+                           'digest_started': _dtl2.datetime.utcnow().strftime('%H:%M UTC')})
+    except Exception:
+        pass
+
     def _bg():
-        digest_run._running = True
         try:
             _run_digest(hours=hours)
         finally:
-            digest_run._running = False
+            # Release lock
+            try:
+                rpts, setups, digest = _store_load()
+                requests.put(_JSONBIN_URL, headers=_JSONBIN_HEADERS, timeout=10,
+                             json={'reports': rpts, 'setups': setups, 'digest': digest,
+                                   'digest_running': False})
+            except Exception:
+                pass
+
     threading.Thread(target=_bg, daemon=True).start()
-    return jsonify({'success': True, 'message': f'Digest started for last {hours}h — reload page in ~2 minutes'})
+    return jsonify({'success': True, 'message': f'Digest started for last {hours}h — reload page in ~11 minutes'})
 
 
 @app.route('/digest/debug')
