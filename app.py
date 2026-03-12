@@ -2160,121 +2160,88 @@ Report Structure:
         return None
 
 
-def _gemini_find_latest_video(channel_name, handle, hours, gemini_key):
-    """Step 1: Use Gemini grounding to find the latest video URL and ID."""
-    import datetime as _dt2, re, requests as _req
-    now_str   = _dt2.datetime.utcnow().strftime('%B %d, %Y')
-    since_str = (_dt2.datetime.utcnow() - _dt2.timedelta(hours=hours)).strftime('%B %d, %Y %H:%M UTC')
+# Channel ID cache — resolved once from YouTube API, persisted to avoid repeated lookups
+_yt_channel_id_cache = {}  # handle -> UCxxxxx
 
-    find_prompt = (
-        f"Today is {now_str}. Search YouTube for the most recent video published by the channel '{channel_name}' "
-        f"after {since_str}. "
-        f"Reply with ONLY these two lines and nothing else:\n"
-        f"TITLE: [exact video title]\n"
-        f"URL: https://www.youtube.com/watch?v=[real_video_id]\n"
-        f"If no video was published after {since_str}, reply exactly: NO_NEW_VIDEO"
-    )
+def _yt_resolve_channel_id(handle, yt_key):
+    """Resolve a YouTube @handle to a UCxxxxx channel ID via YouTube Data API v3."""
+    if handle in _yt_channel_id_cache:
+        return _yt_channel_id_cache[handle]
+    try:
+        clean_handle = handle.lstrip('@')
+        r = requests.get(
+            'https://www.googleapis.com/youtube/v3/channels',
+            params={'part': 'id', 'forHandle': clean_handle, 'key': yt_key},
+            timeout=10
+        )
+        if r.ok:
+            items = r.json().get('items', [])
+            if items:
+                channel_id = items[0]['id']
+                _yt_channel_id_cache[handle] = channel_id
+                print(f'[DIGEST] Resolved handle @{clean_handle} → {channel_id}')
+                return channel_id
+    except Exception as e:
+        print(f'[DIGEST] Handle resolve error for {handle}: {e}')
+    return None
+
+
+def _yt_find_latest_video(channel_name, handle, hours, yt_key):
+    """Use YouTube Data API v3 to find the latest video from a channel."""
+    import datetime as _dt2
+    channel_id = _yt_resolve_channel_id(handle, yt_key)
+    if not channel_id:
+        print(f'[DIGEST] Could not resolve channel ID for {channel_name} (@{handle})')
+        return None, None, None
+
+    # published_after must be RFC 3339 format
+    since = _dt2.datetime.utcnow() - _dt2.timedelta(hours=hours)
+    published_after = since.strftime('%Y-%m-%dT%H:%M:%SZ')
 
     try:
-        from google.genai import types as genai_types
-        client = _genai_client or _genai.Client(api_key=gemini_key)
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=find_prompt,
-            config=genai_types.GenerateContentConfig(
-                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
-                max_output_tokens=1000,
-                temperature=0.0
-            )
+        r = requests.get(
+            'https://www.googleapis.com/youtube/v3/search',
+            params={
+                'part':           'snippet',
+                'channelId':      channel_id,
+                'order':          'date',
+                'type':           'video',
+                'maxResults':     1,
+                'publishedAfter': published_after,
+                'key':            yt_key,
+            },
+            timeout=10
         )
-        if not response or not response.candidates:
-            print(f'[DIGEST] No response for {channel_name}')
+        if not r.ok:
+            print(f'[DIGEST] YouTube API error for {channel_name}: {r.status_code} {r.text[:100]}')
             return None, None, None
 
-        meta      = response.candidates[0].grounding_metadata
-        video_url = None
-        title     = ''
-
-        # Method 1: grounding chunk URI — resolve Vertex redirect → real YouTube URL
-        if meta and meta.grounding_chunks:
-            uri = getattr(meta.grounding_chunks[0].web, 'uri', None) if meta.grounding_chunks[0].web else None
-            if uri:
-                # Resolve redirect to get real YouTube URL
-                for method in [_req.head, _req.get]:
-                    try:
-                        rr = method(uri, timeout=12, allow_redirects=True)
-                        if 'youtube.com/watch' in rr.url or 'youtu.be/' in rr.url:
-                            video_url = rr.url
-                            print(f'[DIGEST] Resolved: {channel_name} — {video_url[:60]}')
-                            break
-                        for hop in rr.history:
-                            if 'youtube.com/watch' in hop.url:
-                                video_url = hop.url
-                                break
-                        if video_url:
-                            break
-                    except Exception:
-                        pass
-                # If redirect failed, keep raw URI for fallback
-                if not video_url:
-                    video_url = uri
-
-        # Method 2: parse structured TITLE/URL reply, then fallback to text scan
-        all_text = response.text or ''
-        if 'NO_NEW_VIDEO' in all_text or 'no new video' in all_text.lower() or 'no video was published' in all_text.lower():
-            print(f'[DIGEST] No new video for {channel_name}')
+        items = r.json().get('items', [])
+        if not items:
+            print(f'[DIGEST] No new video in last {hours}h for {channel_name}')
             return None, None, None
 
-        # Parse structured TITLE: / URL: lines
-        for line in all_text.split('\n'):
-            line = line.strip()
-            if line.startswith('TITLE:') and not title:
-                candidate = line[6:].strip().strip('"')
-                if candidate and 'youtube.com' not in candidate and 'http' not in candidate:
-                    title = candidate
-            elif line.startswith('URL:') and not video_url:
-                candidate = line[4:].strip()
-                # Strict validation: must be real YouTube watch URL with 11-char ID
-                vm = re.search(r'youtube\.com/watch\?v=([A-Za-z0-9_-]{11})(?:[&\s]|$)', candidate)
-                if vm:
-                    video_url = f'https://www.youtube.com/watch?v={vm.group(1)}'
-                    print(f'[DIGEST] URL from structured reply: {channel_name} — {video_url}')
-
-        # Fallback: scan grounding chunks or text for YouTube URL
-        if not video_url or 'vertexaisearch' in video_url:
-            yt_ids = re.findall(r'youtube\.com/watch\?v=([A-Za-z0-9_-]{11})', all_text)
-            if yt_ids:
-                video_url = f'https://www.youtube.com/watch?v={yt_ids[0]}'
-                print(f'[DIGEST] URL from text scan: {channel_name} — {video_url}')
-
-        if not video_url:
-            print(f'[DIGEST] No URL found for {channel_name}')
-            return None, None, None
-
-        # Extract video_id
-        vid_match = re.search(r'watch\?v=([A-Za-z0-9_-]{11})', video_url)
-        video_id = vid_match.group(1) if vid_match else None
-
-        # Title fallback: extract from quoted text in response
-        if not title or title.lower() in ('youtube.com', 'youtu.be', 'youtube'):
-            m = re.search(r'"([^"\n]{10,120})"', all_text)
-            if m:
-                cand = m.group(1).strip()
-                if 'youtube.com' not in cand and 'http' not in cand:
-                    title = cand
-        if not title or title.lower() in ('youtube.com', 'youtu.be', 'youtube'):
-            title = channel_name
-        print(f'[DIGEST] Found: {channel_name} — {title[:50]}')
+        item     = items[0]
+        video_id = item['id']['videoId']
+        title    = item['snippet']['title']
+        video_url = f'https://www.youtube.com/watch?v={video_id}'
+        print(f'[DIGEST] Found via API: {channel_name} — {title[:60]}')
         return title, video_id, video_url
 
     except Exception as e:
-        print(f'[DIGEST] Find video error for {channel_name}: {e}')
+        print(f'[DIGEST] YouTube API find error for {channel_name}: {e}')
         return None, None, None
 
 
-def _gemini_find_and_summarise(channel_name, handle, lang, hours, gemini_key):
-    """Two-step: find latest video then analyse it with transcript or native video."""
-    title, video_id, video_url = _gemini_find_latest_video(channel_name, handle, hours, gemini_key)
+def _gemini_find_and_summarise(channel_name, handle, lang, hours, gemini_key, yt_key=None):
+    """Two-step: find latest video via YouTube API, then analyse with Gemini."""
+    # Use YouTube Data API if key available, else skip
+    if yt_key:
+        title, video_id, video_url = _yt_find_latest_video(channel_name, handle, hours, yt_key)
+    else:
+        print(f'[DIGEST] No YOUTUBE_API_KEY — skipping {channel_name}')
+        return None
+
     if not video_id:
         return None
 
@@ -2307,6 +2274,7 @@ def _run_digest(hours=24):
     """Full digest — Gemini finds and summarises latest videos. No YouTube API needed."""
     global _digest_last_run
     gemini_key = os.environ.get('GEMINI_API_KEY', '')
+    yt_key     = os.environ.get('YOUTUBE_API_KEY', '')
     tg_token   = os.environ.get('TELEGRAM_BOT_TOKEN', '') or TELEGRAM_BOT_TOKEN
     tg_chat    = os.environ.get('TELEGRAM_CHAT_ID', '') or TELEGRAM_CHAT_ID
 
@@ -2325,7 +2293,7 @@ def _run_digest(hours=24):
         if i > 0:
             time.sleep(60)  # 60s between channels — stay within RPM limits
         print(f'[DIGEST] Checking {ch["name"]}...')
-        response = _gemini_find_and_summarise(ch['name'], ch['handle'], ch['lang'], hours, gemini_key)
+        response = _gemini_find_and_summarise(ch['name'], ch['handle'], ch['lang'], hours, gemini_key, yt_key=yt_key)
         if not response:
             _channel_status[ch['name']] = '— no new video'
             continue
@@ -2415,6 +2383,69 @@ def digest_run():
             digest_run._running = False
     threading.Thread(target=_bg, daemon=True).start()
     return jsonify({'success': True, 'message': f'Digest started for last {hours}h — reload page in ~2 minutes'})
+
+
+@app.route('/digest/debug')
+def digest_debug():
+    """Debug endpoint — tests YouTube API for all channels and returns raw results."""
+    import datetime as _dt
+    yt_key     = os.environ.get('YOUTUBE_API_KEY', '')
+    hours      = int(request.args.get('hours', 24))
+    since      = (_dt.datetime.utcnow() - _dt.timedelta(hours=hours)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    if not yt_key:
+        return jsonify({'error': 'YOUTUBE_API_KEY not set in Railway variables'}), 500
+
+    results = []
+    for ch in DIGEST_CHANNELS:
+        entry = {'channel': ch['name'], 'handle': ch['handle'], 'hours': hours}
+
+        # Step 1: resolve handle → channel ID
+        channel_id = _yt_resolve_channel_id(ch['handle'], yt_key)
+        entry['channel_id'] = channel_id or 'FAILED TO RESOLVE'
+
+        if channel_id:
+            # Step 2: search for latest video
+            try:
+                r = requests.get(
+                    'https://www.googleapis.com/youtube/v3/search',
+                    params={
+                        'part':           'snippet',
+                        'channelId':      channel_id,
+                        'order':          'date',
+                        'type':           'video',
+                        'maxResults':     1,
+                        'publishedAfter': since,
+                        'key':            yt_key,
+                    },
+                    timeout=10
+                )
+                entry['api_status'] = r.status_code
+                data = r.json()
+                items = data.get('items', [])
+                if items:
+                    v = items[0]
+                    entry['video_id']    = v['id']['videoId']
+                    entry['title']       = v['snippet']['title']
+                    entry['published']   = v['snippet']['publishedAt']
+                    entry['url']         = f"https://www.youtube.com/watch?v={v['id']['videoId']}"
+                    entry['status']      = 'FOUND'
+                else:
+                    entry['status'] = f'NO_NEW_VIDEO in last {hours}h'
+                    entry['api_error'] = data.get('error', {})
+            except Exception as e:
+                entry['status'] = f'ERROR: {e}'
+        else:
+            entry['status'] = 'CHANNEL_ID_RESOLUTION_FAILED'
+
+        results.append(entry)
+
+    return jsonify({
+        'youtube_api_key_set': bool(yt_key),
+        'hours': hours,
+        'since': since,
+        'channels': results
+    })
 
 
 @app.route('/digest')
