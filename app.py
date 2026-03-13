@@ -2407,6 +2407,58 @@ def digest_run():
     return jsonify({'success': True, 'message': f'Digest started for last {hours}h — reload page in ~11 minutes'})
 
 
+@app.route('/admin/restore-march7-setups', methods=['POST', 'GET'])
+def admin_restore_march7_setups():
+    """One-time restore of March 7 setups lost due to digest lock bug."""
+    import json as _json
+
+    restored_setups = [
+        {"id":"ADA_4H_1741381560000","symbol":"ADA","direction":"LONG","entry":0.2557,"stop":0.24655,"target":0.274,"source":"Citadel Report","timeframe":"4H","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"WLFI_4H_1741381560100","symbol":"WLFI","direction":"LONG","entry":0.0969,"stop":0.093,"target":0.1047,"source":"Citadel Report","timeframe":"4H","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"ETC_4H_1741381560200","symbol":"ETC","direction":"LONG","entry":8.123,"stop":7.8572,"target":8.6546,"source":"Citadel Report","timeframe":"4H","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"ALGO_4H_1741381560300","symbol":"ALGO","direction":"LONG","entry":0.0835,"stop":0.0811,"target":0.0883,"source":"Citadel Report","timeframe":"4H","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"TRUMP_4H_1741381560400","symbol":"TRUMP","direction":"LONG","entry":3.043,"stop":2.9425,"target":3.244,"source":"Citadel Report","timeframe":"4H","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"VIRTUAL_4H_1741381560500","symbol":"VIRTUAL","direction":"LONG","entry":0.6745,"stop":0.6436,"target":0.7363,"source":"Citadel Report","timeframe":"4H","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"CRV_4H_1741381560600","symbol":"CRV","direction":"LONG","entry":0.233,"stop":0.22355,"target":0.2519,"source":"Citadel Report","timeframe":"4H","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"FET_4H_1741381560700","symbol":"FET","direction":"LONG","entry":0.1443,"stop":0.13905,"target":0.1548,"source":"Citadel Report","timeframe":"4H","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"BSV_4H_1741381560800","symbol":"BSV","direction":"LONG","entry":13.9,"stop":13.4746,"target":14.7508,"source":"Citadel Report","timeframe":"4H","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"GRT_4H_1741381560900","symbol":"GRT","direction":"LONG","entry":0.02522,"stop":0.02447,"target":0.02672,"source":"Citadel Report","timeframe":"4H","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"BTC_1W_1741381561000","symbol":"BTC","direction":"LONG","entry":67251.3,"stop":53662.5,"target":94428.9,"source":"Citadel Report","timeframe":"1W","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"ETH_1W_1741381561100","symbol":"ETH","direction":"LONG","entry":1959.95,"stop":1290.33,"target":3299.19,"source":"Citadel Report","timeframe":"1W","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"BNB_1W_1741381561200","symbol":"BNB","direction":"LONG","entry":620.2,"stop":468.087,"target":924.425,"source":"Citadel Report","timeframe":"1W","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"XRP_1W_1741381561300","symbol":"XRP","direction":"LONG","entry":1.3512,"stop":0.85725,"target":2.3391,"source":"Citadel Report","timeframe":"1W","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"SOL_1W_1741381561400","symbol":"SOL","direction":"LONG","entry":82.79,"stop":48.3401,"target":151.69,"source":"Citadel Report","timeframe":"1W","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"DOGE_1W_1741381561500","symbol":"DOGE","direction":"LONG","entry":0.08973,"stop":0.04473,"target":0.17973,"source":"Citadel Report","timeframe":"1W","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"ADA_1W_1741381561600","symbol":"ADA","direction":"LONG","entry":0.2548,"stop":0.1201,"target":0.5242,"source":"Citadel Report","timeframe":"1W","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"LINK_1W_1741381561700","symbol":"LINK","direction":"LONG","entry":8.685,"stop":5.09595,"target":15.8631,"source":"Citadel Report","timeframe":"1W","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"XLM_1W_1741381561800","symbol":"XLM","direction":"LONG","entry":0.15,"stop":0.0876,"target":0.2748,"source":"Citadel Report","timeframe":"1W","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+        {"id":"LTC_1W_1741381561900","symbol":"LTC","direction":"LONG","entry":53.47,"stop":35.4594,"target":89.4913,"source":"Citadel Report","timeframe":"1W","notes":"","status":"OPEN","createdAt":"2026-03-07T20:06:00Z","closedAt":None,"closePrice":None},
+    ]
+
+    try:
+        global _backtest_setups
+        cur_reports, cur_setups, cur_digest = _store_load()
+
+        # Merge — restored setups first, current setups override by ID (no duplicates)
+        merged = {s['id']: s for s in restored_setups}
+        for s in cur_setups:
+            merged[s['id']] = s
+        final = list(merged.values())
+
+        _backtest_setups = final
+        _store_save()
+
+        return jsonify({
+            'success': True,
+            'restored': len(restored_setups),
+            'existing': len(cur_setups),
+            'total': len(final),
+            'symbols': [f"{s['symbol']} ({s['timeframe']})" for s in final]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/admin/jsonbin-versions')
 def admin_jsonbin_versions():
     """Fetch all versions of the JSONBin and show setups count per version."""
