@@ -218,8 +218,12 @@ _last_alert_time = {}           # symbol -> last alert timestamp
 _monitor_running  = False
 
 # ── Cache for Russell 2000 constituents (refresh every 24h) ──
-_russell_cache = None
+_russell_cache      = None
 _russell_cache_time = 0
+_sp500_cache        = None
+_sp500_cache_time   = 0
+_nasdaq_cache       = None
+_nasdaq_cache_time  = 0
 CACHE_TTL = 86400  # 24 hours
 
 HEADERS = {
@@ -2004,6 +2008,63 @@ def backtest_page():
     with open(html_path, 'r') as f:
         return f.read(), 200, {'Content-Type': 'text/html'}
 
+
+# ── News Intel: Financial Juice RSS proxy (Section 07) ───────
+@app.route('/api/fj-feed')
+def fj_feed():
+    try:
+        url = 'https://financialjuice.com/feed'
+        headers_fj = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+        }
+        r = requests.get(url, headers=headers_fj, timeout=10)
+        if not r.ok:
+            return jsonify({'error': f'Financial Juice returned {r.status_code}'}), 502
+
+        import re as _re
+        items = []
+        for item_block in _re.findall(r'<item>(.*?)</item>', r.text, _re.DOTALL):
+            def tag(name):
+                m = _re.search(rf'<{name}[^>]*><!\[CDATA\[(.*?)\]\]></{name}>|<{name}[^>]*>(.*?)</{name}>', item_block, _re.DOTALL)
+                if m:
+                    return (m.group(1) or m.group(2) or '').strip()
+                return ''
+            title = tag('title')
+            link  = tag('link') or tag('guid')
+            pub   = tag('pubDate')
+            if not title:
+                continue
+            pub_iso = ''
+            if pub:
+                try:
+                    from email.utils import parsedate_to_datetime
+                    pub_iso = parsedate_to_datetime(pub).isoformat()
+                except Exception:
+                    pub_iso = pub
+            items.append({'title': title, 'url': link, 'date': pub_iso, 'important': False})
+        return jsonify(items[:40])
+    except Exception as e:
+        print(f'FJ feed error: {e}')
+        return jsonify({'error': str(e)}), 503
+
+
+# ── News Intel: CryptoPanic proxy (Section 07) ────────────────
+@app.route('/api/crypto-news')
+def crypto_news():
+    try:
+        cp_url = (
+            'https://cryptopanic.com/api/free/v1/posts/'
+            '?auth_token=free&public=true&kind=news&regions=en&filter=important'
+        )
+        r = requests.get(cp_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        if not r.ok:
+            return jsonify({'error': f'CryptoPanic returned {r.status_code}'}), 502
+        return jsonify(r.json())
+    except Exception as e:
+        print(f'CryptoPanic proxy error: {e}')
+        return jsonify({'error': str(e)}), 503
+
 # ── Health check ─────────────────────────────────────────────
 
 # ═══════════════════════════════════════════════════════════════
@@ -2031,9 +2092,7 @@ _digest_seen          = set()   # tracks video titles already summarised today
 _digest_channel_status = {}     # channel -> 'new video' | 'no new video' | 'error'
 
 def _gemini_analyse_video(channel_name, handle, video_id, video_url, title, lang, gemini_key, deep_dive=True):
-    """Analyse a YouTube video using transcript + Gemini native video fallback."""
-    from youtube_transcript_api import YouTubeTranscriptApi
-
+    """Analyse a YouTube video using Gemini native audio/video analysis."""
     if lang == 'tr':
         analyst_prompt = f"""Title: {title}
 Channel: {channel_name}
@@ -2901,7 +2960,7 @@ def fetch_one_stock(sym, interval='1wk'):
             print(f'{sym} Yahoo error: {e}')
 
         if yahoo_klines:
-            return sym, {'klines': yahoo_klines, 'marketCap': market_cap, 'type': 'stock'}
+            return sym, {'klines': yahoo_klines, 'marketCap': market_cap, 'type': 'stock', 'source': 'yahoo', 'lastBar': yahoo_klines[-1][0] if yahoo_klines else None}
 
         # ── 2. Stooq fallback — only fires when Yahoo fails ──
         # Skip Stooq for 60m (intraday) — it doesn't have reliable hourly data
@@ -2910,7 +2969,7 @@ def fetch_one_stock(sym, interval='1wk'):
             stooq_klines = fetch_stooq(sym, interval)
             if stooq_klines:
                 print(f'{sym}: Stooq success ({len(stooq_klines)} bars)')
-                return sym, {'klines': stooq_klines, 'marketCap': None, 'type': 'stock'}
+                return sym, {'klines': stooq_klines, 'marketCap': None, 'type': 'stock', 'source': 'stooq', 'lastBar': stooq_klines[-1][0] if stooq_klines else None}
 
         return sym, None
     except Exception as e:
@@ -3119,14 +3178,33 @@ def stocks():
 
     interval = request.args.get('interval', '1wk')
     results = {}
+    yahoo_count = 0
+    stooq_count = 0
+    failed_count = 0
     with ThreadPoolExecutor(max_workers=40) as executor:
         futures = {executor.submit(fetch_one_stock, sym, interval): sym for sym in symbols}
         for future in as_completed(futures):
             sym, data = future.result()
             if data:
                 results[sym] = data
+                src = data.get('source', '')
+                if src == 'yahoo':  yahoo_count += 1
+                elif src == 'stooq': stooq_count += 1
+            else:
+                failed_count += 1
 
-    return jsonify(results)
+    print(f'[STOCKS] {len(results)}/{len(symbols)} fetched — Yahoo:{yahoo_count} Stooq:{stooq_count} Failed:{failed_count}')
+    return jsonify({
+        'data': results,
+        'meta': {
+            'requested': len(symbols),
+            'fetched':   len(results),
+            'yahoo':     yahoo_count,
+            'stooq':     stooq_count,
+            'failed':    failed_count,
+            'interval':  interval,
+        }
+    })
 
 # ── Russell 2000 constituents via iShares IWM ETF ────────────
 @app.route('/russell2000')
@@ -3215,6 +3293,9 @@ def russell2000():
 # ── S&P 500 constituents via iShares IVV ETF ─────────────────
 @app.route('/sp500')
 def sp500():
+    global _sp500_cache, _sp500_cache_time
+    if _sp500_cache and (time.time() - _sp500_cache_time) < CACHE_TTL:
+        return jsonify({'tickers': _sp500_cache, 'count': len(_sp500_cache), 'source': 'cache'})
     try:
         url = (
             'https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf/'
@@ -3226,7 +3307,7 @@ def sp500():
         }
         r = requests.get(url, headers=headers, timeout=20)
         if not r.ok:
-            raise Exception(f'{r.status_code}')
+            raise Exception(f'iShares returned {r.status_code}')
 
         tickers = []
         reader = csv.reader(io.StringIO(r.text))
@@ -3236,15 +3317,73 @@ def sp500():
                 continue
             ticker = row[0].strip().strip('"')
             if not started:
-                if ticker.isupper() and 1 <= len(ticker) <= 5 and ticker.isalpha():
+                if ticker.isupper() and 1 <= len(ticker) <= 5 and ticker.replace('-','').isalpha():
                     started = True
                 else:
                     continue
-            if ticker and ticker.isupper() and ticker.isalpha() and ticker not in ('CASH', 'USD'):
+            if not ticker or ticker in ('Ticker', 'Name', 'CASH', 'USD', 'EUR', '-'):
+                continue
+            if ticker.isupper() and 1 <= len(ticker) <= 5 and ticker.replace('-','').isalpha():
                 tickers.append(ticker)
 
-        return jsonify({'tickers': tickers[:505], 'count': len(tickers)})
+        if len(tickers) > 100:
+            _sp500_cache      = tickers[:505]
+            _sp500_cache_time = time.time()
+            print(f'S&P 500: fetched {len(tickers)} tickers from iShares')
+            return jsonify({'tickers': _sp500_cache, 'count': len(tickers), 'source': 'ishares'})
+
+        raise Exception(f'Only parsed {len(tickers)} tickers — possible format change')
     except Exception as e:
+        print(f'S&P 500 fetch failed: {e}')
+        return jsonify({'error': str(e)}), 503
+
+
+# ── Nasdaq-100 constituents via iShares QQQ ETF ──────────────
+@app.route('/nasdaq100')
+def nasdaq100():
+    global _nasdaq_cache, _nasdaq_cache_time
+    if _nasdaq_cache and (time.time() - _nasdaq_cache_time) < CACHE_TTL:
+        return jsonify({'tickers': _nasdaq_cache, 'count': len(_nasdaq_cache), 'source': 'cache'})
+    try:
+        url = (
+            'https://www.ishares.com/us/products/238048/ishares-nasdaq-100-etf/'
+            '1467271812596.ajax?fileType=csv&fileName=IQQQ_holdings&dataType=fund'
+        )
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.ishares.com/',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        }
+        r = requests.get(url, headers=headers, timeout=20)
+        if not r.ok:
+            raise Exception(f'iShares returned {r.status_code}')
+
+        tickers = []
+        reader = csv.reader(io.StringIO(r.text))
+        started = False
+        for row in reader:
+            if not row:
+                continue
+            ticker = row[0].strip().strip('"')
+            if not started:
+                if ticker.isupper() and 1 <= len(ticker) <= 5 and ticker.replace('-','').isalpha():
+                    started = True
+                else:
+                    continue
+            if not ticker or ticker in ('Ticker', 'Name', 'CASH', 'USD', 'EUR', '-'):
+                continue
+            if ticker.isupper() and 1 <= len(ticker) <= 5 and ticker.replace('-','').isalpha():
+                tickers.append(ticker)
+
+        if len(tickers) > 50:
+            _nasdaq_cache      = tickers[:110]
+            _nasdaq_cache_time = time.time()
+            print(f'Nasdaq-100: fetched {len(tickers)} tickers from iShares')
+            return jsonify({'tickers': _nasdaq_cache, 'count': len(tickers), 'source': 'ishares'})
+
+        raise Exception(f'Only parsed {len(tickers)} tickers — possible format change')
+    except Exception as e:
+        print(f'Nasdaq-100 fetch failed: {e}')
         return jsonify({'error': str(e)}), 503
 
 # ── Monitor control routes ───────────────────────────────────
