@@ -2373,27 +2373,23 @@ def digest_run():
     data  = request.get_json(silent=True, force=True) or {}
     hours = data.get('hours', 24)
 
-    # Cross-worker lock via JSONBin — prevents both gunicorn workers running simultaneously
-    try:
-        lock_r = requests.get(_JSONBIN_URL + '/latest', headers=_JSONBIN_HEADERS, timeout=10)
-        if lock_r.ok:
-            rec = lock_r.json().get('record', {})
-            if rec.get('digest_running'):
-                import datetime as _dtl
-                started = rec.get('digest_started', '')
-                return jsonify({'success': False, 'error': f'Digest already running (started {started}) — please wait'})
-    except Exception:
-        pass  # If lock check fails, proceed anyway
+    # Cross-worker lock via shared filesystem — prevents both gunicorn workers running simultaneously
+    _DIGEST_LOCK_FILE = '/tmp/digest_running.lock'
+    import os as _os2
+    if _os2.path.exists(_DIGEST_LOCK_FILE):
+        try:
+            with open(_DIGEST_LOCK_FILE) as _lf:
+                started = _lf.read().strip()
+            return jsonify({'success': False, 'error': f'Digest already running (started {started}) — please wait'})
+        except Exception:
+            pass
 
-    # Set lock
+    # Set lock — use a simple shared file flag (both workers share same Railway container filesystem)
+    import datetime as _dtl2
+    _DIGEST_LOCK_FILE = '/tmp/digest_running.lock'
     try:
-        import datetime as _dtl2
-        lock_data = _store_load()
-        rpts, setups, digest = lock_data
-        requests.put(_JSONBIN_URL, headers=_JSONBIN_HEADERS, timeout=10,
-                     json={'reports': rpts, 'setups': setups, 'digest': digest,
-                           'digest_running': True,
-                           'digest_started': _dtl2.datetime.utcnow().strftime('%H:%M UTC')})
+        with open(_DIGEST_LOCK_FILE, 'w') as _lf:
+            _lf.write(_dtl2.datetime.utcnow().strftime('%H:%M UTC'))
     except Exception:
         pass
 
@@ -2401,17 +2397,108 @@ def digest_run():
         try:
             _run_digest(hours=hours)
         finally:
-            # Release lock
             try:
-                rpts, setups, digest = _store_load()
-                requests.put(_JSONBIN_URL, headers=_JSONBIN_HEADERS, timeout=10,
-                             json={'reports': rpts, 'setups': setups, 'digest': digest,
-                                   'digest_running': False})
+                import os as _os
+                _os.remove(_DIGEST_LOCK_FILE)
             except Exception:
                 pass
 
     threading.Thread(target=_bg, daemon=True).start()
     return jsonify({'success': True, 'message': f'Digest started for last {hours}h — reload page in ~11 minutes'})
+
+
+@app.route('/admin/jsonbin-versions')
+def admin_jsonbin_versions():
+    """Fetch all versions of the JSONBin and show setups count per version."""
+    try:
+        # Get version list
+        r = requests.get(
+            f'https://api.jsonbin.io/v3/b/{_JSONBIN_BIN_ID}/versions',
+            headers=_JSONBIN_HEADERS,
+            timeout=15
+        )
+        if not r.ok:
+            return jsonify({'error': f'API error: {r.status_code}', 'body': r.text}), 500
+
+        versions = r.json()
+        summary = []
+        for v in versions:
+            vnum = v.get('version')
+            summary.append({
+                'version': vnum,
+                'createdAt': v.get('createdAt', ''),
+            })
+
+        return jsonify({'total_versions': len(summary), 'versions': summary})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/admin/jsonbin-restore/<int:version>')
+def admin_jsonbin_restore(version):
+    """Read a specific JSONBin version and return its setups count + setup IDs."""
+    try:
+        r = requests.get(
+            f'https://api.jsonbin.io/v3/b/{_JSONBIN_BIN_ID}/{version}',
+            headers=_JSONBIN_HEADERS,
+            timeout=15
+        )
+        if not r.ok:
+            return jsonify({'error': f'API error: {r.status_code}', 'body': r.text}), 500
+
+        rec = r.json().get('record', {})
+        setups = rec.get('setups', [])
+        reports = rec.get('reports', {})
+        return jsonify({
+            'version': version,
+            'setups_count': len(setups),
+            'reports_count': len(reports),
+            'setup_symbols': [s.get('symbol') for s in setups],
+            'report_ids': list(reports.keys()),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/admin/jsonbin-apply/<int:version>', methods=['POST'])
+def admin_jsonbin_apply(version):
+    """Restore setups from a specific version, merging with current reports."""
+    try:
+        # Load old version
+        r_old = requests.get(
+            f'https://api.jsonbin.io/v3/b/{_JSONBIN_BIN_ID}/{version}',
+            headers=_JSONBIN_HEADERS,
+            timeout=15
+        )
+        if not r_old.ok:
+            return jsonify({'error': f'Could not load version {version}'}), 500
+
+        old_rec  = r_old.json().get('record', {})
+        old_setups = old_rec.get('setups', [])
+
+        # Load current data
+        cur_reports, cur_setups, cur_digest = _store_load()
+
+        # Merge setups — old setups base, current setups override by ID
+        merged = {s['id']: s for s in old_setups}
+        for s in cur_setups:
+            merged[s['id']] = s
+        final_setups = list(merged.values())
+
+        # Save merged back
+        global _backtest_setups
+        _backtest_setups = final_setups
+        _store_save()
+
+        return jsonify({
+            'success': True,
+            'old_setups': len(old_setups),
+            'current_setups': len(cur_setups),
+            'merged_setups': len(final_setups),
+            'symbols': [s.get('symbol') for s in final_setups]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/digest/debug')
