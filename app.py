@@ -83,7 +83,7 @@ def _sync_from_jsonbin():
     except Exception as e:
         print(f'[STORE] Sync error (non-fatal): {e}')
 
-def _log_backtest_setup(symbol, direction, entry, stop, target, source, timeframe='1H', notes=''):
+def _log_backtest_setup(symbol, direction, entry, stop, target, source, timeframe='1H', notes='', asset_type='crypto'):
     """Log an AI-generated setup to the backtest store."""
     if not entry or not stop or not target:
         return
@@ -98,6 +98,7 @@ def _log_backtest_setup(symbol, direction, entry, stop, target, source, timefram
         'timeframe': timeframe,
         'notes':     notes,
         'status':    'OPEN',
+        'assetType': asset_type,
         'createdAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
         'closedAt':  None,
         'closePrice':None,
@@ -107,7 +108,7 @@ def _log_backtest_setup(symbol, direction, entry, stop, target, source, timefram
         if len(_backtest_setups) > 500:
             _backtest_setups.pop()
         _store_save()
-    print(f'[BACKTEST] Logged: {symbol} {direction} E:{entry} S:{stop} T:{target} ({source})')
+    print(f'[BACKTEST] Logged: {symbol} {direction} E:{entry} S:{stop} T:{target} ({source}) [{asset_type}]')
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify, request
@@ -1499,6 +1500,7 @@ def citadel_report():
 
         # Step 1: Calculate setups in Python, log all to backtest
         setups = []
+        price_warnings = []  # tracks corrected prices
         for coin in coins_structured[:10]:
             try:
                 sym   = coin.get('symbol', '')
@@ -1519,9 +1521,33 @@ def citadel_report():
                     else:
                         stop   = round(price + 1.5 * atr, 8)
                         target = max(round(price - 3.0 * atr, 8), 0.000001)
+                    # Determine asset type from coin data
+                    _asset_type = coin.get('type', 'crypto')
+                    if _asset_type not in ('crypto', 'stock'):
+                        _asset_type = 'stock' if any(c.isalpha() and c.isupper() for c in sym) and '.' not in sym and len(sym) <= 5 and not sym.endswith('USDT') else 'crypto'
+
+                    # ── Live price validation — reject bad scan data ──────
+                    live_price = _fetch_live_price(sym, _asset_type)
+                    if live_price and price:
+                        deviation = abs(price - live_price) / live_price
+                        if deviation > 0.03:  # more than 3% off live price
+                            print(f'[CITADEL] ⚠ PRICE MISMATCH {sym}: scan=${price:.4f} live=${live_price:.4f} dev={deviation*100:.1f}% — REJECTING setup')
+                            price_warnings.append({
+                                'symbol': sym,
+                                'scanPrice': price,
+                                'livePrice': round(live_price, 6),
+                                'deviation': round(deviation * 100, 1)
+                            })
+                            # Use live price instead of bad scan price
+                            price  = live_price
+                            stop   = max(round(price - 1.5 * atr, 8), 0.000001) if direction == 'LONG' else round(price + 1.5 * atr, 8)
+                            target = round(price + 3.0 * atr, 8) if direction == 'LONG' else max(round(price - 3.0 * atr, 8), 0.000001)
+                            print(f'[CITADEL] Corrected {sym} price to live=${price:.4f}, new S:{stop:.4f} T:{target:.4f}')
+
                     _log_backtest_setup(sym, direction, price, stop, target,
-                                        'Citadel Report', timeframe=tf, notes=sigs[:120])
-                    print(f'[CITADEL] Logged {sym} {direction} E:{price} S:{stop} T:{target} ATR:{atr}')
+                                        'Citadel Report', timeframe=tf, notes=sigs[:120],
+                                        asset_type=_asset_type)
+                    print(f'[CITADEL] Logged {sym} {direction} E:{price} S:{stop} T:{target} ATR:{atr} [{_asset_type}]')
                 else:
                     stop = target = None
                 vol_ratio = coin.get('volSpike')  # actual ratio e.g. 2.87 or null
@@ -1698,7 +1724,7 @@ def citadel_report():
                 'parse_mode': 'HTML', 'disable_web_page_preview': False
             }, timeout=10)
 
-        return jsonify({'report': filled, 'reportUrl': report_url, 'reportId': report_id})
+        return jsonify({'report': filled, 'reportUrl': report_url, 'reportId': report_id, 'priceWarnings': price_warnings})
     except Exception as e:
         print(f'[CITADEL] Error: {e}')
         return jsonify({'error': str(e)}), 500
@@ -1974,6 +2000,42 @@ def reports_index():
 
 # ── Backtest API ──────────────────────────────────────────────
 
+def _fetch_live_price(sym, asset_type='crypto'):
+    """Fetch current market price. Returns float or None."""
+    if asset_type == 'stock':
+        try:
+            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d'
+            r = requests.get(url, headers=HEADERS, timeout=5)
+            if r.ok:
+                result = r.json().get('chart', {}).get('result', [None])[0]
+                if result:
+                    closes = result.get('indicators', {}).get('quote', [{}])[0].get('close', [])
+                    closes = [c for c in closes if c is not None]
+                    if closes:
+                        return closes[-1]
+        except Exception:
+            pass
+        return None
+    else:
+        # Try Binance spot first
+        try:
+            r = requests.get(f'https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT',
+                             headers=HEADERS, timeout=5)
+            if r.ok:
+                return float(r.json()['price'])
+        except Exception:
+            pass
+        # Fallback: Binance futures
+        try:
+            r = requests.get(f'https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}USDT',
+                             headers=HEADERS, timeout=5)
+            if r.ok:
+                return float(r.json()['price'])
+        except Exception:
+            pass
+        return None
+
+
 @app.route('/backtest/setups', methods=['GET'])
 def backtest_get_setups():
     """Return all logged setups with current price evaluation."""
@@ -1981,17 +2043,51 @@ def backtest_get_setups():
     if not _backtest_setups:
         print('[BACKTEST] Memory empty — resyncing from JSONBin')
         _sync_from_jsonbin()
-    # Fetch current prices for open setups
-    open_syms = list({s['symbol'] for s in _backtest_setups if s['status'] == 'OPEN'})
+
+    # Separate crypto vs stock symbols
+    open_setups = [s for s in _backtest_setups if s['status'] == 'OPEN']
+    crypto_syms = list({s['symbol'] for s in open_setups if s.get('assetType','crypto') != 'stock'})
+    stock_syms  = list({s['symbol'] for s in open_setups if s.get('assetType','') == 'stock'})
+
     prices = {}
-    for sym in open_syms:
+
+    # ── Crypto: Binance spot price ────────────────────────────
+    def _fetch_binance_price(sym):
         try:
             r = requests.get(f'https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT',
                              headers=HEADERS, timeout=5)
             if r.ok:
-                prices[sym] = float(r.json()['price'])
+                return sym, float(r.json()['price'])
         except Exception:
             pass
+        return sym, None
+
+    # ── Stocks: Yahoo Finance price ───────────────────────────
+    def _fetch_yahoo_price(sym):
+        try:
+            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d'
+            r = requests.get(url, headers=HEADERS, timeout=5)
+            if r.ok:
+                result = r.json().get('chart', {}).get('result', [None])[0]
+                if result:
+                    closes = result.get('indicators', {}).get('quote', [{}])[0].get('close', [])
+                    closes = [c for c in closes if c is not None]
+                    if closes:
+                        return sym, closes[-1]
+        except Exception:
+            pass
+        return sym, None
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        futs = [ex.submit(_fetch_binance_price, s) for s in crypto_syms]
+        futs += [ex.submit(_fetch_yahoo_price, s) for s in stock_syms]
+        for f in as_completed(futs):
+            sym, price = f.result()
+            if price:
+                prices[sym] = price
+
+    print(f'[BACKTEST] Prices fetched: {len(prices)}/{len(crypto_syms)+len(stock_syms)} symbols')
 
     result = []
     for s in _backtest_setups:
