@@ -2397,8 +2397,10 @@ Report Structure:
         if response.text:
             print(f'[DIGEST] Audio analysis OK: {channel_name}')
             return response.text
+        else:
+            print(f'[DIGEST] Audio analysis returned empty response for {channel_name}')
     except Exception as e:
-        print(f'[DIGEST] Audio failed, trying video: {channel_name} — {e}')
+        print(f'[DIGEST] Audio failed for {channel_name}: {type(e).__name__}: {e}')
 
     # Step 2: Fallback to full video
     try:
@@ -2419,7 +2421,7 @@ Report Structure:
         )
         return response.text
     except Exception as e:
-        print(f'[DIGEST] Gemini analyse error for {channel_name}: {e}')
+        print(f'[DIGEST] Video analysis failed for {channel_name}: {type(e).__name__}: {e}')
         return None
 
 
