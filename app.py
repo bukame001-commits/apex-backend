@@ -2936,7 +2936,7 @@ def fetch_one_stock(sym, interval='1wk'):
         market_cap = None
         try:
             url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={interval}&range={range_val}'
-            r = requests.get(url, headers=HEADERS, timeout=8)
+            r = requests.get(url, headers=HEADERS, timeout=5)
             if r.ok:
                 data = r.json()
                 result = data.get('chart', {}).get('result', [None])[0]
@@ -2962,14 +2962,9 @@ def fetch_one_stock(sym, interval='1wk'):
         if yahoo_klines:
             return sym, {'klines': yahoo_klines, 'marketCap': market_cap, 'type': 'stock', 'source': 'yahoo', 'lastBar': yahoo_klines[-1][0] if yahoo_klines else None}
 
-        # ── 2. Stooq fallback — only fires when Yahoo fails ──
-        # Skip Stooq for 60m (intraday) — it doesn't have reliable hourly data
-        if interval != '60m':
-            print(f'{sym}: Yahoo failed, trying Stooq...')
-            stooq_klines = fetch_stooq(sym, interval)
-            if stooq_klines:
-                print(f'{sym}: Stooq success ({len(stooq_klines)} bars)')
-                return sym, {'klines': stooq_klines, 'marketCap': None, 'type': 'stock', 'source': 'stooq', 'lastBar': stooq_klines[-1][0] if stooq_klines else None}
+        # ── 2. Stooq disabled — times out 100% from Railway EU IPs ──
+        # Keeping fetch_stooq() function intact for potential future use
+        # but not calling it to avoid 10s timeout penalty per ticker
 
         return sym, None
     except Exception as e:
