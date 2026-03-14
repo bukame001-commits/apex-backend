@@ -2014,11 +2014,13 @@ def backtest_page():
 def fj_feed():
     try:
         url = 'https://financialjuice.com/feed'
+        print(f'[NEWS] Fetching FJ feed...')
         headers_fj = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'application/rss+xml, application/xml, text/xml, */*',
         }
         r = requests.get(url, headers=headers_fj, timeout=10)
+        print(f'[NEWS] FJ feed status: {r.status_code}, size: {len(r.text)} chars')
         if not r.ok:
             return jsonify({'error': f'Financial Juice returned {r.status_code}'}), 502
 
@@ -2058,6 +2060,7 @@ def crypto_news():
             '?auth_token=free&public=true&kind=news&regions=en&filter=important'
         )
         r = requests.get(cp_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        print(f'[NEWS] CryptoPanic status: {r.status_code}')
         if not r.ok:
             return jsonify({'error': f'CryptoPanic returned {r.status_code}'}), 502
         return jsonify(r.json())
