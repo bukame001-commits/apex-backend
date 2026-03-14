@@ -16,6 +16,65 @@ _JSONBIN_API_KEY = _clean(os.environ.get('JSONBIN_API_KEY', ''))
 _JSONBIN_URL     = f'https://api.jsonbin.io/v3/b/{_JSONBIN_BIN_ID}'
 _JSONBIN_HEADERS = {'X-Master-Key': _JSONBIN_API_KEY, 'Content-Type': 'application/json'}
 
+# ── Finnhub API helpers ───────────────────────────────────────
+def _finnhub_key():
+    return os.environ.get('FINNHUB_API_KEY', '')
+
+def _finnhub_quote(sym):
+    """Fetch real-time quote from Finnhub. Returns current price or None."""
+    key = _finnhub_key()
+    if not key:
+        return None
+    try:
+        r = requests.get(
+            f'https://finnhub.io/api/v1/quote?symbol={sym}&token={key}',
+            headers=HEADERS, timeout=5
+        )
+        if r.ok:
+            data = r.json()
+            price = data.get('c')  # current price
+            if price and price > 0:
+                return float(price)
+    except Exception as e:
+        print(f'[FINNHUB] Quote error for {sym}: {e}')
+    return None
+
+def _finnhub_candles(sym, resolution='W', days_back=365*2):
+    """Fetch OHLCV candles from Finnhub. Returns klines list or None.
+    resolution: D=daily, W=weekly, M=monthly
+    """
+    key = _finnhub_key()
+    if not key:
+        return None
+    try:
+        to_ts   = int(time.time())
+        from_ts = to_ts - days_back * 86400
+        r = requests.get(
+            f'https://finnhub.io/api/v1/stock/candle'
+            f'?symbol={sym}&resolution={resolution}&from={from_ts}&to={to_ts}&token={key}',
+            headers=HEADERS, timeout=10
+        )
+        if not r.ok:
+            return None
+        data = r.json()
+        if data.get('s') != 'ok':
+            return None
+        ts = data.get('t', [])
+        o  = data.get('o', [])
+        h  = data.get('h', [])
+        l  = data.get('l', [])
+        c  = data.get('c', [])
+        v  = data.get('v', [])
+        if len(c) < 20:
+            return None
+        klines = [[ts[i]*1000, o[i], h[i], l[i], c[i], v[i]] for i in range(len(ts))
+                  if c[i] is not None and o[i] is not None]
+        return klines if len(klines) >= 20 else None
+    except Exception as e:
+        print(f'[FINNHUB] Candles error for {sym}: {e}')
+    return None
+
+
 def _store_load():
     """Load {setups, reports} from JSONBin. Returns (reports_dict, setups_list)."""
     if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
@@ -1521,10 +1580,10 @@ def citadel_report():
                     else:
                         stop   = round(price + 1.5 * atr, 8)
                         target = max(round(price - 3.0 * atr, 8), 0.000001)
-                    # Determine asset type from coin data
+                    # Asset type comes from frontend scan data (crypto vs stock)
                     _asset_type = coin.get('type', 'crypto')
                     if _asset_type not in ('crypto', 'stock'):
-                        _asset_type = 'stock' if any(c.isalpha() and c.isupper() for c in sym) and '.' not in sym and len(sym) <= 5 and not sym.endswith('USDT') else 'crypto'
+                        _asset_type = 'crypto'
 
                     # ── Live price validation — reject bad scan data ──────
                     live_price = _fetch_live_price(sym, _asset_type)
@@ -2003,37 +2062,24 @@ def reports_index():
 def _fetch_live_price(sym, asset_type='crypto'):
     """Fetch current market price. Returns float or None."""
     if asset_type == 'stock':
-        try:
-            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d'
-            r = requests.get(url, headers=HEADERS, timeout=5)
-            if r.ok:
-                result = r.json().get('chart', {}).get('result', [None])[0]
-                if result:
-                    closes = result.get('indicators', {}).get('quote', [{}])[0].get('close', [])
-                    closes = [c for c in closes if c is not None]
-                    if closes:
-                        return closes[-1]
-        except Exception:
-            pass
-        return None
-    else:
-        # Try Binance spot first
-        try:
-            r = requests.get(f'https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT',
-                             headers=HEADERS, timeout=5)
-            if r.ok:
-                return float(r.json()['price'])
-        except Exception:
-            pass
-        # Fallback: Binance futures
-        try:
-            r = requests.get(f'https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}USDT',
-                             headers=HEADERS, timeout=5)
-            if r.ok:
-                return float(r.json()['price'])
-        except Exception:
-            pass
-        return None
+        return _finnhub_quote(sym)
+    # Crypto: Try Binance spot first
+    try:
+        r = requests.get(f'https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT',
+                         headers=HEADERS, timeout=5)
+        if r.ok:
+            return float(r.json()['price'])
+    except Exception:
+        pass
+    # Fallback: Binance futures
+    try:
+        r = requests.get(f'https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}USDT',
+                         headers=HEADERS, timeout=5)
+        if r.ok:
+            return float(r.json()['price'])
+    except Exception:
+        pass
+    return None
 
 
 @app.route('/backtest/setups', methods=['GET'])
@@ -2044,50 +2090,50 @@ def backtest_get_setups():
         print('[BACKTEST] Memory empty — resyncing from JSONBin')
         _sync_from_jsonbin()
 
-    # Separate crypto vs stock symbols
+    # Separate crypto vs stock symbols — use assetType if present, else try both
     open_setups = [s for s in _backtest_setups if s['status'] == 'OPEN']
-    crypto_syms = list({s['symbol'] for s in open_setups if s.get('assetType','crypto') != 'stock'})
-    stock_syms  = list({s['symbol'] for s in open_setups if s.get('assetType','') == 'stock'})
+    all_open_syms = list({s['symbol'] for s in open_setups})
 
     prices = {}
 
-    # ── Crypto: Binance spot price ────────────────────────────
-    def _fetch_binance_price(sym):
+    def _fetch_best_price(sym, asset_type='crypto'):
+        """Fetch live price — Finnhub for stocks, Binance for crypto."""
+        if asset_type == 'stock':
+            p = _finnhub_quote(sym)
+            return (p, 'finnhub') if p else (None, None)
+        # Crypto: try Binance spot
         try:
             r = requests.get(f'https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT',
-                             headers=HEADERS, timeout=5)
+                             headers=HEADERS, timeout=4)
             if r.ok:
-                return sym, float(r.json()['price'])
+                p = float(r.json()['price'])
+                if p > 0:
+                    return p, 'binance'
         except Exception:
             pass
-        return sym, None
-
-    # ── Stocks: Yahoo Finance price ───────────────────────────
-    def _fetch_yahoo_price(sym):
+        # Fallback: Binance futures
         try:
-            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d'
-            r = requests.get(url, headers=HEADERS, timeout=5)
+            r = requests.get(f'https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}USDT',
+                             headers=HEADERS, timeout=4)
             if r.ok:
-                result = r.json().get('chart', {}).get('result', [None])[0]
-                if result:
-                    closes = result.get('indicators', {}).get('quote', [{}])[0].get('close', [])
-                    closes = [c for c in closes if c is not None]
-                    if closes:
-                        return sym, closes[-1]
+                p = float(r.json()['price'])
+                if p > 0:
+                    return p, 'binance_futures'
         except Exception:
             pass
-        return sym, None
+        return None, None
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
     with ThreadPoolExecutor(max_workers=20) as ex:
-        futs = [ex.submit(_fetch_binance_price, s) for s in crypto_syms]
-        futs += [ex.submit(_fetch_yahoo_price, s) for s in stock_syms]
-        for f in as_completed(futs):
-            sym, price = f.result()
+        futs = {ex.submit(_fetch_best_price, s, next((x.get('assetType','crypto') for x in open_setups if x['symbol']==s), 'crypto')): s
+                for s in all_open_syms}
+        for f in _as_completed(futs):
+            sym = futs[f]
+            price, source = f.result()
             if price:
                 prices[sym] = price
 
-    print(f'[BACKTEST] Prices fetched: {len(prices)}/{len(crypto_syms)+len(stock_syms)} symbols')
+    print(f'[BACKTEST] Prices fetched: {len(prices)}/{len(all_open_syms)} symbols')
 
     result = []
     for s in _backtest_setups:
@@ -3176,7 +3222,11 @@ _digest_thread.start()
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'ok', 'monitor': _monitor_running})
+    return jsonify({
+        'status': 'ok',
+        'monitor': _monitor_running,
+        'finnhub': bool(_finnhub_key()),
+    })
 
 # ── Fetch single stock from Yahoo Finance ─────────────────────
 def parse_klines_from_rows(rows, interval):
@@ -3244,13 +3294,24 @@ def fetch_stooq(sym, interval='1wk'):
 
 def fetch_one_stock(sym, interval='1wk'):
     try:
-        # Normalise interval names (frontend may send 1w, Yahoo needs 1wk)
+        # Normalise interval names
         interval_map = {'1w': '1wk', '1week': '1wk', '4h': '60m', '4hour': '60m'}
         interval = interval_map.get(interval, interval)
+
+        # ── 1. Try Finnhub first (no IP block, reliable) ──────
+        finnhub_resolution_map = {'1wk': 'W', '1d': 'D', '60m': '60'}
+        finnhub_days_map       = {'1wk': 365*3, '1d': 365*2, '60m': 90}
+        fh_res  = finnhub_resolution_map.get(interval, 'W')
+        fh_days = finnhub_days_map.get(interval, 365*3)
+        fh_klines = _finnhub_candles(sym, resolution=fh_res, days_back=fh_days)
+        if fh_klines:
+            print(f'[STOCKS] {sym}: Finnhub OK ({len(fh_klines)} bars)')
+            return sym, {'klines': fh_klines, 'marketCap': None, 'type': 'stock',
+                         'source': 'finnhub', 'lastBar': fh_klines[-1][0] if fh_klines else None}
+
+        # ── 2. Fallback: Yahoo Finance ────────────────────────
         range_map = {'1wk': '4y', '1d': '2y', '60m': '730d'}
         range_val = range_map.get(interval, '4y')
-
-        # ── 1. Try Yahoo Finance first ──
         yahoo_klines = None
         market_cap = None
         try:
