@@ -2056,8 +2056,7 @@ def fj_feed():
 def crypto_news():
     try:
         cp_url = (
-            'https://cryptopanic.com/api/free/v1/posts/'
-            '?auth_token=free&public=true&kind=news&regions=en&filter=important'
+            'https://cryptopanic.com/api/v1/posts/?auth_token=free&public=true&kind=news&regions=en'
         )
         r = requests.get(cp_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
         print(f'[NEWS] CryptoPanic status: {r.status_code}')
