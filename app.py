@@ -2010,62 +2010,74 @@ def backtest_page():
 
 
 # ── News Intel: Financial Juice RSS proxy (Section 07) ───────
+def _parse_rss_tag(block, name):
+    import re as _re
+    m = _re.search(rf'<{name}[^>]*><!\[CDATA\[(.*?)\]\]></{name}>|<{name}[^>]*>(.*?)</{name}>', block, _re.DOTALL)
+    if m:
+        return (m.group(1) or m.group(2) or '').strip()
+    return ''
+
+def _parse_rss_feed(xml_text, source_label):
+    import re as _re
+    from email.utils import parsedate_to_datetime
+    items = []
+    for block in _re.findall(r'<item>(.*?)</item>', xml_text, _re.DOTALL):
+        title = _parse_rss_tag(block, 'title')
+        link  = _parse_rss_tag(block, 'link') or _parse_rss_tag(block, 'guid')
+        pub   = _parse_rss_tag(block, 'pubDate')
+        if not title:
+            continue
+        pub_iso = ''
+        if pub:
+            try:
+                pub_iso = parsedate_to_datetime(pub).isoformat()
+            except Exception:
+                pub_iso = pub
+        items.append({'title': title, 'url': link, 'date': pub_iso, 'source': source_label})
+    return items
+
 @app.route('/api/fj-feed')
 def fj_feed():
     try:
-        url = 'https://financialjuice.com/feed'
         print(f'[NEWS] Fetching FJ feed...')
-        headers_fj = {
+        r = requests.get('https://financialjuice.com/feed', headers={
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'application/rss+xml, application/xml, text/xml, */*',
-        }
-        r = requests.get(url, headers=headers_fj, timeout=10)
+        }, timeout=10)
         print(f'[NEWS] FJ feed status: {r.status_code}, size: {len(r.text)} chars')
         if not r.ok:
-            return jsonify({'error': f'Financial Juice returned {r.status_code}'}), 502
-
-        import re as _re
-        items = []
-        for item_block in _re.findall(r'<item>(.*?)</item>', r.text, _re.DOTALL):
-            def tag(name):
-                m = _re.search(rf'<{name}[^>]*><!\[CDATA\[(.*?)\]\]></{name}>|<{name}[^>]*>(.*?)</{name}>', item_block, _re.DOTALL)
-                if m:
-                    return (m.group(1) or m.group(2) or '').strip()
-                return ''
-            title = tag('title')
-            link  = tag('link') or tag('guid')
-            pub   = tag('pubDate')
-            if not title:
-                continue
-            pub_iso = ''
-            if pub:
-                try:
-                    from email.utils import parsedate_to_datetime
-                    pub_iso = parsedate_to_datetime(pub).isoformat()
-                except Exception:
-                    pub_iso = pub
-            items.append({'title': title, 'url': link, 'date': pub_iso, 'important': False})
+            return jsonify({'error': f'FJ returned {r.status_code}'}), 502
+        items = _parse_rss_feed(r.text, 'Financial Juice')
+        print(f'[NEWS] FJ parsed {len(items)} items')
         return jsonify(items[:40])
     except Exception as e:
-        print(f'FJ feed error: {e}')
+        print(f'[NEWS] FJ feed error: {e}')
         return jsonify({'error': str(e)}), 503
 
 
-# ── News Intel: CryptoPanic proxy (Section 07) ────────────────
+# ── News Intel: Crypto RSS feeds (CoinDesk + Decrypt) ────────
 @app.route('/api/crypto-news')
 def crypto_news():
-    try:
-        cp_url = (
-            'https://cryptopanic.com/api/v1/posts/?auth_token=free&public=true&kind=news&regions=en'
-        )
-        r = requests.get(cp_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-        print(f'[NEWS] CryptoPanic status: {r.status_code}')
-        if not r.ok:
-            return jsonify({'error': f'CryptoPanic returned {r.status_code}'}), 502
-        return jsonify(r.json())
-    except Exception as e:
-        print(f'CryptoPanic proxy error: {e}')
-        return jsonify({'error': str(e)}), 503
+    import re as _re
+    feeds = [
+        ('https://www.coindesk.com/arc/outboundfeeds/rss/', 'CoinDesk'),
+        ('https://decrypt.co/feed',                          'Decrypt'),
+    ]
+    all_items = []
+    for feed_url, label in feeds:
+        try:
+            r = requests.get(feed_url, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }, timeout=8)
+            print(f'[NEWS] {label} status: {r.status_code}, size: {len(r.text)}')
+            if r.ok:
+                items = _parse_rss_feed(r.text, label)
+                print(f'[NEWS] {label} parsed {len(items)} items')
+                all_items.extend(items)
+        except Exception as e:
+            print(f'[NEWS] {label} error: {e}')
+    all_items.sort(key=lambda x: x.get('date',''), reverse=True)
+    return jsonify({'results': all_items[:40]})
 
 # ── Health check ─────────────────────────────────────────────
 
