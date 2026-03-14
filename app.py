@@ -55,9 +55,11 @@ def _finnhub_candles(sym, resolution='W', days_back=365*2):
             headers=HEADERS, timeout=10
         )
         if not r.ok:
+            print(f'[FINNHUB] Candles HTTP {r.status_code} for {sym}')
             return None
         data = r.json()
         if data.get('s') != 'ok':
+            print(f'[FINNHUB] Candles status={data.get("s")} for {sym}')
             return None
         ts = data.get('t', [])
         o  = data.get('o', [])
@@ -3303,11 +3305,16 @@ def fetch_one_stock(sym, interval='1wk'):
         finnhub_days_map       = {'1wk': 365*3, '1d': 365*2, '60m': 90}
         fh_res  = finnhub_resolution_map.get(interval, 'W')
         fh_days = finnhub_days_map.get(interval, 365*3)
-        fh_klines = _finnhub_candles(sym, resolution=fh_res, days_back=fh_days)
-        if fh_klines:
-            print(f'[STOCKS] {sym}: Finnhub OK ({len(fh_klines)} bars)')
-            return sym, {'klines': fh_klines, 'marketCap': None, 'type': 'stock',
-                         'source': 'finnhub', 'lastBar': fh_klines[-1][0] if fh_klines else None}
+        if _finnhub_key():
+            fh_klines = _finnhub_candles(sym, resolution=fh_res, days_back=fh_days)
+            if fh_klines:
+                print(f'[STOCKS] {sym}: Finnhub OK ({len(fh_klines)} bars)')
+                return sym, {'klines': fh_klines, 'marketCap': None, 'type': 'stock',
+                             'source': 'finnhub', 'lastBar': fh_klines[-1][0] if fh_klines else None}
+            else:
+                print(f'[STOCKS] {sym}: Finnhub returned no data — falling back to Yahoo')
+        else:
+            print(f'[STOCKS] No FINNHUB_API_KEY set — skipping Finnhub')
 
         # ── 2. Fallback: Yahoo Finance ────────────────────────
         range_map = {'1wk': '4y', '1d': '2y', '60m': '730d'}
