@@ -20,24 +20,25 @@ def _store_load():
     """Load {setups, reports} from JSONBin. Returns (reports_dict, setups_list)."""
     if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
         print('[STORE] No JSONBin config — data will not persist across restarts')
-        return {}, [], []
+        return {}, [], [], [], []
     try:
         r = requests.get(_JSONBIN_URL + '/latest', headers=_JSONBIN_HEADERS, timeout=15)
         if r.ok:
             rec = r.json().get('record', {})
-            setups  = rec.get('setups', [])
-            reports = rec.get('reports', {})
-            digest  = rec.get('digest', [])
+            setups      = rec.get('setups', [])
+            reports     = rec.get('reports', {})
+            digest      = rec.get('digest', [])
+            news_intel  = rec.get('news_intel', [])
             # JSONBin may return [] if bin was init'd wrong — force to dict
             if not isinstance(reports, dict): reports = {}
             if not isinstance(setups, list):  setups  = []
             if not isinstance(digest, list):  digest  = []
             print(f'[STORE] Loaded: {len(setups)} setups, {len(reports)} reports, {len(digest)} digest items')
-            return reports, setups, digest
+            return reports, setups, digest, news_intel
         print(f'[STORE] Load failed: {r.status_code} {r.text[:80]}')
     except Exception as e:
         print(f'[STORE] Load error: {e}')
-    return {}, []
+    return {}, [], [], []
 
 def _store_save():
     """Save {setups, reports} to JSONBin as a single atomic write."""
@@ -45,7 +46,7 @@ def _store_save():
         return
     try:
         payload = {'setups': _backtest_setups[:200], 'reports': _reports,
-                   'digest': _digest_cache[:50]}
+                   'digest': _digest_cache[:50], 'news_intel': _news_intel_reports[-20:]}
         r = requests.put(_JSONBIN_URL, headers=_JSONBIN_HEADERS, json=payload, timeout=20)
         print(f'[STORE] Save {"OK" if r.ok else "FAILED " + str(r.status_code) + ": " + r.text[:80]}')
     except Exception as e:
@@ -53,13 +54,14 @@ def _store_save():
 
 # ── In-memory stores — loaded lazily on first request ────────
 import uuid as _uuid
-_reports         = {}
-_backtest_setups = []
+_reports            = {}
+_backtest_setups    = []
+_news_intel_reports = []  # [{id, createdAt, brief, recommendations, verdict, headlines_used}]
 
 def _sync_from_jsonbin():
     """Load JSONBin data into in-memory stores (safe to call multiple times)."""
     try:
-        rpts, setups, digest = _store_load()
+        rpts, setups, digest, news_intel = _store_load()
         _reports.update(rpts)
         with _backtest_lock:
             if setups:
@@ -69,7 +71,10 @@ def _sync_from_jsonbin():
             if digest:
                 _digest_cache.clear()
                 _digest_cache.extend(digest)
-        print(f'[STORE] Sync complete: {len(_backtest_setups)} setups, {len(_reports)} reports, {len(_digest_cache)} digest')
+        if news_intel:
+            _news_intel_reports.clear()
+            _news_intel_reports.extend(news_intel)
+        print(f'[STORE] Sync complete: {len(_backtest_setups)} setups, {len(_reports)} reports, {len(_digest_cache)} digest, {len(_news_intel_reports)} news_intel')
     except Exception as e:
         print(f'[STORE] Sync error (non-fatal): {e}')
 
@@ -1577,6 +1582,41 @@ def citadel_report():
 
         market_overview = f'MARKET OVERVIEW ({count} assets, {timeframe}):\n[FILL_OVERVIEW: Write 3-4 sentences describing the overall market conditions shown by these {count} assets. What themes dominate? Bullish or bearish bias? What should traders watch for?]'
 
+        # ── Inject latest news intel report if available ────
+        news_context_block = ''
+        if _news_intel_reports:
+            latest_ni = sorted(_news_intel_reports, key=lambda x: x['createdAt'], reverse=True)[0]
+            age_min = int((time.time() - time.mktime(time.strptime(latest_ni['createdAt'], '%Y-%m-%dT%H:%M:%SZ'))) / 60)
+            verdict = latest_ni.get('verdict', 'MIXED')
+            news_context_block = nl.join([
+                '╔══════════════════════════════════════════════════════╗',
+                '  MACRO INTELLIGENCE CONTEXT — News Intel Report',
+                '  Generated: ' + str(age_min) + ' minutes ago | Verdict: ' + verdict,
+                '╚══════════════════════════════════════════════════════╝',
+                '',
+                latest_ni['report'][:2500],
+                '',
+                '━━━ CITADEL ANALYST INSTRUCTIONS (macro-aware) ━━━━━━━━',
+                'You have APEX scan results below AND a live macro intelligence report above.',
+                'Your job is to cross-reference each setup against the macro context.',
+                '',
+                'For EVERY setup verdict you write:',
+                '1. Add a MACRO ALIGNMENT line: one sentence — does the current macro/news environment',
+                '   support or oppose this trade? Reference a specific headline or macro theme if relevant.',
+                '2. If the setup CONFLICTS with the macro view (e.g. LONG crypto in a RISK-OFF environment,',
+                '   or LONG oil when supply glut news dominates), add this exact warning:',
+                '   ⚠ MACRO CONFLICT: [brief reason — 1 sentence]',
+                '3. If the setup is SUPPORTED by the macro view, add:',
+                '   ✓ MACRO TAILWIND: [brief reason — 1 sentence]',
+                '4. Adjust your TAKE IT / WATCH IT / SKIP IT verdict accordingly — macro conflicts',
+                '   should push toward WATCH IT or SKIP IT unless technical signals are exceptionally strong.',
+                '',
+                'Overall report: start with a MACRO ENVIRONMENT SUMMARY (3 sentences) before the setups.',
+                '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+                '',
+            ])
+            print(f'[CITADEL] Injecting news context ({age_min}min old, verdict: {verdict})')
+
         rules = nl.join([
             'You are the APEX Citadel AI analyst. Write a professional, detailed trading report.',
             'Rules:',
@@ -1589,7 +1629,7 @@ def citadel_report():
             '',
         ])
 
-        prompt = rules + nl + market_overview + nl + nl + 'SETUPS:' + nl + nl.join(template_blocks)
+        prompt = rules + nl + news_context_block + market_overview + nl + nl + 'SETUPS:' + nl + nl.join(template_blocks)
 
         # Step 3: Gemini generates full report
         gemini_url = ('https://generativelanguage.googleapis.com/v1beta/'
@@ -2078,6 +2118,156 @@ def crypto_news():
             print(f'[NEWS] {label} error: {e}')
     all_items.sort(key=lambda x: x.get('date',''), reverse=True)
     return jsonify({'results': all_items[:40]})
+
+# ── News Intel: Additional macro RSS sources ──────────────────
+_MACRO_RSS_FEEDS = [
+    ('https://feeds.reuters.com/reuters/businessNews',       'Reuters'),
+    ('https://feeds.marketwatch.com/marketwatch/topstories', 'MarketWatch'),
+    ('https://feeds.ft.com/rss/home/uk',                    'FT'),
+    ('https://www.investing.com/rss/news.rss',              'Investing.com'),
+    ('https://www.coindesk.com/arc/outboundfeeds/rss/',     'CoinDesk'),
+    ('https://decrypt.co/feed',                             'Decrypt'),
+    ('https://financialjuice.com/feed',                     'Financial Juice'),
+]
+
+def _fetch_all_news_headlines(max_per_source=15):
+    """Fetch headlines from all macro + crypto RSS sources. Returns sorted list."""
+    import re as _re
+    all_items = []
+    for feed_url, label in _MACRO_RSS_FEEDS:
+        try:
+            r = requests.get(feed_url, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/rss+xml,application/xml,text/xml,*/*',
+            }, timeout=8)
+            if r.ok and len(r.text) > 200:
+                items = _parse_rss_feed(r.text, label)
+                all_items.extend(items[:max_per_source])
+                print(f'[NEWS] {label}: {len(items[:max_per_source])} headlines')
+            else:
+                print(f'[NEWS] {label}: HTTP {r.status_code}')
+        except Exception as e:
+            print(f'[NEWS] {label} error: {e}')
+    all_items.sort(key=lambda x: x.get('date', ''), reverse=True)
+    return all_items
+
+
+@app.route('/api/compile-news-report', methods=['POST'])
+def compile_news_report():
+    """Fetch all sources, run Gemini analysis, save report, prune old ones."""
+    global _news_intel_reports
+    try:
+        gemini_key = os.environ.get('GEMINI_API_KEY', '')
+        if not gemini_key:
+            return jsonify({'error': 'GEMINI_API_KEY not set'}), 500
+
+        # ── Fetch all headlines ──────────────────────────────
+        headlines = _fetch_all_news_headlines(max_per_source=15)
+        if len(headlines) < 3:
+            return jsonify({'error': 'Not enough headlines fetched'}), 503
+
+        print(f'[NEWS-REPORT] Total headlines: {len(headlines)}')
+
+        # ── Build Gemini prompt ──────────────────────────────
+        nl = chr(10)
+        hl_text = nl.join(
+            f'{i+1}. [{it["source"]}] {it["title"]}'
+            for i, it in enumerate(headlines[:60])
+        )
+
+        prompt = f"""You are a senior macro intelligence analyst at a top-tier hedge fund. Your job is to analyze current headlines and produce actionable investment intelligence.
+
+CURRENT HEADLINES ({len(headlines[:60])} sources — Reuters, MarketWatch, FT, Investing.com, CoinDesk, Decrypt, Financial Juice):
+
+{hl_text}
+
+Produce a structured intelligence report in the following EXACT format. Do not use markdown asterisks or hashes. Use plain text only.
+
+MACRO SNAPSHOT
+[Write 4-5 sentences describing the dominant macro narrative, geopolitical risks, central bank posture, and overall market environment. Be specific — reference actual headlines.]
+
+ASSET RECOMMENDATIONS
+[For each recommendation, format exactly as:]
+ASSET | DIRECTION | CONVICTION | REASONING
+
+Example format:
+OIL (WTI/Brent) | BUY | HIGH | Middle East supply disruption risk from [specific headline] historically drives 8-15% crude spike; energy equities follow with 48h lag
+BTC | HOLD | MEDIUM | Risk-off sentiment from Fed commentary caps upside; on-chain accumulation contradicts bearish narrative
+GOLD | BUY | HIGH | Safe-haven bid accelerating as [specific event] drives dollar weakness and institutional rotation
+
+Cover: Crypto (BTC, ETH, altcoins), Energy (oil, gas, nuclear, renewables), Equities (sectors), Commodities, Safe havens (gold, bonds)
+Minimum 6 recommendations, maximum 12. Only include assets where headlines provide clear directional signal.
+
+ASSETS TO AVOID
+[List assets with negative signals and one-line reason each]
+
+RISK VERDICT
+[One of: RISK-ON / RISK-OFF / MIXED — followed by one sentence justification]
+
+KEY CATALYST
+[The single most important headline or event driving today's market, in one sentence]"""
+
+        gemini_url = ('https://generativelanguage.googleapis.com/v1beta/'
+                      'models/gemini-2.5-flash:generateContent?key=' + gemini_key)
+        gemini_resp = requests.post(gemini_url, json={
+            'contents': [{'parts': [{'text': prompt}]}],
+            'generationConfig': {'maxOutputTokens': 3000, 'temperature': 0.4}
+        }, timeout=90)
+
+        if not gemini_resp.ok:
+            return jsonify({'error': 'Gemini error: ' + gemini_resp.text[:200]}), 500
+
+        report_text = gemini_resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+        for md in ['**', '##', '###', '# ']:
+            report_text = report_text.replace(md, '')
+
+        # ── Parse verdict from report ────────────────────────
+        verdict = 'MIXED'
+        for line in report_text.splitlines():
+            if 'RISK-ON' in line:   verdict = 'RISK-ON';  break
+            if 'RISK-OFF' in line:  verdict = 'RISK-OFF'; break
+            if 'MIXED' in line and 'VERDICT' in line.upper(): verdict = 'MIXED'; break
+
+        # ── Save report ──────────────────────────────────────
+        report_id = time.strftime('%Y%m%d-%H%M') + '-ni-' + _uuid.uuid4().hex[:4]
+        report = {
+            'id':         report_id,
+            'createdAt':  time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            'report':     report_text,
+            'verdict':    verdict,
+            'sourceCount': len(headlines),
+            'headlines':  [{'title': h['title'], 'source': h['source']} for h in headlines[:20]],
+        }
+        _news_intel_reports.append(report)
+
+        # ── Prune reports older than 3 days ──────────────────
+        cutoff = time.time() - 3 * 24 * 3600
+        _news_intel_reports[:] = [
+            r for r in _news_intel_reports
+            if time.mktime(time.strptime(r['createdAt'], '%Y-%m-%dT%H:%M:%SZ')) > cutoff
+        ]
+        print(f'[NEWS-REPORT] Saved {report_id}. Total: {len(_news_intel_reports)}')
+        _store_save()
+
+        return jsonify({'report': report_text, 'verdict': verdict, 'id': report_id,
+                        'sourceCount': len(headlines), 'createdAt': report['createdAt']})
+
+    except Exception as e:
+        import traceback
+        print(f'[NEWS-REPORT] Error: {e}')
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/news-intel-reports')
+def get_news_intel_reports():
+    """Return saved news intel reports (last 3 days)."""
+    cutoff = time.time() - 3 * 24 * 3600
+    fresh = [
+        r for r in _news_intel_reports
+        if time.mktime(time.strptime(r['createdAt'], '%Y-%m-%dT%H:%M:%SZ')) > cutoff
+    ]
+    return jsonify(fresh)
 
 # ── Health check ─────────────────────────────────────────────
 
