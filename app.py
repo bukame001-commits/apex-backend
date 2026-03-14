@@ -2099,11 +2099,8 @@ def backtest_get_setups():
     prices = {}
 
     def _fetch_best_price(sym, asset_type='crypto'):
-        """Fetch live price — Finnhub for stocks, Binance for crypto."""
-        if asset_type == 'stock':
-            p = _finnhub_quote(sym)
-            return (p, 'finnhub') if p else (None, None)
-        # Crypto: try Binance spot
+        """Fetch live price — tries Binance first, then Finnhub for stocks."""
+        # Try Binance spot (works for crypto, fast)
         try:
             r = requests.get(f'https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT',
                              headers=HEADERS, timeout=4)
@@ -2113,7 +2110,7 @@ def backtest_get_setups():
                     return p, 'binance'
         except Exception:
             pass
-        # Fallback: Binance futures
+        # Try Binance futures
         try:
             r = requests.get(f'https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}USDT',
                              headers=HEADERS, timeout=4)
@@ -2123,6 +2120,10 @@ def backtest_get_setups():
                     return p, 'binance_futures'
         except Exception:
             pass
+        # Binance failed — try Finnhub (works for stocks)
+        p = _finnhub_quote(sym)
+        if p:
+            return p, 'finnhub'
         return None, None
 
     from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
