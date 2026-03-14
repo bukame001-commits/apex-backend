@@ -20,7 +20,7 @@ def _store_load():
     """Load {setups, reports} from JSONBin. Returns (reports_dict, setups_list)."""
     if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
         print('[STORE] No JSONBin config — data will not persist across restarts')
-        return {}, [], [], [], []
+        return {}, [], [], [], [], []
     try:
         r = requests.get(_JSONBIN_URL + '/latest', headers=_JSONBIN_HEADERS, timeout=15)
         if r.ok:
@@ -28,25 +28,28 @@ def _store_load():
             setups      = rec.get('setups', [])
             reports     = rec.get('reports', {})
             digest      = rec.get('digest', [])
-            news_intel  = rec.get('news_intel', [])
+            news_intel     = rec.get('news_intel', [])
+            digest_seen_ids= rec.get('digest_seen_ids', [])
             # JSONBin may return [] if bin was init'd wrong — force to dict
             if not isinstance(reports, dict): reports = {}
             if not isinstance(setups, list):  setups  = []
             if not isinstance(digest, list):  digest  = []
             print(f'[STORE] Loaded: {len(setups)} setups, {len(reports)} reports, {len(digest)} digest items')
-            return reports, setups, digest, news_intel
+            return reports, setups, digest, news_intel, digest_seen_ids
         print(f'[STORE] Load failed: {r.status_code} {r.text[:80]}')
     except Exception as e:
         print(f'[STORE] Load error: {e}')
-    return {}, [], [], []
+    return {}, [], [], [], []
 
 def _store_save():
     """Save {setups, reports} to JSONBin as a single atomic write."""
     if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
         return
     try:
+        # Keep last 200 seen video IDs (rolling window)
         payload = {'setups': _backtest_setups[:200], 'reports': _reports,
-                   'digest': _digest_cache[:50], 'news_intel': _news_intel_reports[-20:]}
+                   'digest': _digest_cache[:50], 'news_intel': _news_intel_reports[-20:],
+                   'digest_seen_ids': list(_digest_seen_ids)[-200:]}
         r = requests.put(_JSONBIN_URL, headers=_JSONBIN_HEADERS, json=payload, timeout=20)
         print(f'[STORE] Save {"OK" if r.ok else "FAILED " + str(r.status_code) + ": " + r.text[:80]}')
     except Exception as e:
@@ -61,7 +64,7 @@ _news_intel_reports = []  # [{id, createdAt, brief, recommendations, verdict, he
 def _sync_from_jsonbin():
     """Load JSONBin data into in-memory stores (safe to call multiple times)."""
     try:
-        rpts, setups, digest, news_intel = _store_load()
+        rpts, setups, digest, news_intel, digest_seen_ids = _store_load()
         _reports.update(rpts)
         with _backtest_lock:
             if setups:
@@ -74,6 +77,8 @@ def _sync_from_jsonbin():
         if news_intel:
             _news_intel_reports.clear()
             _news_intel_reports.extend(news_intel)
+        if digest_seen_ids:
+            _digest_seen_ids.update(digest_seen_ids)
         print(f'[STORE] Sync complete: {len(_backtest_setups)} setups, {len(_reports)} reports, {len(_digest_cache)} digest, {len(_news_intel_reports)} news_intel')
     except Exception as e:
         print(f'[STORE] Sync error (non-fatal): {e}')
@@ -2292,7 +2297,8 @@ DIGEST_CHANNELS = [
 _digest_cache     = []   # list of digest run results
 _digest_lock      = threading.Lock()
 _digest_last_run      = None
-_digest_seen          = set()   # tracks video titles already summarised today
+_digest_seen          = set()   # tracks video titles already summarised today (in-memory, session only)
+_digest_seen_ids      = set()   # tracks video_ids already summarised (persisted to JSONBin)
 _digest_channel_status = {}     # channel -> 'new video' | 'no new video' | 'error'
 
 def _gemini_analyse_video(channel_name, handle, video_id, video_url, title, lang, gemini_key, deep_dive=True):
@@ -2565,11 +2571,22 @@ def _run_digest(hours=24):
 
         title, url = _parse_gemini_response(response, ch['name'], ch['lang'])
 
+        # Check by video_id (persisted) — prevents re-summarising across restarts
+        _vid_id = None
+        _vid_match = re.search(r'youtube\.com/watch\?v=([\w-]+)', url or '')
+        if _vid_match:
+            _vid_id = _vid_match.group(1)
+        if _vid_id and _vid_id in _digest_seen_ids:
+            print(f'[DIGEST] Already summarised video {_vid_id} ({title[:40]}) — skipping')
+            continue
+        # Also check in-session by title (fallback for when URL not parsed)
         seen_key = f'{today}::{ch["name"]}::{title}'
         if seen_key in _digest_seen:
-            print(f'[DIGEST] Already summarised "{title[:50]}" today — skipping')
+            print(f'[DIGEST] Already summarised "{title[:50]}" today (session) — skipping')
             continue
         _digest_seen.add(seen_key)
+        if _vid_id:
+            _digest_seen_ids.add(_vid_id)
 
         entry = {
             'channel':   ch['name'],
