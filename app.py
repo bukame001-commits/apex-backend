@@ -2434,7 +2434,7 @@ def _get_all_channels():
     """Merge hardcoded channels with user-added custom channels."""
     seen_handles = set()
     all_channels = []
-    for ch in _get_all_channels():
+    for ch in DIGEST_CHANNELS:
         h = ch['handle'].lower()
         if h not in seen_handles:
             seen_handles.add(h)
