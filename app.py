@@ -81,7 +81,7 @@ def _store_load():
     """Load {setups, reports} from JSONBin. Returns (reports_dict, setups_list)."""
     if not _JSONBIN_BIN_ID or not _JSONBIN_API_KEY:
         print('[STORE] No JSONBin config — data will not persist across restarts')
-        return {}, [], [], [], [], []
+        return {}, [], [], [], [], [], []
     try:
         r = requests.get(_JSONBIN_URL + '/latest', headers=_JSONBIN_HEADERS, timeout=15)
         if r.ok:
@@ -90,17 +90,18 @@ def _store_load():
             reports     = rec.get('reports', {})
             digest      = rec.get('digest', [])
             news_intel     = rec.get('news_intel', [])
-            digest_seen_ids= rec.get('digest_seen_ids', [])
+            digest_seen_ids  = rec.get('digest_seen_ids', [])
+            custom_channels  = rec.get('custom_channels', [])
             # JSONBin may return [] if bin was init'd wrong — force to dict
             if not isinstance(reports, dict): reports = {}
             if not isinstance(setups, list):  setups  = []
             if not isinstance(digest, list):  digest  = []
             print(f'[STORE] Loaded: {len(setups)} setups, {len(reports)} reports, {len(digest)} digest items')
-            return reports, setups, digest, news_intel, digest_seen_ids
+            return reports, setups, digest, news_intel, digest_seen_ids, custom_channels
         print(f'[STORE] Load failed: {r.status_code} {r.text[:80]}')
     except Exception as e:
         print(f'[STORE] Load error: {e}')
-    return {}, [], [], [], []
+    return {}, [], [], [], [], []
 
 def _store_save():
     """Save {setups, reports} to JSONBin as a single atomic write."""
@@ -110,7 +111,8 @@ def _store_save():
         # Keep last 200 seen video IDs (rolling window)
         payload = {'setups': _backtest_setups[:200], 'reports': _reports,
                    'digest': _digest_cache[:50], 'news_intel': _news_intel_reports[-20:],
-                   'digest_seen_ids': list(_digest_seen_ids)[-200:]}
+                   'digest_seen_ids': list(_digest_seen_ids)[-200:],
+                   'custom_channels': _custom_channels}
         r = requests.put(_JSONBIN_URL, headers=_JSONBIN_HEADERS, json=payload, timeout=20)
         print(f'[STORE] Save {"OK" if r.ok else "FAILED " + str(r.status_code) + ": " + r.text[:80]}')
     except Exception as e:
@@ -125,7 +127,7 @@ _news_intel_reports = []  # [{id, createdAt, brief, recommendations, verdict, he
 def _sync_from_jsonbin():
     """Load JSONBin data into in-memory stores (safe to call multiple times)."""
     try:
-        rpts, setups, digest, news_intel, digest_seen_ids = _store_load()
+        rpts, setups, digest, news_intel, digest_seen_ids, custom_channels = _store_load()
         _reports.update(rpts)
         with _backtest_lock:
             if setups:
@@ -140,6 +142,9 @@ def _sync_from_jsonbin():
             _news_intel_reports.extend(news_intel)
         if digest_seen_ids:
             _digest_seen_ids.update(digest_seen_ids)
+        if custom_channels:
+            _custom_channels.clear()
+            _custom_channels.extend(custom_channels)
         print(f'[STORE] Sync complete: {len(_backtest_setups)} setups, {len(_reports)} reports, {len(_digest_cache)} digest, {len(_news_intel_reports)} news_intel')
     except Exception as e:
         print(f'[STORE] Sync error (non-fatal): {e}')
@@ -2425,6 +2430,22 @@ def get_news_intel_reports():
 # ── CREATOR DIGEST ─────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════
 
+def _get_all_channels():
+    """Merge hardcoded channels with user-added custom channels."""
+    seen_handles = set()
+    all_channels = []
+    for ch in _get_all_channels():
+        h = ch['handle'].lower()
+        if h not in seen_handles:
+            seen_handles.add(h)
+            all_channels.append(ch)
+    for ch in _custom_channels:
+        h = ch['handle'].lower()
+        if h not in seen_handles:
+            seen_handles.add(h)
+            all_channels.append(ch)
+    return all_channels
+
 DIGEST_CHANNELS = [
     {'handle': 'KanalFinans',                    'name': 'Kanal Finans',          'lang': 'tr', 'category': 'Finance'},
     {'handle': 'economisttv-artunç-kocabalkan',  'name': 'Economist TV',          'lang': 'tr', 'category': 'Finance'},
@@ -2439,7 +2460,8 @@ DIGEST_CHANNELS = [
     {'handle': 'Swan_Bitcoin',                   'name': 'Swan Bitcoin',          'lang': 'en', 'category': 'Crypto'},
 ]
 
-_digest_cache     = []   # list of digest run results
+_digest_cache         = []   # list of digest run results
+_custom_channels      = []   # user-added channels (persisted to JSONBin)
 _digest_lock      = threading.Lock()
 _digest_last_run      = None
 _digest_seen          = set()   # tracks video titles already summarised today (in-memory, session only)
@@ -2707,9 +2729,9 @@ def _run_digest(hours=24):
     import datetime as _dt
     today = _dt.datetime.utcnow().strftime('%Y-%m-%d')
 
-    _channel_status = {ch['name']: '⏳ checking...' for ch in DIGEST_CHANNELS}
+    _channel_status = {ch['name']: '⏳ checking...' for ch in _get_all_channels()}
 
-    for i, ch in enumerate(DIGEST_CHANNELS):
+    for i, ch in enumerate(_get_all_channels()):
         if i > 0:
             time.sleep(60)  # 60s between channels — stay within RPM limits
         print(f'[DIGEST] Checking {ch["name"]}...')
@@ -2795,6 +2817,50 @@ def _run_digest(hours=24):
     print(f'[DIGEST] Done — {len(results)} channels summarised')
     return {'success': True, 'count': len(results), 'run_time': run_time, 'videos': results}
 
+
+@app.route('/digest/channels', methods=['GET'])
+def get_digest_channels():
+    """Return all channels (hardcoded + custom)."""
+    return jsonify({
+        'hardcoded': DIGEST_CHANNELS,
+        'custom':    _custom_channels,
+        'all':       _get_all_channels()
+    })
+
+@app.route('/digest/channels', methods=['POST'])
+def add_digest_channel():
+    """Add a custom channel. Body: {handle, lang?, category?}"""
+    global _custom_channels
+    data   = request.get_json() or {}
+    handle = data.get('handle', '').strip().lstrip('@')
+    if not handle:
+        return jsonify({'error': 'handle required'}), 400
+    # Check not already in list
+    all_handles = [ch['handle'].lower() for ch in _get_all_channels()]
+    if handle.lower() in all_handles:
+        return jsonify({'error': 'Channel already exists'}), 409
+    # Detect language from handle heuristic (user can override)
+    lang     = data.get('lang', 'en')
+    category = data.get('category', 'Crypto')
+    name     = data.get('name', '@' + handle)
+    new_ch = {'handle': handle, 'name': name, 'lang': lang, 'category': category, 'custom': True}
+    _custom_channels.append(new_ch)
+    _store_save()
+    print(f'[DIGEST] Added custom channel: @{handle}')
+    return jsonify({'ok': True, 'channel': new_ch, 'total': len(_get_all_channels())})
+
+@app.route('/digest/channels/<handle>', methods=['DELETE'])
+def remove_digest_channel(handle):
+    """Remove a custom channel by handle."""
+    global _custom_channels
+    handle = handle.lstrip('@')
+    before = len(_custom_channels)
+    _custom_channels[:] = [ch for ch in _custom_channels if ch['handle'].lower() != handle.lower()]
+    if len(_custom_channels) == before:
+        return jsonify({'error': 'Channel not found or is a built-in channel'}), 404
+    _store_save()
+    print(f'[DIGEST] Removed custom channel: @{handle}')
+    return jsonify({'ok': True, 'remaining': len(_custom_channels)})
 
 @app.route('/digest/run', methods=['POST'])
 def digest_run():
@@ -2994,7 +3060,7 @@ def digest_debug():
         return jsonify({'error': 'YOUTUBE_API_KEY not set in Railway variables'}), 500
 
     results = []
-    for ch in DIGEST_CHANNELS:
+    for ch in _get_all_channels():
         entry = {'channel': ch['name'], 'handle': ch['handle'], 'hours': hours}
 
         # Step 1: resolve handle → channel ID
@@ -3085,7 +3151,7 @@ def digest_page():
 
     # Build channel status table
     status_rows = ''
-    for ch in DIGEST_CHANNELS:
+    for ch in _get_all_channels():
         st = ch_status.get(ch['name'], '— not checked yet')
         flag = '🇹🇷' if ch['lang'] == 'tr' else '🇬🇧'
         color = '#00ff88' if st.startswith('✅') else '#444' if st.startswith('—') else '#f0c040'
