@@ -2651,7 +2651,6 @@ def _yt_find_latest_video(channel_name, handle, hours, yt_key):
 
 def _gemini_find_and_summarise(channel_name, handle, lang, hours, gemini_key, yt_key=None):
     """Two-step: find latest video via YouTube API, then analyse with Gemini."""
-    # Use YouTube Data API if key available, else skip
     if yt_key:
         title, video_id, video_url = _yt_find_latest_video(channel_name, handle, hours, yt_key)
     else:
@@ -2659,6 +2658,11 @@ def _gemini_find_and_summarise(channel_name, handle, lang, hours, gemini_key, yt
         return None
 
     if not video_id:
+        return None
+
+    # ── Check dedup BEFORE calling Gemini (saves API quota) ──
+    if video_id in _digest_seen_ids:
+        print(f'[DIGEST] Already summarised video {video_id} ({title[:50]}) — skipping Gemini call')
         return None
 
     analysis = _gemini_analyse_video(channel_name, handle, video_id, video_url, title, lang, gemini_key)
@@ -2716,18 +2720,16 @@ def _run_digest(hours=24):
 
         title, url = _parse_gemini_response(response, ch['name'], ch['lang'])
 
-        # Check by video_id (persisted) — prevents re-summarising across restarts
+        # Extract video_id and register it as seen
         _vid_id = None
         _vid_match = re.search(r'youtube\.com/watch\?v=([\w-]+)', url or '')
         if _vid_match:
             _vid_id = _vid_match.group(1)
-        if _vid_id and _vid_id in _digest_seen_ids:
-            print(f'[DIGEST] Already summarised video {_vid_id} ({title[:40]}) — skipping')
-            continue
-        # Also check in-session by title (fallback for when URL not parsed)
+
+        # Session-level title dedup (fallback safety net)
         seen_key = f'{today}::{ch["name"]}::{title}'
         if seen_key in _digest_seen:
-            print(f'[DIGEST] Already summarised "{title[:50]}" today (session) — skipping')
+            print(f'[DIGEST] Duplicate title detected "{title[:50]}" — skipping')
             continue
         _digest_seen.add(seen_key)
         if _vid_id:
